@@ -1,11 +1,13 @@
 use std::{
-    cell::Cell,
     ops::{Deref, DerefMut},
     rc::Rc,
 };
 
+#[cfg(not(short_floats))]
 pub type NodeValue = f64;
-// type NodeValue = f32;
+
+#[cfg(short_floats)]
+type NodeValue = f32;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -34,6 +36,21 @@ pub trait RNG {
     }
 }
 
+pub trait ShuffleRng {
+    fn shuffle_vec<T>(&self, vec: &mut Vec<T>);
+}
+
+impl<T: RNG> ShuffleRng for T {
+    fn shuffle_vec<E>(&self, vec: &mut Vec<E>) {
+        let len = vec.len();
+
+        for i in 0..len {
+            let j = self.rand_range(i, len);
+            vec.swap(i, j);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NetworkShape {
     inputs_count: usize,
@@ -55,6 +72,7 @@ impl NetworkShape {
 pub struct Network {
     layers: Vec<Layer>,
     activation_mode: NetworkActivationMode,
+    softmax_output_enabled: bool,
 }
 
 impl Network {
@@ -79,6 +97,7 @@ impl Network {
         Self {
             layers,
             activation_mode: Default::default(),
+            softmax_output_enabled: Default::default(),
         }
     }
 
@@ -86,14 +105,23 @@ impl Network {
         self.activation_mode = activation_mode;
     }
 
+    pub fn set_softmax_output_enabled(&mut self, enabled: bool) {
+        self.softmax_output_enabled = enabled;
+    }
+
     pub fn compute(&self, inputs: LayerValues) -> Result<LayerValues, ()> {
         inputs.assert_length_equals(self.inputs_count()?)?;
 
+        let (last_layer, layers) = self.layers.split_last().expect("should have final layer");
         let mut output = inputs;
-        for layer in self.layers.iter() {
+
+        for layer in layers {
             output = layer.compute(&output)?;
-            output = self.activation_mode.apply(output);
+            output = self.activation_mode.apply(&output);
         }
+
+        output = last_layer.compute(&output)?;
+        output = self.final_layer_activation().apply(&output);
 
         Ok(output)
     }
@@ -109,8 +137,8 @@ impl Network {
         Ok(errors)
     }
 
-    pub fn learn(&mut self, strategy: NetworkLearnStrategy) -> Result<(), ()> {
-        match strategy {
+    pub fn learn(&mut self, strategy: NetworkLearnStrategy) -> Result<Option<NodeValue>, ()> {
+        let cost = match strategy {
             NetworkLearnStrategy::MutateRng { rand_amount, rng } => {
                 let strategy = LayerLearnStrategy::MutateRng {
                     weight_factor: rand_amount,
@@ -120,89 +148,185 @@ impl Network {
                 for layer in self.layers.iter_mut() {
                     layer.learn(&strategy)?;
                 }
+
+                None
             }
             NetworkLearnStrategy::GradientDecent {
                 inputs,
                 target_outputs,
                 learn_rate,
             } => {
-                let mut layers_activations = vec![inputs];
-                let mut output = layers_activations.first().expect("missing input values");
+                let layers_activations = self.compute_with_layers_activations(inputs)?;
 
-                for layer in self.layers.iter() {
-                    let input = output;
-                    let x = layer.compute(&input)?;
-                    let x = self.activation_mode.apply(x);
+                let output_layer_error = self.perform_gradient_decent_step(
+                    layers_activations,
+                    target_outputs,
+                    learn_rate,
+                    false,
+                )?;
 
-                    layers_activations.push(x);
-                    output = layers_activations
-                        .last()
-                        .expect("missing latest pushed layer");
+                Some(output_layer_error)
+            }
+            NetworkLearnStrategy::BatchGradientDecent {
+                training_pairs,
+                batch_size,
+                learn_rate,
+            } => {
+                use itertools::Itertools;
+                if training_pairs.is_empty() {
+                    return Ok(None);
                 }
 
-                // let mut total_errors = vec![];
-                let mut output_layer_d = None;
+                let mut sum_error = 0.0;
+                let training_pairs_len = training_pairs.len();
 
-                for (layer, layer_input) in self
-                    .layers
-                    .iter_mut()
-                    .rev()
-                    .zip(layers_activations.iter().rev().skip(1))
-                {
-                    let x = layer.compute(&layer_input)?;
+                for training_pairs in training_pairs.into_iter().chunks(batch_size).into_iter() {
+                    for (inputs, target_outputs) in training_pairs {
+                        let layers_activations = self.compute_with_layers_activations(inputs)?;
 
-                    let activation_d = self.activation_mode.derivative(&x);
+                        let output_layer_error = self.perform_gradient_decent_step(
+                            layers_activations,
+                            target_outputs,
+                            learn_rate,
+                            true,
+                        )?;
 
-                    if let Some(prev_layer_d) = output_layer_d.take() {
-                        let prev_layer_d = LayerValues(prev_layer_d);
-                        let layer_d = layer.compute_d(&prev_layer_d)?;
-                        let layer_d = activation_d.iter().zip(layer_d).map(|(x, y)| x * y);
-
-                        output_layer_d = Some(layer_d.collect::<Vec<NodeValue>>());
-                    } else {
-                        // let errors = layer.calculate_error(&x, &target_outputs)?;
-                        // total_errors.push(errors.iter().sum::<NodeValue>());
-
-                        let error_d = layer.calculate_error_d(&x, &target_outputs)?;
-                        output_layer_d = Some(
-                            activation_d
-                                .multiply_iter(&error_d)
-                                .collect::<Vec<NodeValue>>(),
-                        );
+                        sum_error += output_layer_error;
                     }
-
-                    let gradients = output_layer_d
-                        .as_ref()
-                        .expect("should know output deviratives by now");
-
-                    layer.learn(&LayerLearnStrategy::GradientDecent {
-                        gradients: LayerValues(gradients.clone()),
-                        layer_inputs: layer_input.clone(), // TODO: can remove clone?
-                        learn_rate,
-                    })?;
+                }
+                if training_pairs_len > 0 {
+                    for layer in self.layers.iter_mut() {
+                        layer.apply_batch_gradients(learn_rate)?;
+                    }
                 }
 
-                // let network_cost: NodeValue =
-                //     total_errors.iter().sum::<NodeValue>() / total_errors.len() as NodeValue;
-
-                // println!("network_cost = {network_cost}")
+                Some(sum_error / training_pairs_len as NodeValue)
             }
             NetworkLearnStrategy::Multi(strategies) => {
                 for strategy in strategies.into_iter() {
                     self.learn(strategy)?;
                 }
+
+                None
             }
-        }
-        Ok(())
+        };
+        Ok(cost)
     }
 
-    pub fn node_weights(&self, layer_idx: usize, node_index: usize) -> Result<impl Iterator<Item = &f64>, ()> {
-        Ok(self.layers.get(layer_idx).ok_or(())?.node_weights(node_index))
+    fn compute_with_layers_activations(
+        &mut self,
+        inputs: LayerValues,
+    ) -> Result<Vec<LayerValues>, ()> {
+        let mut layers_activations = vec![inputs];
+        let mut output = layers_activations.first().expect("missing input values");
+        let (last_layer, layers) = self.layers.split_last().expect("should have final layer");
+
+        for layer in layers {
+            let x = layer.compute(&output)?;
+            let x = self.activation_mode.apply(&x);
+
+            layers_activations.push(x);
+            output = layers_activations
+                .last()
+                .expect("missing latest pushed layer");
+        }
+
+        let x = last_layer.compute(&output)?;
+        let x = self.final_layer_activation().apply(&x);
+
+        layers_activations.push(x);
+        Ok(layers_activations)
+    }
+
+    fn perform_gradient_decent_step(
+        &mut self,
+        layers_activations: Vec<LayerValues>,
+        target_outputs: LayerValues,
+        learn_rate: f64,
+        enqueue_batch: bool,
+    ) -> Result<f64, ()> {
+        let mut output_layer_d = None;
+        let mut output_layer_error = 0.0;
+        let final_activation_mode = self.final_layer_activation();
+
+        for (layer, layer_input) in self
+            .layers
+            .iter_mut()
+            .rev()
+            .zip(layers_activations.iter().rev().skip(1))
+        {
+            // use stored weighted input sums here instead?
+            let x = layer.compute(&layer_input)?;
+
+            // key
+            //  dc/dw = dz/dw * da/dz * dc/da
+            //    da/dz = activation_d
+            //    dc/da = error_d
+            //    dz/dw = layer.learn (network weights)
+
+            if let Some(prev_layer_d) = output_layer_d.take() {
+                let activation_d = self.activation_mode.derivative(&x);
+                let prev_layer_d = LayerValues(prev_layer_d);
+                let layer_d = layer.compute_d(&prev_layer_d)?;
+                let layer_d = activation_d.multiply_by_iter(layer_d);
+
+                output_layer_d = Some(layer_d.collect::<Vec<NodeValue>>());
+            } else {
+                let activation_d = final_activation_mode.derivative(&x);
+                let layer_output = final_activation_mode.apply(&x);
+                output_layer_error = layer.calculate_error(&layer_output, &target_outputs)?.ave();
+
+                let error_d = layer.calculate_error_d(&layer_output, &target_outputs)?;
+                output_layer_d = Some(
+                    activation_d
+                        .multiply_iter(&error_d)
+                        .collect::<Vec<NodeValue>>(),
+                );
+            }
+
+            let gradients = output_layer_d
+                .as_ref()
+                .expect("should know output deviratives by now");
+
+            if enqueue_batch {
+                layer.learn(&LayerLearnStrategy::EnqueueBatchGradientDecent {
+                    gradients: LayerValues(gradients.clone()),
+                    layer_inputs: layer_input.clone(), // TODO: can remove clone?
+                })?;
+            } else {
+                layer.learn(&LayerLearnStrategy::GradientDecent {
+                    gradients: LayerValues(gradients.clone()),
+                    layer_inputs: layer_input.clone(), // TODO: can remove clone?
+                    learn_rate,
+                })?;
+            }
+        }
+        Ok(output_layer_error)
+    }
+
+    pub fn node_weights(
+        &self,
+        layer_idx: usize,
+        node_index: usize,
+    ) -> Result<impl Iterator<Item = &f64>, ()> {
+        Ok(self
+            .layers
+            .get(layer_idx)
+            .ok_or(())?
+            .node_weights(node_index))
     }
 
     fn inputs_count(&self) -> Result<usize, ()> {
         let first_layer = &self.layers.iter().next().ok_or(())?;
         Ok(first_layer.inputs_count)
+    }
+
+    fn final_layer_activation(&self) -> NetworkActivationMode {
+        if self.softmax_output_enabled {
+            NetworkActivationMode::SoftMax
+        } else {
+            self.activation_mode
+        }
     }
 }
 
@@ -210,7 +334,31 @@ impl Network {
 pub struct Layer {
     weights: Vec<NodeValue>,
     bias: Vec<NodeValue>,
+    pending_gradients: Option<PendingLayerGradients>,
     inputs_count: usize,
+}
+
+pub struct PendingLayerGradients {
+    weights: Vec<NodeValue>,
+    bias: Vec<NodeValue>,
+}
+
+impl std::fmt::Debug for PendingLayerGradients {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLayerGradients")
+            .field("weights_count", &self.weights.len())
+            .field("bias_count", &self.bias.len())
+            .finish()
+    }
+}
+
+impl PendingLayerGradients {
+    pub fn new(parent: &Layer) -> Self {
+        Self {
+            weights: vec![0.0; parent.inputs_count * parent.size()],
+            bias: vec![0.0; parent.size()],
+        }
+    }
 }
 
 impl Layer {
@@ -219,6 +367,7 @@ impl Layer {
         let empty = Self {
             weights: vec![0.0; weights_size],
             bias: vec![0.0; size],
+            pending_gradients: None,
             inputs_count,
         };
 
@@ -296,25 +445,76 @@ impl Layer {
                 layer_inputs,
                 learn_rate,
             } => {
-                if self.weights.len() != gradients.len() * layer_inputs.len() {
-                    // print error?
-                    return Err(());
+                let (weights_gradients, bias_gradients) =
+                    self.compute_gradients_iter(gradients, layer_inputs)?;
+
+                for (x, grad) in self.weights.iter_mut().zip(weights_gradients) {
+                    *x = *x - (grad * learn_rate)
                 }
-                for ((layer_input, grad), x) in layer_inputs
-                    .iter()
-                    .flat_map(|layer_input| gradients.iter().map(move |grad| (layer_input, grad)))
-                    .zip(self.weights.iter_mut())
+                for (x, grad) in self.bias.iter_mut().zip(bias_gradients) {
+                    *x = *x - (grad * learn_rate)
+                }
+            }
+            LayerLearnStrategy::EnqueueBatchGradientDecent {
+                gradients,
+                layer_inputs,
+            } => {
+                let (weights_gradients, bias_gradients) =
+                    self.compute_gradients_iter(gradients, layer_inputs)?;
+                let pending_gradients = self
+                    .pending_gradients
+                    .get_or_insert(PendingLayerGradients::new(&self));
+
+                for (grad, pending_grad) in
+                    weights_gradients.zip(pending_gradients.weights.iter_mut())
                 {
-                    let old = *x;
-                    *x = old - (grad * layer_input * learn_rate);
+                    *pending_grad += grad;
                 }
-                for (grad, x) in gradients.iter().zip(self.bias.iter_mut()) {
-                    let old = *x;
-                    *x = old - (grad * learn_rate);
+                for (grad, pending_grad) in bias_gradients.zip(pending_gradients.bias.iter_mut()) {
+                    *pending_grad += grad;
                 }
             }
         }
         Ok(())
+    }
+
+    pub fn apply_batch_gradients(&mut self, learn_rate: f64) -> Result<(), ()> {
+        let pending_gradients = self.pending_gradients.take().ok_or(())?;
+
+        for (x, grad) in self.weights.iter_mut().zip(pending_gradients.bias.iter()) {
+            *x = *x - (grad * learn_rate)
+        }
+        for (x, grad) in self.bias.iter_mut().zip(pending_gradients.weights.iter()) {
+            *x = *x - (grad * learn_rate)
+        }
+
+        Ok(())
+    }
+
+    fn compute_gradients_iter<'a>(
+        &self,
+        gradients: &'a LayerValues,
+        layer_inputs: &'a LayerValues,
+    ) -> Result<
+        (
+            impl Iterator<Item = NodeValue> + 'a,
+            impl Iterator<Item = NodeValue> + 'a,
+        ),
+        (),
+    > {
+        if self.weights.len() != gradients.len() * layer_inputs.len() {
+            // print error?
+            return Err(());
+        }
+
+        let weights_gradients = layer_inputs
+            .iter()
+            .flat_map(|layer_input| gradients.iter().map(move |grad| (layer_input, grad)))
+            .map(move |(layer_input, grad)| grad * *layer_input);
+
+        let bias_gradients = gradients.iter().cloned();
+
+        Ok((weights_gradients, bias_gradients))
     }
 
     pub fn size(&self) -> usize {
@@ -366,6 +566,12 @@ where
     }
 }
 
+impl FromIterator<NodeValue> for LayerValues {
+    fn from_iter<T: IntoIterator<Item = NodeValue>>(iter: T) -> Self {
+        LayerValues(iter.into_iter().collect())
+    }
+}
+
 impl Deref for LayerValues {
     type Target = Vec<NodeValue>;
 
@@ -384,13 +590,6 @@ impl LayerValues {
     pub fn new(inner: Vec<NodeValue>) -> Self {
         Self(inner)
     }
-    fn assert_length(&self, other: impl Deref<Target = Vec<NodeValue>>) -> Result<(), ()> {
-        if self.len() == other.len() {
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
     fn assert_length_equals(&self, expected: usize) -> Result<(), ()> {
         if self.len() == expected {
             Ok(())
@@ -399,13 +598,36 @@ impl LayerValues {
         }
     }
     fn multiply_iter<'a>(&'a self, rhs: &'a Self) -> impl Iterator<Item = NodeValue> + 'a {
-        self.iter().zip(rhs.iter()).map(|(x, y)| x * y)
+        self.multiply_by_iter(rhs.iter().copied())
     }
-    pub fn normalized_dot_product(&self, rhs: &LayerValues) -> NodeValue {
-        let lhs_len: NodeValue = self.iter().map(|x| x.powi(2)).sum();
-        let rhs_len: NodeValue = self.iter().map(|x| x.powi(2)).sum();
-        let len = lhs_len * rhs_len;
-        self.iter().zip(rhs.iter()).map(|(lhs, rhs)| lhs * rhs).sum::<NodeValue>() / len
+    fn multiply_by_iter<'a, T: Iterator<Item = NodeValue> + 'a>(
+        &'a self,
+        rhs: T,
+    ) -> impl Iterator<Item = NodeValue> + 'a {
+        self.iter().zip(rhs).map(|(x, y)| x * y)
+    }
+    pub fn ave(&self) -> NodeValue {
+        if !self.is_empty() {
+            self.iter().sum::<NodeValue>() / self.len() as NodeValue
+        } else {
+            0.0
+        }
+    }
+    pub fn normalized_dot_product(&self, rhs: &LayerValues) -> Option<NodeValue> {
+        let (v1, v2) = (self, rhs);
+        if v1.len() != v2.len() {
+            return None;
+        }
+
+        let dot_product = v1.iter().zip(v2.iter()).map(|(&x, &y)| x * y).sum::<NodeValue>();
+        let norm1 = v1.iter().map(|&x| x * x).sum::<NodeValue>().sqrt();
+        let norm2 = v2.iter().map(|&x| x * x).sum::<NodeValue>().sqrt();
+
+        if norm1 == 0.0 || norm2 == 0.0 {
+            return None;
+        }
+
+        Some(dot_product / (norm1 * norm2))
     }
 }
 
@@ -425,6 +647,10 @@ pub enum LayerLearnStrategy {
         layer_inputs: LayerValues,
         learn_rate: NodeValue,
     },
+    EnqueueBatchGradientDecent {
+        gradients: LayerValues,
+        layer_inputs: LayerValues,
+    },
 }
 
 pub enum NetworkLearnStrategy {
@@ -435,6 +661,11 @@ pub enum NetworkLearnStrategy {
     GradientDecent {
         inputs: LayerValues,
         target_outputs: LayerValues,
+        learn_rate: NodeValue,
+    },
+    BatchGradientDecent {
+        training_pairs: Vec<(LayerValues, LayerValues)>,
+        batch_size: usize,
         learn_rate: NodeValue,
     },
     Multi(Vec<NetworkLearnStrategy>),
@@ -448,9 +679,9 @@ pub enum NetworkActivationMode {
 }
 
 impl NetworkActivationMode {
-    fn apply(&self, mut output: LayerValues) -> LayerValues {
+    fn apply(&self, output: &LayerValues) -> LayerValues {
         match self {
-            NetworkActivationMode::Linear => output,
+            NetworkActivationMode::Linear => output.clone(),
             NetworkActivationMode::SoftMax => {
                 let exp_iter = output.iter().map(|x| x.exp());
                 let sum: NodeValue = exp_iter.clone().sum();
@@ -458,29 +689,30 @@ impl NetworkActivationMode {
             }
             NetworkActivationMode::Sigmoid => {
                 LayerValues(output.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect())
-            } // NetworkActivationMode::SoftMax => {
-              //     let sum: NodeValue = {
-              //         let exp_iter = output.iter().map(|x| x.exp());
-              //         exp_iter.clone().sum()
-              //     };
-              //     for x in output.iter_mut() {
-              //         *x = *x / sum;
-              //     }
-              //     output
-              // }
+            }
         }
     }
     fn derivative(&self, output: &LayerValues) -> LayerValues {
         match self {
-            NetworkActivationMode::Linear => LayerValues(output.iter().map(|_| 1.0).collect()),
-            NetworkActivationMode::SoftMax => todo!(),
+            NetworkActivationMode::Linear => output.iter().map(|_| 1.0).collect(),
+            NetworkActivationMode::SoftMax => {
+                let softmax = self.apply(output);
+                softmax
+                    .iter()
+                    .enumerate()
+                    .map(|(j, sj)| {
+                        softmax
+                            .iter()
+                            .enumerate()
+                            .map(|(i, si)| if i == j { si * (1.0 - si) } else { si * -sj })
+                            .sum::<NodeValue>()
+                    })
+                    .collect()
+            }
             NetworkActivationMode::Sigmoid => {
-                let sigmoid_iter = output.iter().map(|x| 1.0 / (1.0 + (-x).exp()));
-                LayerValues(
-                    sigmoid_iter
-                        .map(|signmoid| signmoid * (1.0 - signmoid))
-                        .collect(),
-                )
+                let mut sigmoid = self.apply(output);
+                sigmoid.iter_mut().for_each(|x| *x = *x * (1.0 - *x));
+                sigmoid
             }
         }
     }
@@ -627,29 +859,26 @@ mod tests {
         network.set_activation_mode(NetworkActivationMode::Sigmoid);
 
         let output_1 = network.compute(network_input.iter().into()).unwrap();
-        for round in 1..10_000 {
-            network
+        for round in 1..1_000 {
+            let error = network
                 .learn(NetworkLearnStrategy::GradientDecent {
-                    learn_rate: 0.1,
+                    learn_rate: 1e-2,
                     inputs: network_input.iter().into(),
                     target_outputs: target_output.iter().into(),
                 })
-                .unwrap();
-
-            let error = network
-                .compute_error(network_input.iter().into(), &target_output.iter().into())
                 .unwrap()
-                .iter()
-                .sum::<NodeValue>();
+                .unwrap();
 
             if round < 50
                 || (round < 1000 && round % 100 == 0)
                 || (round < 10000 && round % 1000 == 0)
+                || round % 10000 == 0
             {
                 println!("round = {round}, network_cost = {error}");
             }
 
             if error < 1e-6 {
+                println!("DONE round = {round}, network_cost = {error}");
                 break;
             }
         }
@@ -660,8 +889,13 @@ mod tests {
         println!("network = {network:#?}");
 
         assert_ne!(vec![0.5, 0.5], *output_1);
-        panic!("test out")
-        // assert_ne!(vec![0.5, 0.5], *output_2);
-        // assert_ne!(*output_1, *output_2);
+        assert!(
+            (target_output[0] - output_2[0]).abs() < 0.05,
+            "{target_output:?} and {output_2:?} dont match"
+        );
+        assert!(
+            (target_output[1] - output_2[1]).abs() < 0.05,
+            "{target_output:?} and {output_2:?} dont match"
+        );
     }
 }
