@@ -83,6 +83,51 @@ button {
 button:hover {
   cursor: pointer;
 }
+button:disabled {
+  background-color: #c0c0c0;
+  color: #e1e1e1;
+}
+button:disabled:hover {
+  cursor: not-allowed;
+}
+
+.trainer_controls {
+  width: 80%;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+}
+
+.trainer_controls button {
+  margin: 3px 0px;
+  width: 40%;
+  margin: 0 auto;
+  display: inline-block;
+}
+
+.trainer_controls p {
+  width: 100%;
+  text-align: center;
+}
+
+.trainer_header {
+  padding: 0px 15px;
+  background-color: black;
+}
+
+.trainer_header h2 {
+  color: #ffffff;
+  padding: 8px 0px;
+}
+
+.trainer-nearest {
+  width: 80%;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+}
 
 .json-editor {
   /* Allow other elems to be inside */
@@ -95,8 +140,8 @@ button:hover {
 
   /* Normal inline styles */
   padding: 8px;
-  margin: 8px;
-  width: calc(100% - 16px);
+  margin: 8px auto;
+  width: calc(80% - 16px);
   height: 175px;
 
   font-size: normal;
@@ -147,7 +192,7 @@ button:hover {
 
 .json-editor textarea {
   color: black;
-  background: linear-gradient(0deg, #aaaaaa 0%, #dcdcdc 49%, #f5f5f5 100%);
+  background: linear-gradient(0deg, #f5f5f5 0%, #fafafa 49%, #f5f5f5 100%);
   caret-color: inherit!important; /* Or choose your favourite color */
 }
 
