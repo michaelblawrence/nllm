@@ -3,15 +3,17 @@ mod nearest;
 
 use std::{collections::HashSet, rc::Rc};
 
+use web_sys::console::log_1;
 use yew::prelude::*;
+use yew_hooks::use_timeout;
 
 use crate::{
     components::PlotComponent,
     ml::{embeddings::Embedding, JsRng},
 };
 
-pub use parser::TrainEmbeddingConfig;
 use nearest::EmbeddingNearest;
+pub use parser::TrainEmbeddingConfig;
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct EmbeddingTrainerProps {
@@ -28,10 +30,69 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
     let train_iter_count = use_state(|| 0);
     let embedding_handle = use_state(|| handle::EmbeddingHandle::default());
 
+    let train_remaining_iters = use_state(|| 0_usize);
+    let train_timeout = use_timeout(
+        {
+            let chart_points = chart_points.clone();
+            let vocab_and_phrases = vocab_and_phrases.clone();
+            let train_iter_count = train_iter_count.clone();
+            let embedding_handle = embedding_handle.clone();
+            let embedding_training_config = embedding_training_config.clone();
+            let train_remaining_iters = train_remaining_iters.clone();
+            move || {
+                if *train_remaining_iters <= 0 {
+                    return;
+                }
+
+                let next_handle = embedding_handle.replace_with(|mut embedding_instance| {
+                    let (_, phrases, testing_phrases) = &**vocab_and_phrases;
+                    let mut errors = (*chart_points).clone();
+
+                    let TrainEmbeddingConfig {
+                        word_locality_factor,
+                        train_rate,
+                        ..
+                    } = embedding_training_config;
+
+                    let error = parser::train_embedding(
+                        &mut embedding_instance,
+                        &phrases,
+                        train_rate,
+                        word_locality_factor,
+                        testing_phrases,
+                    );
+
+                    errors.push((errors.len() as f64, error));
+
+                    chart_points.set(errors);
+                    train_iter_count.set(*train_iter_count + 1);
+                    embedding_instance
+                });
+                
+                embedding_handle.set(next_handle);
+                train_remaining_iters.set(*train_remaining_iters - 1);
+            }
+        },
+        5,
+    );
+
+    use_effect_with_deps(
+        {
+            let train_timeout = train_timeout.clone();
+            move |train_remaining_iters: &usize| {
+                if *train_remaining_iters > 0 {
+                    train_timeout.reset();
+                }
+            }
+        },
+        *train_remaining_iters,
+    );
+
     use_effect_with_deps(
         {
             let vocab_and_phrases = vocab_and_phrases.clone();
             let embedding_training_config = embedding_training_config.clone();
+            let train_remaining_iters = train_remaining_iters.clone();
             move |config: &TrainEmbeddingConfig| {
                 let (vocab, mut phrases) =
                     parser::parse_vocab_and_phrases(Some(config.max_vocab_words_count));
@@ -48,6 +109,7 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
                 );
 
                 vocab_and_phrases.set(Rc::new((vocab, phrases, testing_phrases)));
+                train_remaining_iters.set(0);
                 move || {}
             }
         },
@@ -59,6 +121,7 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
             let chart_points = chart_points.clone();
             let embedding_handle = embedding_handle.clone();
             let embedding_training_config = embedding_training_config.clone();
+            let train_remaining_iters = train_remaining_iters.clone();
 
             move |vocab_and_phrases: &Rc<(HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>)>| {
                 let (vocab, phrases, testing_phrases) = &**vocab_and_phrases;
@@ -73,27 +136,9 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
                 let mut embedding_instance =
                     Embedding::new(vocab.clone(), embedding_size, Rc::new(JsRng::default()));
 
-                let mut testing_phrases_errors = vec![];
-
-                for _ in 0..training_rounds {
-                    let error = parser::train_embedding(
-                        &mut embedding_instance,
-                        &phrases,
-                        train_rate,
-                        word_locality_factor,
-                        testing_phrases,
-                    );
-                    testing_phrases_errors.push(error);
-                }
-
-                let error_chart_points = testing_phrases_errors
-                    .iter()
-                    .enumerate()
-                    .map(|(i, x)| (i as f64, *x))
-                    .collect::<Vec<(f64, f64)>>();
-
-                chart_points.set(error_chart_points);
+                chart_points.set(vec![]);
                 embedding_handle.set(embedding_handle.replace(embedding_instance));
+                train_remaining_iters.set(training_rounds);
 
                 move || {}
             }
@@ -102,60 +147,48 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
     );
 
     let onclick_train_iter = {
-        let chart_points = chart_points.clone();
-        let vocab_and_phrases = vocab_and_phrases.clone();
-        let train_iter_count = train_iter_count.clone();
-        let embedding_handle = embedding_handle.clone();
+        let train_remaining_iters = train_remaining_iters.clone();
         let embedding_training_config = embedding_training_config.clone();
 
         move |_| {
-            let next_handle = embedding_handle.replace_with(|mut embedding_instance| {
-                let (_, phrases, testing_phrases) = &**vocab_and_phrases;
-                let mut errors = (*chart_points).clone();
+            let iters = embedding_training_config.training_rounds.max(1);
+            train_remaining_iters.set(*train_remaining_iters + iters);
+        }
+    };
 
-                let TrainEmbeddingConfig {
-                    word_locality_factor,
-                    train_rate,
-                    ..
-                } = embedding_training_config;
+    let onclick_train_stop = {
+        let train_remaining_iters = train_remaining_iters.clone();
 
-                let error = parser::train_embedding(
-                    &mut embedding_instance,
-                    &phrases,
-                    train_rate,
-                    word_locality_factor,
-                    testing_phrases,
-                );
-
-                errors.push((errors.len() as f64, error));
-
-                chart_points.set(errors);
-                train_iter_count.set(*train_iter_count + 1);
-                embedding_instance
-            });
-            embedding_handle.set(next_handle);
+        move |_| {
+            train_remaining_iters.set(0);
         }
     };
 
     html! {
         <div class="trainer">
-            <h2>{"WASM Word Embeddings"}</h2>
-            <p>{
-                format!(
-                    "Extracted {} vocab words from {} phrases (mean length = {} words)",
-                    vocab_and_phrases.0.len(),
-                    vocab_and_phrases.1.len(),
-                    vocab_and_phrases.1.iter().map(|x| x.len()).sum::<usize>() as f32
-                        / vocab_and_phrases.1.len() as f32
-                )
-            }</p>
-            <button onclick={onclick_train_iter}>{ format!("Run Training Iteration") }</button>
+            <div class="trainer_header">
+                <h2>{"WASM Word Embeddings"}</h2>
+            </div>
+            <div class="trainer_controls">
+                <p>{
+                    format!(
+                        "Extracted {} vocab words from {} phrases (mean length = {} words)",
+                        vocab_and_phrases.0.len(),
+                        vocab_and_phrases.1.len(),
+                        vocab_and_phrases.1.iter().map(|x| x.len()).sum::<usize>() as f32
+                            / vocab_and_phrases.1.len() as f32
+                    )
+                }</p>
+                <button onclick={onclick_train_iter}>{ format!("Run Training Iteration") }</button>
+                <button onclick={onclick_train_stop} disabled={*train_remaining_iters == 0}>{ format!("Stop Training Iterations") }</button>
+                <p>{format!("Queued iterations = {}",*train_remaining_iters)}</p>
+            </div>
+            <PlotComponent points={(*chart_points).clone()} />
             <EmbeddingNearest
                 vocab_and_phrases={(*vocab_and_phrases).clone()}
                 embedding={(*embedding_handle).clone()}
                 iter_hint={*train_iter_count}
             />
-            <PlotComponent points={(*chart_points).clone()} />
         </div>
     }
 }
