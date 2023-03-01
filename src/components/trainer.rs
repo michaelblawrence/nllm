@@ -21,34 +21,23 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
     let embedding_training_config = (*props.config).clone();
 
     let chart_points = use_state(|| vec![]);
-    let embedding_handle = use_state(|| handle::EmbeddingHandle::default());
-    let vocab_and_phrases =
-        use_state(|| Rc::new((Default::default(), Default::default(), Default::default())));
     let train_iter_count = use_state(|| 0);
 
-    let setup_state = {
-        let embedding_handle = embedding_handle.clone();
-        let vocab_and_phrases = vocab_and_phrases.clone();
+    let (embedding_handle, vocab_and_phrases, train_remaining_iters) =
+        use_embeddings(props.config.clone(), {
+            let chart_points = chart_points.clone();
+            let train_iter_count = train_iter_count.clone();
 
-        move |(e_handle, v_and_p)| {
-            embedding_handle.set(e_handle);
-            vocab_and_phrases.set(v_and_p);
-        }
-    };
+            move |embedding, error| {
+                let mut errors = (*chart_points).clone();
+                errors.push((errors.len() as f64, error));
 
-    let train_remaining_iters = use_embeddings(props.config.clone(), setup_state, {
-        let chart_points = chart_points.clone();
-        let train_iter_count = train_iter_count.clone();
+                chart_points.set(errors);
+                train_iter_count.set(*train_iter_count + 1);
 
-        move |embedding, error| {
-            let mut errors = (*chart_points).clone();
-            errors.push((errors.len() as f64, error));
-
-            chart_points.set(errors);
-            train_iter_count.set(*train_iter_count + 1);
-            embedding
-        }
-    });
+                embedding
+            }
+        });
 
     let onclick_train_iter = {
         let train_remaining_iters = train_remaining_iters.clone();
@@ -110,24 +99,20 @@ mod hook {
         parser, TrainEmbeddingConfig,
     };
 
+    pub type VocabAndPhrases = (HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>);
+
     #[hook]
-    pub fn use_embeddings<F, V>(
+    pub fn use_embeddings<F>(
         config: Rc<TrainEmbeddingConfig>,
-        set_initial_state_fn: V,
         with_emedding_fn: F,
-    ) -> UseStateHandle<usize>
+    ) -> (
+        UseStateHandle<EmbeddingHandle>,
+        UseStateHandle<Rc<VocabAndPhrases>>,
+        UseStateHandle<usize>,
+    )
     where
         F: FnOnce(Embedding, f64) -> Embedding + 'static,
-        V: FnOnce(
-                (
-                    EmbeddingHandle,
-                    Rc<(HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>)>,
-                ),
-            ) -> ()
-            + 'static,
     {
-        let embedding_training_config = (*config).clone();
-
         let vocab_and_phrases =
             use_state(|| Rc::new((Default::default(), Default::default(), Default::default())));
         let embedding_handle = use_state(|| handle::EmbeddingHandle::default());
@@ -138,7 +123,7 @@ mod hook {
             {
                 let vocab_and_phrases = vocab_and_phrases.clone();
                 let embedding_handle = embedding_handle.clone();
-                let embedding_training_config = embedding_training_config.clone();
+                let config = config.clone();
                 let train_remaining_iters = train_remaining_iters.clone();
 
                 move || {
@@ -150,23 +135,15 @@ mod hook {
                         |mut embedding_instance| {
                             let (_, phrases, testing_phrases) = &**vocab_and_phrases;
 
-                            let TrainEmbeddingConfig {
-                                word_locality_factor,
-                                train_rate,
-                                ..
-                            } = embedding_training_config;
-
                             let error = parser::train_embedding(
                                 &mut embedding_instance,
                                 &phrases,
-                                train_rate,
-                                word_locality_factor,
+                                config.train_rate,
+                                config.word_locality_factor,
                                 testing_phrases,
                             );
 
-                            let embedding_instance = with_emedding_fn(embedding_instance, error);
-
-                            embedding_instance
+                            with_emedding_fn(embedding_instance, error)
                         },
                     ));
 
@@ -191,57 +168,44 @@ mod hook {
         use_effect_with_deps(
             {
                 let vocab_and_phrases = vocab_and_phrases.clone();
-                let embedding_training_config = embedding_training_config.clone();
                 let train_remaining_iters = train_remaining_iters.clone();
-                move |config: &TrainEmbeddingConfig| {
+
+                move |config: &Rc<TrainEmbeddingConfig>| {
                     let (vocab, mut phrases) =
                         parser::parse_vocab_and_phrases(Some(config.max_vocab_words_count));
-                    let TrainEmbeddingConfig {
-                        max_phrases_count,
-                        test_phrases_pct,
-                        ..
-                    } = embedding_training_config;
 
                     let testing_phrases = parser::split_training_and_testing(
                         &mut phrases,
-                        max_phrases_count,
-                        test_phrases_pct,
+                        config.max_phrases_count,
+                        config.test_phrases_pct,
                     );
 
                     let v_and_p = Rc::new((vocab, phrases, testing_phrases));
                     vocab_and_phrases.set(v_and_p);
                     train_remaining_iters.set(0);
+
                     move || {}
                 }
             },
-            embedding_training_config.clone(),
+            config.clone(),
         );
 
         use_effect_with_deps(
             {
                 let embedding_handle = embedding_handle.clone();
-                let embedding_training_config = embedding_training_config.clone();
+                let config = config.clone();
                 let train_remaining_iters = train_remaining_iters.clone();
 
-                move |vocab_and_phrases: &Rc<(
-                    HashSet<String>,
-                    Vec<Vec<String>>,
-                    Vec<Vec<String>>,
-                )>| {
+                move |vocab_and_phrases: &Rc<VocabAndPhrases>| {
                     let (vocab, ..) = &**vocab_and_phrases;
-                    let TrainEmbeddingConfig {
-                        embedding_size,
-                        training_rounds,
-                        ..
-                    } = embedding_training_config;
 
-                    let embedding_instance =
-                        Embedding::new(vocab.clone(), embedding_size, Rc::new(JsRng::default()));
+                    embedding_handle.set(embedding_handle.replace(Embedding::new(
+                        vocab.clone(),
+                        config.embedding_size,
+                        Rc::new(JsRng::default()),
+                    )));
 
-                    let next_handle = embedding_handle.replace(embedding_instance);
-                    set_initial_state_fn((next_handle.tick(), vocab_and_phrases.clone()));
-                    embedding_handle.set(next_handle);
-                    train_remaining_iters.set(training_rounds);
+                    train_remaining_iters.set(config.training_rounds);
 
                     move || {}
                 }
@@ -249,7 +213,7 @@ mod hook {
             (*vocab_and_phrases).clone(),
         );
 
-        train_remaining_iters
+        (embedding_handle, vocab_and_phrases, train_remaining_iters)
     }
 }
 
