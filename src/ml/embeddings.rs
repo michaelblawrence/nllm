@@ -30,7 +30,7 @@ impl Embedding {
         );
 
         network.set_activation_mode(super::NetworkActivationMode::Sigmoid);
-        network.set_softmax_output_enabled(true);
+        network.set_softmax_output_enabled(false);
 
         Self {
             network,
@@ -76,12 +76,14 @@ impl Embedding {
                 }
             });
 
+            let training_pairs = random_word_vectors
+                .map(|(x, y)| (LayerValues::new(x.clone()), LayerValues::new(y.clone())))
+                .collect();
+
             let cost = self
                 .network
                 .learn(super::NetworkLearnStrategy::BatchGradientDecent {
-                    training_pairs: random_word_vectors
-                        .map(|(x, y)| (LayerValues::new(x.clone()), LayerValues::new(y.clone())))
-                        .collect(),
+                    training_pairs,
                     batch_size: 100,
                     learn_rate,
                 })?;
@@ -91,7 +93,7 @@ impl Embedding {
             counter += 1;
         }
         let cost = cost_sum / counter as NodeValue;
-        println!(" -- net train iter cost {cost}");
+        // println!(" -- net train iter cost {cost}");
 
         Ok(cost)
     }
@@ -196,11 +198,19 @@ impl Embedding {
         }
 
         let (nearest_vocab, nearest_dot_product) = dot_products
-            .into_iter()
+            .iter()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
             .ok_or(())?;
 
-        Ok((nearest_vocab.clone(), nearest_dot_product))
+        let (furthest_vocab, furthest_dot_product) = dot_products
+            .iter()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+            .ok_or(())?;
+
+        let available_range = 1.0 - furthest_dot_product;
+        let similarity_fact = (nearest_dot_product - furthest_dot_product) / available_range;
+
+        Ok((nearest_vocab.to_string(), similarity_fact))
     }
 
     fn one_hot(&self, idx: usize) -> impl Iterator<Item = NodeValue> {
@@ -234,7 +244,7 @@ mod tests {
 
         let phrases: Vec<Vec<String>> = iter::repeat(phrases.into_iter())
             .flatten()
-            .take(250)
+            .take(500)
             .map(|phrase| {
                 phrase
                     .split_whitespace()
@@ -252,17 +262,84 @@ mod tests {
         let embedding = setup_embeddings(
             (vocab, phrases),
             TestEmbeddingConfig {
-                embedding_size: 8,
+                embedding_size: 2,
                 training_rounds: 1000,
                 max_phrases_count: 500,
                 word_locality_factor: 2,
-                train_rate: 1e-3,
-                test_phrases_pct: 20.0,
+                train_rate: 1e-2,
+                test_phrases_pct: 10.0,
             },
         );
 
         // assert_eq!("wine", embedding.nearest("bottle").unwrap().0.as_str());
         assert_eq!("piano", embedding.nearest("violin").unwrap().0.as_str());
+    }
+
+    #[test]
+    fn can_network_learn_every_layers_grad_descent_sigmoid() {
+        let phrases = [
+            "bottle wine bottle wine bottle wine bottle wine",
+            "piano violin piano violin piano violin piano violin",
+            "piano violin piano violin piano violin piano violin",
+            "piano violin piano violin piano violin piano violin",
+            "pizza pasta pizza pasta pizza pasta pizza pasta",
+            "coffee soda coffee soda coffee soda coffee soda",
+            "bottle soda bottle soda bottle soda bottle soda",
+        ];
+
+        // let phrases = iter::repeat(phrases.into_iter()).flatten().take(250);
+        let phrases = phrases.iter();
+
+        let phrases: Vec<Vec<String>> = phrases
+            .map(|phrase| {
+                phrase
+                    .split_whitespace()
+                    .map(|word| word.to_string())
+                    .collect()
+            })
+            .collect();
+
+        let vocab: HashSet<String> = phrases
+            .iter()
+            .flat_map(|phrase| phrase.iter())
+            .cloned()
+            .collect();
+
+        let test_embedding_config = TestEmbeddingConfig {
+            embedding_size: 8,
+            training_rounds: 0,
+            max_phrases_count: 500,
+            word_locality_factor: 2,
+            train_rate: 1e-3,
+            test_phrases_pct: 0.0,
+        };
+        let mut embedding =
+            setup_embeddings((vocab, phrases.clone()), test_embedding_config.clone());
+
+        let each_layer_weights = (*embedding.embeddings("piano").unwrap()).clone();
+        let init_nearest = embedding.nearest("piano");
+
+        embedding
+            .train(
+                &phrases,
+                test_embedding_config.train_rate,
+                test_embedding_config.word_locality_factor,
+            )
+            .unwrap();
+
+        let current_nearest = embedding.nearest("piano");
+        let current_layer_weights = (*embedding.embeddings("piano").unwrap()).clone();
+
+        let diffs = current_layer_weights
+            .iter()
+            .zip(each_layer_weights.iter())
+            .map(|(c, i)| c - i)
+            .collect::<Vec<_>>();
+
+        dbg!(diffs);
+        dbg!((&init_nearest, &current_nearest));
+        assert_ne!(&each_layer_weights, &current_layer_weights);
+        assert_ne!(&init_nearest, &current_nearest);
     }
 
     #[test]
@@ -275,14 +352,15 @@ mod tests {
                 embedding_size: 80,
                 training_rounds: 50,
                 max_phrases_count: 250,
-                word_locality_factor: 5,
-                train_rate: 1e-3,
-                test_phrases_pct: 20.0,
+                word_locality_factor: 2,
+                train_rate: 1e-2,
+                test_phrases_pct: 10.0,
             },
         );
         todo!("finish test case")
     }
 
+    #[derive(Clone)]
     struct TestEmbeddingConfig {
         embedding_size: usize,
         training_rounds: usize,
@@ -329,13 +407,24 @@ mod tests {
 
                 if &predicted == actual {
                     correct_first_word_predictions += 1;
+                    for word in embedding.vocab.keys() {
+                        if word != actual {
+                            seen_pairs.remove(&(word.clone(), actual.clone()));
+                        }
+                    }
+                    if seen_pairs.insert((predicted.clone(), actual.clone())) {
+                        println!(
+                            "embed! round = {}, ✅ correctly identified new prediction pairing.. '{last_word} {predicted}' was predicted correctly",
+                            round + 1
+                        );
+                    }
                 } else {
                     let error = embedding.compute_error(testing_phrase).unwrap();
                     errors.push(error);
 
                     if seen_pairs.insert((predicted.clone(), actual.clone())) {
                         println!(
-                            "embed! round = {}, found new messed up prediction pairing.. '{last_word} {predicted}' was predicted instead of '{last_word} {actual}'",
+                            "  embed! round = {}, ❌ found new messed up prediction pairing.. '{last_word} {predicted}' was predicted instead of '{last_word} {actual}'",
                             round + 1
                         );
                     }
