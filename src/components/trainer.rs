@@ -1,10 +1,12 @@
+mod handle;
+
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
 };
 
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::__rt::WasmRefCell;
+use web_sys::console::log_1;
 use yew::prelude::*;
 
 use crate::{
@@ -21,65 +23,187 @@ pub struct EmbeddingTrainerProps {
 pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
     let embedding_training_config = (*props.config).clone();
 
-    let vocab_and_phrases = use_state(|| {
-        parse_vocab_and_phrases(Some(embedding_training_config.max_vocab_words_count))
-    });
+    let vocab_and_phrases =
+        use_state(|| Rc::new((Default::default(), Default::default(), Default::default())));
     let chart_points = use_state(|| vec![]);
-    let random_vocab_seed = use_state(|| 0);
-    let train_fn = use_state(|| None);
-
-    let nearest_target = use_state(|| Some("anyone".to_string()));
-    let nearest_message = use_state(|| "".to_string());
+    let train_iter_count = use_state(|| 0);
+    let embedding_handle = use_state(|| handle::EmbeddingHandle::default());
 
     use_effect_with_deps(
         {
             let vocab_and_phrases = vocab_and_phrases.clone();
+            let embedding_training_config = embedding_training_config.clone();
             move |config: &TrainEmbeddingConfig| {
-                vocab_and_phrases.set(parse_vocab_and_phrases(Some(config.max_vocab_words_count)));
+                let (vocab, mut phrases) =
+                    parse_vocab_and_phrases(Some(config.max_vocab_words_count));
+                let TrainEmbeddingConfig {
+                    max_phrases_count,
+                    test_phrases_pct,
+                    ..
+                } = embedding_training_config;
+
+                let testing_phrases =
+                    split_training_and_testing(&mut phrases, max_phrases_count, test_phrases_pct);
+
+                vocab_and_phrases.set(Rc::new((vocab, phrases, testing_phrases)));
                 move || {}
             }
         },
         (*props.config).clone(),
     );
+
+    use_effect_with_deps(
+        {
+            let chart_points = chart_points.clone();
+            let embedding_handle = embedding_handle.clone();
+            let embedding_training_config = embedding_training_config.clone();
+
+            move |vocab_and_phrases: &Rc<(HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>)>| {
+                let (vocab, phrases, testing_phrases) = &**vocab_and_phrases;
+                let TrainEmbeddingConfig {
+                    embedding_size,
+                    training_rounds,
+                    word_locality_factor,
+                    train_rate,
+                    ..
+                } = embedding_training_config;
+
+                let mut embedding_instance =
+                    Embedding::new(vocab.clone(), embedding_size, Rc::new(JsRng::default()));
+
+                let mut testing_phrases_errors = vec![];
+
+                for _ in 0..training_rounds {
+                    let error = train_embedding(
+                        &mut embedding_instance,
+                        &phrases,
+                        train_rate,
+                        word_locality_factor,
+                        testing_phrases,
+                    );
+                    testing_phrases_errors.push(error);
+                }
+
+                let error_chart_points = testing_phrases_errors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| (i as f64, *x))
+                    .collect::<Vec<(f64, f64)>>();
+
+                chart_points.set(error_chart_points);
+                embedding_handle.set(embedding_handle.replace(embedding_instance));
+
+                move || {}
+            }
+        },
+        (*vocab_and_phrases).clone(),
+    );
+
+    let onclick_train_iter = {
+        let chart_points = chart_points.clone();
+        let vocab_and_phrases = vocab_and_phrases.clone();
+        let train_iter_count = train_iter_count.clone();
+        let embedding_handle = embedding_handle.clone();
+        let embedding_training_config = embedding_training_config.clone();
+
+        move |_| {
+            let next_handle = embedding_handle.replace_with(|mut embedding_instance| {
+                let (_, phrases, testing_phrases) = &**vocab_and_phrases;
+                let mut errors = (*chart_points).clone();
+
+                let TrainEmbeddingConfig {
+                    word_locality_factor,
+                    train_rate,
+                    ..
+                } = embedding_training_config;
+
+                let error = train_embedding(
+                    &mut embedding_instance,
+                    &phrases,
+                    train_rate,
+                    word_locality_factor,
+                    testing_phrases,
+                );
+
+                errors.push((errors.len() as f64, error));
+
+                chart_points.set(errors);
+                train_iter_count.set(*train_iter_count + 1);
+                embedding_instance
+            });
+            embedding_handle.set(next_handle);
+        }
+    };
+
+    html! {
+        <div class="trainer">
+            <h2>{"WASM Word Embeddings"}</h2>
+            <p>{
+                format!(
+                    "Extracted {} vocab words from {} phrases (mean length = {} words)",
+                    vocab_and_phrases.0.len(),
+                    vocab_and_phrases.1.len(),
+                    vocab_and_phrases.1.iter().map(|x| x.len()).sum::<usize>() as f32
+                        / vocab_and_phrases.1.len() as f32
+                )
+            }</p>
+            <button onclick={onclick_train_iter}>{ format!("Run Training Iteration") }</button>
+            <EmbeddingNearest
+                vocab_and_phrases={(*vocab_and_phrases).clone()}
+                embedding={(*embedding_handle).clone()}
+                iter_hint={*train_iter_count}
+            />
+            <PlotComponent points={(*chart_points).clone()} />
+        </div>
+    }
+}
+
+#[derive(Properties, Clone, PartialEq)]
+pub struct EmbeddingNearestProps {
+    pub vocab_and_phrases: Rc<(HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>)>,
+    pub embedding: handle::EmbeddingHandle,
+    #[prop_or_default]
+    pub iter_hint: usize,
+}
+
+#[function_component]
+pub fn EmbeddingNearest(props: &EmbeddingNearestProps) -> Html {
+    let vocab_and_phrases = props.vocab_and_phrases.clone();
+    let embedding = props.embedding.clone();
+    let iter_hint = props.iter_hint.clone();
+
+    let random_vocab_seed = use_state(|| 0);
+    let nearest_target = use_state(|| Some("anyone".to_string()));
+    let nearest_message = use_state(|| "".to_string());
+
     use_effect_with_deps(
         {
             let nearest_message = nearest_message.clone();
-            let train_fn = train_fn.clone();
-            move |nearest_target: &Option<String>| {
+
+            move |(nearest_target, embedding, i): &(Option<String>, handle::EmbeddingHandle, _)| {
+                log_1(&format!("iter hint = {i}").into());
                 nearest_message.set(format!(
                     "Nearest vocab word to '{}' is ...",
                     nearest_target.clone().unwrap_or_else(|| "...".to_string())
                 ));
-                // if let Some(mut train_fn) = train_fn.as_ref().map(|train_fn: | train_fn.borrow_mut())
-                // {
-                //     if let Some(nearest_target) = nearest_target {
-                //         let tasks = vec![
-                //             EmbeddingTasks::SkipTrain(),
-                //             EmbeddingTasks::GetNearest(nearest_target.clone()),
-                //         ];
-                //         let (error, task_outputs) = train_fn(tasks);
-                //         let task_outputs = train_fn();
-                //         if let Some(EmbeddingTasksOutput::GetNearest(
-                //             EmbeddingTasks::GetNearest(word),
-                //             Ok(next_nearest),
-                //         )) = task_outputs.into_iter().find(|x| {
-                //             if let EmbeddingTasksOutput::GetNearest(..) = &x {
-                //                 true
-                //             } else {
-                //                 false
-                //             }
-                //         }) {
-                //             nearest_message.set(format!(
-                //                 "Nearest vocab word to '{}' is {} (with a distance of {})",
-                //                 word, next_nearest.0, next_nearest.1
-                //             ));
-                //         }
-                //     }
-                // }
+
+                if let Some(word) = nearest_target {
+                    let nearest = embedding.borrow().nearest(&word);
+                    log_1(&format!("nearest = {nearest:?}").into());
+
+                    match nearest {
+                        Ok(next_nearest) => nearest_message.set(format!(
+                            "Nearest vocab word to '{}' is {} (with a distance of {})",
+                            word, next_nearest.0, next_nearest.1
+                        )),
+                        Err(_) => (),
+                    }
+                }
+
                 move || {}
             }
         },
-        (*nearest_target).clone(),
+        ((*nearest_target).clone(), embedding.clone(), iter_hint),
     );
 
     use_effect_with_deps(
@@ -87,10 +211,10 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
             let nearest_target = nearest_target.clone();
 
             move |(vocab_and_phrases, _): &(
-                UseStateHandle<(HashSet<String>, Vec<Vec<String>>)>,
+                Rc<(HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>)>,
                 _,
             )| {
-                let (vocab, _) = &**vocab_and_phrases;
+                let (vocab, _, _) = &**vocab_and_phrases;
                 let rand_range = JsRng::default().rand_range(0, vocab.len());
                 if let Some(random_vocab) = vocab.iter().nth(rand_range) {
                     nearest_target.set(Some(random_vocab.clone()));
@@ -102,69 +226,6 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
         (vocab_and_phrases.clone(), *random_vocab_seed),
     );
 
-    use_effect_with_deps(
-        {
-            let chart_points = chart_points.clone();
-            let train_fn = train_fn.clone();
-            let nearest_target = nearest_target.clone();
-
-            move |vocab_and_phrases: &UseStateHandle<(HashSet<String>, Vec<Vec<String>>)>| {
-                let (vocab, phrases) = &**vocab_and_phrases;
-
-                let (errors, train) =
-                    train_embeddings((vocab.clone(), phrases.clone()), embedding_training_config);
-                let error_chart_points = errors
-                    .iter()
-                    .enumerate()
-                    .map(|(i, x)| (i as f64, *x))
-                    .collect::<Vec<(f64, f64)>>();
-
-                chart_points.set(error_chart_points);
-                train_fn.set(Some(WasmRefCell::new(train)));
-                move || {}
-            }
-        },
-        vocab_and_phrases.clone(),
-    );
-
-    let onclick_train_iter = {
-        let chart_points = chart_points.clone();
-        let train_fn = train_fn.clone();
-        let nearest_target = nearest_target.clone();
-        let nearest_message = nearest_message.clone();
-
-        move |_| {
-            if let Some(mut train_fn) = train_fn.as_ref().map(|train_fn| train_fn.borrow_mut()) {
-                let mut errors = (*chart_points).clone();
-
-                let mut tasks = vec![];
-                if let Some(nearest_target) = &*nearest_target {
-                    tasks.push(EmbeddingTasks::GetNearest(nearest_target.to_string()));
-                }
-
-                let (error, task_outputs) = train_fn(tasks);
-                errors.push((errors.len() as f64, error));
-
-                chart_points.set(errors);
-                if let Some(EmbeddingTasksOutput::GetNearest(
-                    EmbeddingTasks::GetNearest(word),
-                    Ok(next_nearest),
-                )) = task_outputs.into_iter().find(|x| {
-                    if let EmbeddingTasksOutput::GetNearest(..) = &x {
-                        true
-                    } else {
-                        false
-                    }
-                }) {
-                    nearest_message.set(format!(
-                        "Nearest vocab word to '{}' is {} (with a distance of {})",
-                        word, next_nearest.0, next_nearest.1
-                    ));
-                }
-            }
-        }
-    };
-
     let onclick_new_vocab_word = {
         let random_vocab_seed = random_vocab_seed.clone();
 
@@ -172,16 +233,10 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
     };
 
     html! {
-        <div class="trainer">
-            <h2>{"WASM Word Embeddings"}</h2>
-            <p>{format!("Extracted {} vocab words from {} phrases", vocab_and_phrases.0.len(), vocab_and_phrases.1.len())}</p>
-            <button onclick={onclick_train_iter}>{ format!("Run Training Iteration") }</button>
-            <div class="trainer-nearest">
-                <h3>{"Test random 'nearest' word"}</h3>
-                <button onclick={onclick_new_vocab_word}>{ format!("New word") }</button>
-                <p>{nearest_message.to_string()}</p>
-            </div>
-            <PlotComponent points={(*chart_points).clone()} />
+        <div class="trainer-nearest">
+            <h3>{"Test random 'nearest' word"}</h3>
+            <button onclick={onclick_new_vocab_word}>{ format!("New word") }</button>
+            <p>{nearest_message.to_string()}</p>
         </div>
     }
 }
@@ -197,108 +252,39 @@ pub struct TrainEmbeddingConfig {
     pub test_phrases_pct: NodeValue,
 }
 
-pub(crate) type EmbeddingError = NodeValue;
+fn train_embedding(
+    embedding: &mut Embedding,
+    phrases: &Vec<Vec<String>>,
+    train_rate: f64,
+    word_locality_factor: usize,
+    testing_phrases: &Vec<Vec<String>>,
+) -> f64 {
+    let train_timer_label = &"embedding train";
+    web_sys::console::time_with_label(train_timer_label);
 
-#[derive(Clone)]
-pub enum EmbeddingTasks {
-    SkipTrain(),
-    GetNearest(String),
+    embedding
+        .train(&phrases, train_rate, word_locality_factor)
+        .unwrap();
+
+    web_sys::console::time_end_with_label(train_timer_label);
+
+    embedding.compute_error_batch(&testing_phrases).unwrap()
 }
 
-pub enum EmbeddingTasksOutput {
-    GetNearest(EmbeddingTasks, Result<(String, NodeValue), ()>),
-    None,
-}
-
-pub(crate) fn train_embeddings(
-    (vocab, mut phrases): (HashSet<String>, Vec<Vec<String>>),
-    TrainEmbeddingConfig {
-        embedding_size,
-        training_rounds,
-        word_locality_factor,
-        max_phrases_count,
-        max_vocab_words_count: _,
-        train_rate,
-        test_phrases_pct,
-    }: TrainEmbeddingConfig,
-) -> (
-    Vec<EmbeddingError>,
-    impl FnMut(Vec<EmbeddingTasks>) -> (EmbeddingError, Vec<EmbeddingTasksOutput>),
-) {
-    let rng = Rc::new(JsRng::default());
-    let mut embedding = Embedding::new(vocab, embedding_size, rng.clone());
-
-    let testing_phrases =
-        split_training_and_testing(&mut phrases, max_phrases_count, test_phrases_pct);
-    let mut testing_phrases_errors = vec![];
-
-    let mut train_fn = move |tasks: Vec<EmbeddingTasks>| {
-        let train_timer_label = &"embedding train";
-        web_sys::console::time_with_label(train_timer_label);
-        let skip = tasks
-            .iter()
-            .find(|x| {
-                if let EmbeddingTasks::SkipTrain() = &x {
-                    true
-                } else {
-                    false
-                }
-            })
-            .is_some();
-
-        if !skip {
-            embedding
-                .train(&phrases, train_rate, word_locality_factor)
-                .unwrap();
-        }
-        web_sys::console::time_end_with_label(train_timer_label);
-
-        let error = embedding.compute_error_batch(&testing_phrases).unwrap();
-
-        let task_outputs = tasks
-            .iter()
-            .map(|task| match &task {
-                EmbeddingTasks::GetNearest(word) => {
-                    EmbeddingTasksOutput::GetNearest(task.clone(), embedding.nearest(word))
-                }
-                EmbeddingTasks::SkipTrain() => EmbeddingTasksOutput::None,
-            })
-            .collect();
-
-        (error, task_outputs)
-    };
-
-    for _ in 0..training_rounds {
-        let (error, _) = train_fn(vec![]);
-        testing_phrases_errors.push(error);
-    }
-
-    (testing_phrases_errors, train_fn)
-}
-
-pub(crate) fn split_training_and_testing(
+fn split_training_and_testing(
     phrases: &mut Vec<Vec<String>>,
     max_phrases_count: usize,
     test_phrases_pct: f64,
 ) -> Vec<Vec<String>> {
     _ = phrases.split_off(max_phrases_count.min(phrases.len()));
-    let testing_phrases = phrases.split_off(
-        phrases.len()
-            - (phrases.len() as NodeValue * (test_phrases_pct as NodeValue / 100.0)) as usize,
-    );
-    // log_1(
-    //     &format!(
-    //         "{:#?}",
-    //         phrases.iter().map(|x| x.join(" ")).collect::<Vec<_>>()
-    //     )
-    //     .into(),
-    // );
-    testing_phrases
+
+    let testing_count = phrases.len() as NodeValue * (test_phrases_pct as NodeValue / 100.0);
+    let testing_count = testing_count as usize;
+
+    phrases.split_off(phrases.len() - testing_count)
 }
 
-pub(crate) fn parse_vocab_and_phrases(
-    max_vocab: Option<usize>,
-) -> (HashSet<String>, Vec<Vec<String>>) {
+fn parse_vocab_and_phrases(max_vocab: Option<usize>) -> (HashSet<String>, Vec<Vec<String>>) {
     let phrase_json = include_str!("../../res/phrase_list.json");
     let phrase_json: serde_json::Value = serde_json::from_str(phrase_json).unwrap();
     let mut phrases: Vec<Vec<String>> = phrase_json
@@ -341,7 +327,8 @@ pub(crate) fn parse_vocab_and_phrases(
     if max_vocab.is_some() {
         phrases = phrases
             .into_iter()
-            .filter(|phrase| phrase.iter().any(|word| vocab.contains(word)))
+            .map(|phrase| phrase.into_iter().take_while(|word| vocab.contains(word)).collect::<Vec<_>>())
+            .filter(|x| !x.is_empty())
             .collect();
         phrases.sort_by_key(|phrase| -(phrase.len() as i64));
     }
