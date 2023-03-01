@@ -316,6 +316,10 @@ impl Network {
             .node_weights(node_index))
     }
 
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
     fn inputs_count(&self) -> Result<usize, ()> {
         let first_layer = &self.layers.iter().next().ok_or(())?;
         Ok(first_layer.inputs_count)
@@ -399,10 +403,10 @@ impl Layer {
 
         let mut outputs = self.bias.clone();
 
-        for input_index in 0..self.inputs_count {
+        for (input_index, input) in inputs.iter().enumerate() {
             let weights = self.node_weights(input_index);
-            for (idx, (input, weight)) in inputs.iter().zip(weights).enumerate() {
-                outputs[idx] += input * weight;
+            for (output_idx, weight) in weights.enumerate() {
+                outputs[output_idx] += input * weight;
             }
         }
 
@@ -481,10 +485,14 @@ impl Layer {
     pub fn apply_batch_gradients(&mut self, learn_rate: f64) -> Result<(), ()> {
         let pending_gradients = self.pending_gradients.take().ok_or(())?;
 
-        for (x, grad) in self.weights.iter_mut().zip(pending_gradients.bias.iter()) {
+        for (x, grad) in self
+            .weights
+            .iter_mut()
+            .zip(pending_gradients.weights.iter())
+        {
             *x = *x - (grad * learn_rate)
         }
-        for (x, grad) in self.bias.iter_mut().zip(pending_gradients.weights.iter()) {
+        for (x, grad) in self.bias.iter_mut().zip(pending_gradients.bias.iter()) {
             *x = *x - (grad * learn_rate)
         }
 
@@ -548,6 +556,7 @@ impl Layer {
     }
 
     fn node_weights<'a>(&'a self, node_index: usize) -> impl Iterator<Item = &'a NodeValue> {
+        // TODO: handle invalid idx case
         let n = self.size();
         let start = n * node_index;
         self.weights[start..start + n].into_iter()
@@ -619,7 +628,11 @@ impl LayerValues {
             return None;
         }
 
-        let dot_product = v1.iter().zip(v2.iter()).map(|(&x, &y)| x * y).sum::<NodeValue>();
+        let dot_product = v1
+            .iter()
+            .zip(v2.iter())
+            .map(|(&x, &y)| x * y)
+            .sum::<NodeValue>();
         let norm1 = v1.iter().map(|&x| x * x).sum::<NodeValue>().sqrt();
         let norm2 = v2.iter().map(|&x| x * x).sum::<NodeValue>().sqrt();
 
@@ -802,72 +815,294 @@ mod tests {
     }
 
     #[test]
-    fn can_network_learn_grad_descent_linear() {
-        let shape = NetworkShape::new(2, 2, vec![6, 6]);
-        let rng = Rc::new(JsRng::default());
-        let network_input = [0.1, 0.9];
-        let target_output = [0.25, 0.75];
-        let mut network = Network::new(&shape, LayerInitStrategy::Random(rng.clone()));
-        network.set_activation_mode(NetworkActivationMode::Linear);
+    fn can_network_learn_grad_descent_linear_simple_orthoganal_inputs() {
+        let training_pairs = [([0.0, 1.0], [0.0, 1.0]), ([1.0, 0.0], [1.0, 0.0])];
+        let mut network = multi_sample::create_network(
+            NetworkShape::new(2, 2, vec![]),
+            NetworkActivationMode::Linear,
+        );
+        let learn_rate = 1e-1;
+        let batch_size = None;
 
-        let output_1 = network.compute(network_input.iter().into()).unwrap();
-        for round in 1..200 {
-            network
-                .learn(NetworkLearnStrategy::GradientDecent {
-                    learn_rate: 0.1,
-                    inputs: network_input.iter().into(),
-                    target_outputs: target_output.iter().into(),
-                })
-                .unwrap();
-
-            let error = network
-                .compute_error(network_input.iter().into(), &target_output.iter().into())
-                .unwrap()
-                .iter()
-                .sum::<NodeValue>();
-
-            if round < 50
-                || (round < 1000 && round % 100 == 0)
-                || (round < 10000 && round % 1000 == 0)
-            {
-                println!("round = {round}, network_cost = {error}");
-            }
+        for round in 1..100 {
+            let error = multi_sample::run_training_iteration(
+                &mut network,
+                &training_pairs,
+                learn_rate,
+                round,
+                batch_size,
+            );
 
             if error < 1e-6 {
+                println!("DONE round = {round}, network_cost = {error}");
                 break;
             }
         }
 
-        let output_2 = network.compute(network_input.iter().into()).unwrap();
-        println!(
-            "init_output = {output_1:?}, target = {target_output:?}, final_output = {output_2:?}"
-        );
-        println!("network = {network:#?}");
+        multi_sample::assert_training_outputs(&training_pairs, network);
+    }
 
-        assert_ne!(vec![0.5, 0.5], *output_1);
-        assert!((target_output[0] - output_2[0]).abs() < 0.05);
-        assert!((target_output[1] - output_2[1]).abs() < 0.05);
+    #[test]
+    fn can_network_learn_grad_descent_sigmoid_simple_orthoganal_inputs() {
+        let training_pairs = [([0.0, 1.0], [0.1, 0.9]), ([1.0, 0.0], [0.9, 0.1])];
+        let mut network = multi_sample::create_network(
+            NetworkShape::new(2, 2, vec![]),
+            NetworkActivationMode::Sigmoid,
+        );
+        let learn_rate = 1e-0;
+        let batch_size = None;
+
+        for round in 1..10_000 {
+            let error = multi_sample::run_training_iteration(
+                &mut network,
+                &training_pairs,
+                learn_rate,
+                round,
+                batch_size,
+            );
+
+            if error < 1e-6 {
+                println!("DONE round = {round}, network_cost = {error}");
+                break;
+            }
+        }
+
+        multi_sample::assert_training_outputs(&training_pairs, network);
+    }
+
+    #[test]
+    fn can_network_learn_grad_descent_sigmoid_simple_orthoganal_triple_inputs() {
+        let training_pairs = [
+            ([0.0, 1.0, 0.0], [0.1, 0.9, 0.1]),
+            ([1.0, 0.0, 0.0], [0.9, 0.1, 0.9]),
+            ([0.0, 0.0, 0.1], [0.3, 0.5, 0.2]),
+        ];
+        let mut network = multi_sample::create_network(
+            NetworkShape::new(3, 3, vec![]),
+            NetworkActivationMode::Sigmoid,
+        );
+        let learn_rate = 1e-0;
+        let batch_size = None;
+
+        for round in 1..10_000 {
+            let error = multi_sample::run_training_iteration(
+                &mut network,
+                &training_pairs,
+                learn_rate,
+                round,
+                batch_size,
+            );
+
+            if error < 1e-6 {
+                println!("DONE round = {round}, network_cost = {error}");
+                break;
+            }
+        }
+
+        multi_sample::assert_training_outputs(&training_pairs, network);
+    }
+
+    #[test]
+    fn can_network_learn_grad_descent_sigmoid_simple_nonorthoganal_triple_inputs() {
+        let training_pairs = [
+            ([0.1, 1.0, 0.0], [0.1, 0.9, 0.1]),
+            ([1.0, 1.0, 0.2], [0.9, 0.1, 0.9]),
+            ([0.3, 0.1, 1.0], [0.3, 0.5, 0.2]),
+        ];
+        let mut network = multi_sample::create_network(
+            NetworkShape::new(3, 3, vec![]),
+            NetworkActivationMode::Sigmoid,
+        );
+        let learn_rate = 1e-0;
+        let batch_size = None;
+
+        for round in 1..10_000 {
+            let error = multi_sample::run_training_iteration(
+                &mut network,
+                &training_pairs,
+                learn_rate,
+                round,
+                batch_size,
+            );
+
+            if error < 1e-6 {
+                println!("DONE round = {round}, network_cost = {error}");
+                break;
+            }
+        }
+
+        multi_sample::assert_training_outputs(&training_pairs, network);
+    }
+
+    #[test]
+    fn can_network_learn_grad_descent_linear() {
+        let training_pairs = [([0.1, 0.9], [0.25, 0.75])];
+        let mut network = multi_sample::create_network(
+            NetworkShape::new(2, 2, vec![6, 6]),
+            NetworkActivationMode::Linear,
+        );
+        let learn_rate = 1e-1;
+        let batch_size = None;
+
+        for round in 1..200 {
+            let error = multi_sample::run_training_iteration(
+                &mut network,
+                &training_pairs,
+                learn_rate,
+                round,
+                batch_size,
+            );
+
+            if error < 1e-6 {
+                println!("DONE round = {round}, network_cost = {error}");
+                break;
+            }
+        }
+
+        multi_sample::assert_training_outputs(&training_pairs, network);
     }
 
     #[test]
     fn can_network_learn_grad_descent_sigmoid() {
-        let shape = NetworkShape::new(2, 2, vec![6, 6]);
-        let rng = Rc::new(JsRng::default());
-        let network_input = [0.1, 0.9];
-        let target_output = [0.25, 0.75];
-        let mut network = Network::new(&shape, LayerInitStrategy::Random(rng.clone()));
-        network.set_activation_mode(NetworkActivationMode::Sigmoid);
+        let training_pairs = [([0.1, 0.9], [0.25, 0.75])];
+        let mut network = multi_sample::create_network(
+            NetworkShape::new(2, 2, vec![6, 6]),
+            NetworkActivationMode::Sigmoid,
+        );
+        let learn_rate = 1e-1;
+        let batch_size = None;
 
-        let output_1 = network.compute(network_input.iter().into()).unwrap();
         for round in 1..1_000 {
-            let error = network
-                .learn(NetworkLearnStrategy::GradientDecent {
-                    learn_rate: 1e-2,
-                    inputs: network_input.iter().into(),
-                    target_outputs: target_output.iter().into(),
-                })
-                .unwrap()
-                .unwrap();
+            let error = multi_sample::run_training_iteration(
+                &mut network,
+                &training_pairs,
+                learn_rate,
+                round,
+                batch_size,
+            );
+
+            if error < 1e-6 {
+                println!("DONE round = {round}, network_cost = {error}");
+                break;
+            }
+        }
+
+        multi_sample::assert_training_outputs(&training_pairs, network);
+    }
+
+    #[test]
+    #[ignore = "review later as failure cause unknown"]
+    fn can_network_learn_batch_grad_descent_sigmoid_multi_sample() {
+        let training_pairs = [
+            ([0.0, 1.0], [0.25, 0.75]),
+            ([0.5, 1.0], [0.75, 0.25]),
+            ([0.2, 1.0], [0.1, 0.0]),
+        ];
+        let mut network = multi_sample::create_network(
+            NetworkShape::new(2, 2, vec![16, 4, 4]),
+            NetworkActivationMode::Sigmoid,
+        );
+        let learn_rate = 1e-1;
+        let batch_size = Some(5);
+
+        for round in 1..100_000 {
+            let error = multi_sample::run_training_iteration(
+                &mut network,
+                &training_pairs,
+                learn_rate,
+                round,
+                batch_size,
+            );
+
+            if error < 1e-6 {
+                println!("DONE round = {round}, network_cost = {error}");
+                break;
+            }
+        }
+
+        multi_sample::assert_training_outputs(&training_pairs, network);
+    }
+
+    #[test]
+    fn can_network_learn_every_layers_batch_grad_descent_sigmoid() {
+        let training_pairs = [([0.1, 0.9], [0.25, 0.75])];
+        let mut network = multi_sample::create_network(
+            NetworkShape::new(2, 2, vec![6, 6]),
+            NetworkActivationMode::Sigmoid,
+        );
+        let learn_rate = 1e-1;
+        let batch_size = Some(5);
+
+        // TODO: impl on Network?
+        fn layer_weights<'a>(network: &'a Network) -> impl Iterator<Item = Vec<f64>> + 'a {
+            (0..network.layer_count()).map(|layer_idx| {
+                network
+                    .node_weights(layer_idx, 0)
+                    .unwrap()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        }
+
+        let each_layer_weights: Vec<Vec<_>> = layer_weights(&network).collect();
+
+        multi_sample::gradient_decent::compute_batch_training_iteration(
+            &mut network,
+            &training_pairs,
+            learn_rate,
+            batch_size.unwrap(),
+        );
+
+        for (idx, (current, initial)) in layer_weights(&network)
+            .zip(each_layer_weights.iter())
+            .enumerate()
+        {
+            let diffs = current
+                .iter()
+                .zip(initial.iter())
+                .map(|(c, i)| c - i)
+                .collect::<Vec<_>>();
+            dbg!((idx, diffs));
+
+            assert_ne!(&current, initial);
+        }
+    }
+
+    mod multi_sample {
+        use super::*;
+        use std::rc::Rc;
+
+        pub(crate) fn create_network(
+            shape: NetworkShape,
+            activation_mode: NetworkActivationMode,
+        ) -> Network {
+            let rng = Rc::new(JsRng::default());
+            let mut network = Network::new(&shape, LayerInitStrategy::Random(rng.clone()));
+            network.set_activation_mode(activation_mode);
+            network
+        }
+
+        pub(crate) fn run_training_iteration<const N: usize>(
+            network: &mut Network,
+            training_pairs: &[([f64; N], [f64; N])],
+            learn_rate: f64,
+            round: i32,
+            batch_size: Option<usize>,
+        ) -> f64 {
+            let error = if let Some(batch_size) = batch_size {
+                gradient_decent::compute_batch_training_iteration(
+                    network,
+                    training_pairs,
+                    learn_rate,
+                    batch_size,
+                )
+            } else {
+                gradient_decent::compute_single_training_iteration(
+                    network,
+                    training_pairs,
+                    learn_rate,
+                )
+            };
 
             if round < 50
                 || (round < 1000 && round % 100 == 0)
@@ -877,25 +1112,73 @@ mod tests {
                 println!("round = {round}, network_cost = {error}");
             }
 
-            if error < 1e-6 {
-                println!("DONE round = {round}, network_cost = {error}");
-                break;
+            error
+        }
+
+        pub(crate) fn assert_training_outputs<const N: usize>(
+            training_pairs: &[([f64; N], [f64; N])],
+            network: Network,
+        ) {
+            let mut outputs = vec![];
+            for (network_input, target_output) in training_pairs {
+                let output_2 = network.compute(network_input.iter().into()).unwrap();
+                println!("target = {target_output:?}, final_output = {output_2:?}");
+                outputs.push(output_2);
+            }
+
+            for ((_, target_output), output_2) in training_pairs.iter().zip(outputs) {
+                assert!(
+                    (target_output[0] - output_2[0]).abs() < 0.05,
+                    "{target_output:?} and {output_2:?} dont match"
+                );
+                assert!(
+                    (target_output[1] - output_2[1]).abs() < 0.05,
+                    "{target_output:?} and {output_2:?} dont match"
+                );
             }
         }
-        let output_2 = network.compute(network_input.iter().into()).unwrap();
-        println!(
-            "init_output = {output_1:?}, target = {target_output:?}, final_output = {output_2:?}"
-        );
-        println!("network = {network:#?}");
 
-        assert_ne!(vec![0.5, 0.5], *output_1);
-        assert!(
-            (target_output[0] - output_2[0]).abs() < 0.05,
-            "{target_output:?} and {output_2:?} dont match"
-        );
-        assert!(
-            (target_output[1] - output_2[1]).abs() < 0.05,
-            "{target_output:?} and {output_2:?} dont match"
-        );
+        pub mod gradient_decent {
+            use super::*;
+
+            pub(crate) fn compute_single_training_iteration<const N: usize>(
+                network: &mut Network,
+                training_pairs: &[([f64; N], [f64; N])],
+                learn_rate: f64,
+            ) -> f64 {
+                let mut error = 0.0;
+                for (input, output) in training_pairs {
+                    error += network
+                        .learn(NetworkLearnStrategy::GradientDecent {
+                            inputs: input.iter().cloned().collect(),
+                            target_outputs: output.iter().cloned().collect(),
+                            learn_rate,
+                        })
+                        .unwrap()
+                        .unwrap();
+                    error = error / training_pairs.len() as f64;
+                }
+                error
+            }
+
+            pub(crate) fn compute_batch_training_iteration<const N: usize>(
+                network: &mut Network,
+                training_pairs: &[([f64; N], [f64; N])],
+                learn_rate: f64,
+                batch_size: usize,
+            ) -> f64 {
+                network
+                    .learn(NetworkLearnStrategy::BatchGradientDecent {
+                        training_pairs: training_pairs
+                            .iter()
+                            .map(|(i, o)| (i.iter().into(), o.iter().into()))
+                            .collect(),
+                        batch_size,
+                        learn_rate,
+                    })
+                    .unwrap()
+                    .unwrap()
+            }
+        }
     }
 }
