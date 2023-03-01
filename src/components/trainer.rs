@@ -1,18 +1,17 @@
 mod handle;
+mod nearest;
 
-use std::{
-    collections::{HashMap, HashSet},
-    rc::Rc,
-};
+use std::{collections::HashSet, rc::Rc};
 
-use serde::{Deserialize, Serialize};
-use web_sys::console::log_1;
 use yew::prelude::*;
 
 use crate::{
     components::PlotComponent,
-    ml::{embeddings::Embedding, JsRng, NodeValue, ShuffleRng, RNG},
+    ml::{embeddings::Embedding, JsRng},
 };
+
+pub use parser::TrainEmbeddingConfig;
+use nearest::EmbeddingNearest;
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct EmbeddingTrainerProps {
@@ -35,15 +34,18 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
             let embedding_training_config = embedding_training_config.clone();
             move |config: &TrainEmbeddingConfig| {
                 let (vocab, mut phrases) =
-                    parse_vocab_and_phrases(Some(config.max_vocab_words_count));
+                    parser::parse_vocab_and_phrases(Some(config.max_vocab_words_count));
                 let TrainEmbeddingConfig {
                     max_phrases_count,
                     test_phrases_pct,
                     ..
                 } = embedding_training_config;
 
-                let testing_phrases =
-                    split_training_and_testing(&mut phrases, max_phrases_count, test_phrases_pct);
+                let testing_phrases = parser::split_training_and_testing(
+                    &mut phrases,
+                    max_phrases_count,
+                    test_phrases_pct,
+                );
 
                 vocab_and_phrases.set(Rc::new((vocab, phrases, testing_phrases)));
                 move || {}
@@ -74,7 +76,7 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
                 let mut testing_phrases_errors = vec![];
 
                 for _ in 0..training_rounds {
-                    let error = train_embedding(
+                    let error = parser::train_embedding(
                         &mut embedding_instance,
                         &phrases,
                         train_rate,
@@ -117,7 +119,7 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
                     ..
                 } = embedding_training_config;
 
-                let error = train_embedding(
+                let error = parser::train_embedding(
                     &mut embedding_instance,
                     &phrases,
                     train_rate,
@@ -158,180 +160,112 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
     }
 }
 
-#[derive(Properties, Clone, PartialEq)]
-pub struct EmbeddingNearestProps {
-    pub vocab_and_phrases: Rc<(HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>)>,
-    pub embedding: handle::EmbeddingHandle,
-    #[prop_or_default]
-    pub iter_hint: usize,
-}
+mod parser {
+    use std::collections::{HashMap, HashSet};
 
-#[function_component]
-pub fn EmbeddingNearest(props: &EmbeddingNearestProps) -> Html {
-    let vocab_and_phrases = props.vocab_and_phrases.clone();
-    let embedding = props.embedding.clone();
-    let iter_hint = props.iter_hint.clone();
+    use serde::{Deserialize, Serialize};
 
-    let random_vocab_seed = use_state(|| 0);
-    let nearest_target = use_state(|| Some("anyone".to_string()));
-    let nearest_message = use_state(|| "".to_string());
+    use crate::ml::{embeddings::Embedding, JsRng, NodeValue, ShuffleRng};
 
-    use_effect_with_deps(
-        {
-            let nearest_message = nearest_message.clone();
-
-            move |(nearest_target, embedding, i): &(Option<String>, handle::EmbeddingHandle, _)| {
-                log_1(&format!("iter hint = {i}").into());
-                nearest_message.set(format!(
-                    "Nearest vocab word to '{}' is ...",
-                    nearest_target.clone().unwrap_or_else(|| "...".to_string())
-                ));
-
-                if let Some(word) = nearest_target {
-                    let nearest = embedding.borrow().nearest(&word);
-                    log_1(&format!("nearest = {nearest:?}").into());
-
-                    match nearest {
-                        Ok(next_nearest) => nearest_message.set(format!(
-                            "Nearest vocab word to '{}' is {} (with a distance of {})",
-                            word, next_nearest.0, next_nearest.1
-                        )),
-                        Err(_) => (),
-                    }
-                }
-
-                move || {}
-            }
-        },
-        ((*nearest_target).clone(), embedding.clone(), iter_hint),
-    );
-
-    use_effect_with_deps(
-        {
-            let nearest_target = nearest_target.clone();
-
-            move |(vocab_and_phrases, _): &(
-                Rc<(HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>)>,
-                _,
-            )| {
-                let (vocab, _, _) = &**vocab_and_phrases;
-                let rand_range = JsRng::default().rand_range(0, vocab.len());
-                if let Some(random_vocab) = vocab.iter().nth(rand_range) {
-                    nearest_target.set(Some(random_vocab.clone()));
-                }
-
-                move || {}
-            }
-        },
-        (vocab_and_phrases.clone(), *random_vocab_seed),
-    );
-
-    let onclick_new_vocab_word = {
-        let random_vocab_seed = random_vocab_seed.clone();
-
-        move |_| random_vocab_seed.set(*random_vocab_seed + 1)
-    };
-
-    html! {
-        <div class="trainer-nearest">
-            <h3>{"Test random 'nearest' word"}</h3>
-            <button onclick={onclick_new_vocab_word}>{ format!("New word") }</button>
-            <p>{nearest_message.to_string()}</p>
-        </div>
+    #[derive(Clone, PartialEq, Serialize, Deserialize)]
+    pub struct TrainEmbeddingConfig {
+        pub embedding_size: usize,
+        pub training_rounds: usize,
+        pub max_phrases_count: usize,
+        pub max_vocab_words_count: usize,
+        pub word_locality_factor: usize,
+        pub train_rate: NodeValue,
+        pub test_phrases_pct: NodeValue,
     }
-}
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct TrainEmbeddingConfig {
-    pub embedding_size: usize,
-    pub training_rounds: usize,
-    pub max_phrases_count: usize,
-    pub max_vocab_words_count: usize,
-    pub word_locality_factor: usize,
-    pub train_rate: NodeValue,
-    pub test_phrases_pct: NodeValue,
-}
+    pub(crate) fn train_embedding(
+        embedding: &mut Embedding,
+        phrases: &Vec<Vec<String>>,
+        train_rate: f64,
+        word_locality_factor: usize,
+        testing_phrases: &Vec<Vec<String>>,
+    ) -> f64 {
+        let train_timer_label = &"embedding train";
+        web_sys::console::time_with_label(train_timer_label);
 
-fn train_embedding(
-    embedding: &mut Embedding,
-    phrases: &Vec<Vec<String>>,
-    train_rate: f64,
-    word_locality_factor: usize,
-    testing_phrases: &Vec<Vec<String>>,
-) -> f64 {
-    let train_timer_label = &"embedding train";
-    web_sys::console::time_with_label(train_timer_label);
+        embedding
+            .train(&phrases, train_rate, word_locality_factor)
+            .unwrap();
 
-    embedding
-        .train(&phrases, train_rate, word_locality_factor)
-        .unwrap();
+        web_sys::console::time_end_with_label(train_timer_label);
 
-    web_sys::console::time_end_with_label(train_timer_label);
+        embedding.compute_error_batch(&testing_phrases).unwrap()
+    }
 
-    embedding.compute_error_batch(&testing_phrases).unwrap()
-}
+    pub(crate) fn split_training_and_testing(
+        phrases: &mut Vec<Vec<String>>,
+        max_phrases_count: usize,
+        test_phrases_pct: f64,
+    ) -> Vec<Vec<String>> {
+        _ = phrases.split_off(max_phrases_count.min(phrases.len()));
 
-fn split_training_and_testing(
-    phrases: &mut Vec<Vec<String>>,
-    max_phrases_count: usize,
-    test_phrases_pct: f64,
-) -> Vec<Vec<String>> {
-    _ = phrases.split_off(max_phrases_count.min(phrases.len()));
+        let testing_count = phrases.len() as NodeValue * (test_phrases_pct as NodeValue / 100.0);
+        let testing_count = testing_count as usize;
 
-    let testing_count = phrases.len() as NodeValue * (test_phrases_pct as NodeValue / 100.0);
-    let testing_count = testing_count as usize;
+        phrases.split_off(phrases.len() - testing_count)
+    }
 
-    phrases.split_off(phrases.len() - testing_count)
-}
-
-fn parse_vocab_and_phrases(max_vocab: Option<usize>) -> (HashSet<String>, Vec<Vec<String>>) {
-    let phrase_json = include_str!("../../res/phrase_list.json");
-    let phrase_json: serde_json::Value = serde_json::from_str(phrase_json).unwrap();
-    let mut phrases: Vec<Vec<String>> = phrase_json
-        .as_array()
-        .unwrap()
-        .into_iter()
-        .map(|value| {
-            value
-                .as_array()
-                .unwrap()
-                .into_iter()
-                .map(|value| value.as_str().unwrap().to_owned())
-                .collect()
-        })
-        .collect();
-
-    JsRng::default().shuffle_vec(&mut phrases);
-
-    let vocab = phrases
-        .iter()
-        .map(|phrase| phrase.iter().cloned())
-        .flatten()
-        .fold(HashMap::new(), |mut map, c| {
-            *map.entry(c).or_insert(0_usize) += 1;
-            map
-        })
-        .into_iter();
-    let vocab: HashSet<(String, usize)> = vocab.collect();
-    let mut vocab: Vec<_> = vocab.into_iter().collect();
-
-    JsRng::default().shuffle_vec(&mut vocab);
-    vocab.sort_by_key(|(_, count)| -(*count as i64));
-
-    let vocab = vocab.into_iter().map(|(v, _)| v);
-    let vocab: HashSet<String> = match max_vocab {
-        Some(max_vocab) => vocab.take(max_vocab).collect(),
-        None => vocab.collect(),
-    };
-
-    if max_vocab.is_some() {
-        phrases = phrases
+    pub(crate) fn parse_vocab_and_phrases(
+        max_vocab: Option<usize>,
+    ) -> (HashSet<String>, Vec<Vec<String>>) {
+        let phrase_json = include_str!("../../res/phrase_list.json");
+        let phrase_json: serde_json::Value = serde_json::from_str(phrase_json).unwrap();
+        let mut phrases: Vec<Vec<String>> = phrase_json
+            .as_array()
+            .unwrap()
             .into_iter()
-            .map(|phrase| phrase.into_iter().take_while(|word| vocab.contains(word)).collect::<Vec<_>>())
-            .filter(|x| !x.is_empty())
+            .map(|value| {
+                value
+                    .as_array()
+                    .unwrap()
+                    .into_iter()
+                    .map(|value| value.as_str().unwrap().to_owned())
+                    .collect()
+            })
             .collect();
-        phrases.sort_by_key(|phrase| -(phrase.len() as i64));
-    }
 
-    (vocab, phrases)
+        JsRng::default().shuffle_vec(&mut phrases);
+
+        let vocab = phrases
+            .iter()
+            .map(|phrase| phrase.iter().cloned())
+            .flatten()
+            .fold(HashMap::new(), |mut map, c| {
+                *map.entry(c).or_insert(0_usize) += 1;
+                map
+            })
+            .into_iter();
+        let vocab: HashSet<(String, usize)> = vocab.collect();
+        let mut vocab: Vec<_> = vocab.into_iter().collect();
+
+        JsRng::default().shuffle_vec(&mut vocab);
+        vocab.sort_by_key(|(_, count)| -(*count as i64));
+
+        let vocab = vocab.into_iter().map(|(v, _)| v);
+        let vocab: HashSet<String> = match max_vocab {
+            Some(max_vocab) => vocab.take(max_vocab).collect(),
+            None => vocab.collect(),
+        };
+
+        if max_vocab.is_some() {
+            phrases = phrases
+                .into_iter()
+                .map(|phrase| {
+                    phrase
+                        .into_iter()
+                        .take_while(|word| vocab.contains(word))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|x| !x.is_empty())
+                .collect();
+            phrases.sort_by_key(|phrase| -(phrase.len() as i64));
+        }
+
+        (vocab, phrases)
+    }
 }
