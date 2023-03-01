@@ -1,17 +1,13 @@
 mod handle;
 mod nearest;
 
-use std::{collections::HashSet, rc::Rc};
+use std::rc::Rc;
 
-use web_sys::console::log_1;
 use yew::prelude::*;
-use yew_hooks::use_timeout;
 
-use crate::{
-    components::PlotComponent,
-    ml::{embeddings::Embedding, JsRng},
-};
+use crate::components::PlotComponent;
 
+use hook::use_embeddings;
 use nearest::EmbeddingNearest;
 pub use parser::TrainEmbeddingConfig;
 
@@ -24,127 +20,35 @@ pub struct EmbeddingTrainerProps {
 pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
     let embedding_training_config = (*props.config).clone();
 
+    let chart_points = use_state(|| vec![]);
+    let embedding_handle = use_state(|| handle::EmbeddingHandle::default());
     let vocab_and_phrases =
         use_state(|| Rc::new((Default::default(), Default::default(), Default::default())));
-    let chart_points = use_state(|| vec![]);
     let train_iter_count = use_state(|| 0);
-    let embedding_handle = use_state(|| handle::EmbeddingHandle::default());
 
-    let train_remaining_iters = use_state(|| 0_usize);
-    let train_timeout = use_timeout(
-        {
-            let chart_points = chart_points.clone();
-            let vocab_and_phrases = vocab_and_phrases.clone();
-            let train_iter_count = train_iter_count.clone();
-            let embedding_handle = embedding_handle.clone();
-            let embedding_training_config = embedding_training_config.clone();
-            let train_remaining_iters = train_remaining_iters.clone();
-            move || {
-                if *train_remaining_iters <= 0 {
-                    return;
-                }
+    let setup_state = {
+        let embedding_handle = embedding_handle.clone();
+        let vocab_and_phrases = vocab_and_phrases.clone();
 
-                let next_handle = embedding_handle.replace_with(|mut embedding_instance| {
-                    let (_, phrases, testing_phrases) = &**vocab_and_phrases;
-                    let mut errors = (*chart_points).clone();
+        move |(e_handle, v_and_p)| {
+            embedding_handle.set(e_handle);
+            vocab_and_phrases.set(v_and_p);
+        }
+    };
 
-                    let TrainEmbeddingConfig {
-                        word_locality_factor,
-                        train_rate,
-                        ..
-                    } = embedding_training_config;
+    let train_remaining_iters = use_embeddings(props.config.clone(), setup_state, {
+        let chart_points = chart_points.clone();
+        let train_iter_count = train_iter_count.clone();
 
-                    let error = parser::train_embedding(
-                        &mut embedding_instance,
-                        &phrases,
-                        train_rate,
-                        word_locality_factor,
-                        testing_phrases,
-                    );
+        move |embedding, error| {
+            let mut errors = (*chart_points).clone();
+            errors.push((errors.len() as f64, error));
 
-                    errors.push((errors.len() as f64, error));
-
-                    chart_points.set(errors);
-                    train_iter_count.set(*train_iter_count + 1);
-                    embedding_instance
-                });
-                
-                embedding_handle.set(next_handle);
-                train_remaining_iters.set(*train_remaining_iters - 1);
-            }
-        },
-        5,
-    );
-
-    use_effect_with_deps(
-        {
-            let train_timeout = train_timeout.clone();
-            move |train_remaining_iters: &usize| {
-                if *train_remaining_iters > 0 {
-                    train_timeout.reset();
-                }
-            }
-        },
-        *train_remaining_iters,
-    );
-
-    use_effect_with_deps(
-        {
-            let vocab_and_phrases = vocab_and_phrases.clone();
-            let embedding_training_config = embedding_training_config.clone();
-            let train_remaining_iters = train_remaining_iters.clone();
-            move |config: &TrainEmbeddingConfig| {
-                let (vocab, mut phrases) =
-                    parser::parse_vocab_and_phrases(Some(config.max_vocab_words_count));
-                let TrainEmbeddingConfig {
-                    max_phrases_count,
-                    test_phrases_pct,
-                    ..
-                } = embedding_training_config;
-
-                let testing_phrases = parser::split_training_and_testing(
-                    &mut phrases,
-                    max_phrases_count,
-                    test_phrases_pct,
-                );
-
-                vocab_and_phrases.set(Rc::new((vocab, phrases, testing_phrases)));
-                train_remaining_iters.set(0);
-                move || {}
-            }
-        },
-        (*props.config).clone(),
-    );
-
-    use_effect_with_deps(
-        {
-            let chart_points = chart_points.clone();
-            let embedding_handle = embedding_handle.clone();
-            let embedding_training_config = embedding_training_config.clone();
-            let train_remaining_iters = train_remaining_iters.clone();
-
-            move |vocab_and_phrases: &Rc<(HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>)>| {
-                let (vocab, phrases, testing_phrases) = &**vocab_and_phrases;
-                let TrainEmbeddingConfig {
-                    embedding_size,
-                    training_rounds,
-                    word_locality_factor,
-                    train_rate,
-                    ..
-                } = embedding_training_config;
-
-                let mut embedding_instance =
-                    Embedding::new(vocab.clone(), embedding_size, Rc::new(JsRng::default()));
-
-                chart_points.set(vec![]);
-                embedding_handle.set(embedding_handle.replace(embedding_instance));
-                train_remaining_iters.set(training_rounds);
-
-                move || {}
-            }
-        },
-        (*vocab_and_phrases).clone(),
-    );
+            chart_points.set(errors);
+            train_iter_count.set(*train_iter_count + 1);
+            embedding
+        }
+    });
 
     let onclick_train_iter = {
         let train_remaining_iters = train_remaining_iters.clone();
@@ -190,6 +94,162 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
                 iter_hint={*train_iter_count}
             />
         </div>
+    }
+}
+
+mod hook {
+    use std::{collections::HashSet, rc::Rc};
+
+    use yew::prelude::*;
+    use yew_hooks::use_timeout;
+
+    use crate::ml::{embeddings::Embedding, JsRng};
+
+    use super::{
+        handle::{self, EmbeddingHandle},
+        parser, TrainEmbeddingConfig,
+    };
+
+    #[hook]
+    pub fn use_embeddings<F, V>(
+        config: Rc<TrainEmbeddingConfig>,
+        set_initial_state_fn: V,
+        with_emedding_fn: F,
+    ) -> UseStateHandle<usize>
+    where
+        F: FnOnce(Embedding, f64) -> Embedding + 'static,
+        V: FnOnce(
+                (
+                    EmbeddingHandle,
+                    Rc<(HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>)>,
+                ),
+            ) -> ()
+            + 'static,
+    {
+        let embedding_training_config = (*config).clone();
+
+        let vocab_and_phrases =
+            use_state(|| Rc::new((Default::default(), Default::default(), Default::default())));
+        let embedding_handle = use_state(|| handle::EmbeddingHandle::default());
+
+        let train_remaining_iters = use_state(|| 0_usize);
+
+        let train_timeout = use_timeout(
+            {
+                let vocab_and_phrases = vocab_and_phrases.clone();
+                let embedding_handle = embedding_handle.clone();
+                let embedding_training_config = embedding_training_config.clone();
+                let train_remaining_iters = train_remaining_iters.clone();
+
+                move || {
+                    if *train_remaining_iters <= 0 {
+                        return;
+                    }
+
+                    embedding_handle.set(embedding_handle.replace_with(
+                        |mut embedding_instance| {
+                            let (_, phrases, testing_phrases) = &**vocab_and_phrases;
+
+                            let TrainEmbeddingConfig {
+                                word_locality_factor,
+                                train_rate,
+                                ..
+                            } = embedding_training_config;
+
+                            let error = parser::train_embedding(
+                                &mut embedding_instance,
+                                &phrases,
+                                train_rate,
+                                word_locality_factor,
+                                testing_phrases,
+                            );
+
+                            let embedding_instance = with_emedding_fn(embedding_instance, error);
+
+                            embedding_instance
+                        },
+                    ));
+
+                    train_remaining_iters.set(*train_remaining_iters - 1);
+                }
+            },
+            5,
+        );
+
+        use_effect_with_deps(
+            {
+                let train_timeout = train_timeout.clone();
+                move |train_remaining_iters: &usize| {
+                    if *train_remaining_iters > 0 {
+                        train_timeout.reset();
+                    }
+                }
+            },
+            *train_remaining_iters,
+        );
+
+        use_effect_with_deps(
+            {
+                let vocab_and_phrases = vocab_and_phrases.clone();
+                let embedding_training_config = embedding_training_config.clone();
+                let train_remaining_iters = train_remaining_iters.clone();
+                move |config: &TrainEmbeddingConfig| {
+                    let (vocab, mut phrases) =
+                        parser::parse_vocab_and_phrases(Some(config.max_vocab_words_count));
+                    let TrainEmbeddingConfig {
+                        max_phrases_count,
+                        test_phrases_pct,
+                        ..
+                    } = embedding_training_config;
+
+                    let testing_phrases = parser::split_training_and_testing(
+                        &mut phrases,
+                        max_phrases_count,
+                        test_phrases_pct,
+                    );
+
+                    let v_and_p = Rc::new((vocab, phrases, testing_phrases));
+                    vocab_and_phrases.set(v_and_p);
+                    train_remaining_iters.set(0);
+                    move || {}
+                }
+            },
+            embedding_training_config.clone(),
+        );
+
+        use_effect_with_deps(
+            {
+                let embedding_handle = embedding_handle.clone();
+                let embedding_training_config = embedding_training_config.clone();
+                let train_remaining_iters = train_remaining_iters.clone();
+
+                move |vocab_and_phrases: &Rc<(
+                    HashSet<String>,
+                    Vec<Vec<String>>,
+                    Vec<Vec<String>>,
+                )>| {
+                    let (vocab, ..) = &**vocab_and_phrases;
+                    let TrainEmbeddingConfig {
+                        embedding_size,
+                        training_rounds,
+                        ..
+                    } = embedding_training_config;
+
+                    let embedding_instance =
+                        Embedding::new(vocab.clone(), embedding_size, Rc::new(JsRng::default()));
+
+                    let next_handle = embedding_handle.replace(embedding_instance);
+                    set_initial_state_fn((next_handle.tick(), vocab_and_phrases.clone()));
+                    embedding_handle.set(next_handle);
+                    train_remaining_iters.set(training_rounds);
+
+                    move || {}
+                }
+            },
+            (*vocab_and_phrases).clone(),
+        );
+
+        train_remaining_iters
     }
 }
 
