@@ -3,6 +3,7 @@ mod nearest;
 
 use std::rc::Rc;
 
+use itertools::Itertools;
 use yew::prelude::*;
 
 use crate::components::PlotComponent;
@@ -22,11 +23,13 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
 
     let chart_points = use_state(|| vec![]);
     let train_iter_count = use_state(|| 0);
+    let generated_phrase = use_state(|| String::new());
 
     let (embedding_handle, vocab_and_phrases, train_remaining_iters) =
         use_embeddings(props.config.clone(), {
             let chart_points = chart_points.clone();
             let train_iter_count = train_iter_count.clone();
+            let generated_phrase = generated_phrase.clone();
 
             move |embedding, error| {
                 let mut errors = (*chart_points).clone();
@@ -34,8 +37,17 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
 
                 chart_points.set(errors);
                 train_iter_count.set(*train_iter_count + 1);
+                generated_phrase.set(embedding.predict_iter("money").join(" "));
 
                 embedding
+            }
+        }, {
+            let chart_points = chart_points.clone();
+            let generated_phrase = generated_phrase.clone();
+
+            move || {
+                chart_points.set(vec![]);
+                generated_phrase.set(String::new());
             }
         });
 
@@ -75,6 +87,7 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
                 <button onclick={onclick_train_iter}>{ format!("Run Training Iteration") }</button>
                 <button onclick={onclick_train_stop} disabled={*train_remaining_iters == 0}>{ format!("Stop Training Iterations") }</button>
                 <p>{format!("Queued iterations = {}",*train_remaining_iters)}</p>
+                <p>{&*generated_phrase}</p>
             </div>
             <PlotComponent points={(*chart_points).clone()} />
             <EmbeddingNearest
@@ -102,9 +115,10 @@ mod hook {
     pub type VocabAndPhrases = (HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>);
 
     #[hook]
-    pub fn use_embeddings<F>(
+    pub fn use_embeddings<F, C>(
         config: Rc<TrainEmbeddingConfig>,
         with_emedding_fn: F,
+        cleanup_fn: C
     ) -> (
         UseStateHandle<EmbeddingHandle>,
         UseStateHandle<Rc<VocabAndPhrases>>,
@@ -112,6 +126,7 @@ mod hook {
     )
     where
         F: FnOnce(Embedding, f64) -> Embedding + 'static,
+        C: FnOnce() -> () + 'static,
     {
         let vocab_and_phrases =
             use_state(|| Rc::new((Default::default(), Default::default(), Default::default())));
@@ -184,7 +199,7 @@ mod hook {
                     vocab_and_phrases.set(v_and_p);
                     train_remaining_iters.set(0);
 
-                    move || {}
+                    move || {cleanup_fn();}
                 }
             },
             config.clone(),
