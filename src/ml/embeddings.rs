@@ -4,7 +4,10 @@ use std::{
     rc::Rc,
 };
 
-use super::{LayerInitStrategy, LayerValues, Network, NetworkShape, NodeValue, RNG};
+use super::{
+    BatchSamplingStrategy, LayerInitStrategy, LayerValues, Network, NetworkLearnStrategy,
+    NetworkShape, NodeValue, RNG,
+};
 
 pub struct Embedding {
     network: Network,
@@ -26,7 +29,7 @@ impl Embedding {
 
         let mut network = Network::new(
             &NetworkShape::new(vocab_len, vocab_len, vec![size]),
-            LayerInitStrategy::Random(rng.clone()),
+            LayerInitStrategy::PositiveRandom(rng.clone()),
         );
 
         network.set_activation_mode(super::NetworkActivationMode::Sigmoid);
@@ -82,10 +85,11 @@ impl Embedding {
 
             let cost = self
                 .network
-                .learn(super::NetworkLearnStrategy::BatchGradientDecent {
+                .learn(NetworkLearnStrategy::BatchGradientDecent {
                     training_pairs,
                     batch_size: 100,
                     learn_rate,
+                    batch_sampling: BatchSamplingStrategy::Sequential,
                 })?;
 
             let cost = cost.unwrap_or_default();
@@ -230,8 +234,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "simple but not enough data?"]
-    fn embeddings_work_simple() {
+    fn embeddings_work_simple_prediction() {
         let phrases = [
             "bottle wine bottle wine bottle wine bottle wine",
             "piano violin piano violin piano violin piano violin",
@@ -244,7 +247,7 @@ mod tests {
 
         let phrases: Vec<Vec<String>> = iter::repeat(phrases.into_iter())
             .flatten()
-            .take(500)
+            .take(50)
             .map(|phrase| {
                 phrase
                     .split_whitespace()
@@ -262,8 +265,8 @@ mod tests {
         let embedding = setup_embeddings(
             (vocab, phrases),
             TestEmbeddingConfig {
-                embedding_size: 2,
-                training_rounds: 1000,
+                embedding_size: 5,
+                training_rounds: 150,
                 max_phrases_count: 500,
                 word_locality_factor: 2,
                 train_rate: 1e-2,
@@ -272,7 +275,7 @@ mod tests {
         );
 
         // assert_eq!("wine", embedding.nearest("bottle").unwrap().0.as_str());
-        assert_eq!("piano", embedding.nearest("violin").unwrap().0.as_str());
+        assert_eq!("piano", embedding.predict_next("violin").unwrap().as_str());
     }
 
     #[test]

@@ -50,6 +50,16 @@ impl<T: RNG> ShuffleRng for T {
         }
     }
 }
+impl ShuffleRng for Rc<dyn RNG> {
+    fn shuffle_vec<E>(&self, vec: &mut Vec<E>) {
+        let len = vec.len();
+
+        for i in 0..len {
+            let j = self.rand_range(i, len);
+            vec.swap(i, j);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct NetworkShape {
@@ -171,6 +181,7 @@ impl Network {
                 training_pairs,
                 batch_size,
                 learn_rate,
+                batch_sampling,
             } => {
                 use itertools::Itertools;
                 if training_pairs.is_empty() {
@@ -180,7 +191,18 @@ impl Network {
                 let mut sum_error = 0.0;
                 let training_pairs_len = training_pairs.len();
 
-                for training_pairs in training_pairs.into_iter().chunks(batch_size).into_iter() {
+                let batches = match batch_sampling {
+                    BatchSamplingStrategy::Sequential => {
+                        training_pairs.into_iter().chunks(batch_size)
+                    }
+                    BatchSamplingStrategy::Shuffle(rng) => {
+                        let mut training_pairs = training_pairs;
+                        rng.shuffle_vec(&mut training_pairs);
+                        training_pairs.into_iter().chunks(batch_size)
+                    }
+                };
+
+                for training_pairs in batches.into_iter() {
                     for (inputs, target_outputs) in training_pairs {
                         let layers_activations = self.compute_with_layers_activations(inputs)?;
 
@@ -368,31 +390,19 @@ impl PendingLayerGradients {
 impl Layer {
     pub fn new(size: usize, inputs_count: usize, init_stratergy: &LayerInitStrategy) -> Self {
         let weights_size = inputs_count * size;
-        let empty = Self {
+        let mut layer = Self {
             weights: vec![0.0; weights_size],
             bias: vec![0.0; size],
             pending_gradients: None,
             inputs_count,
         };
 
-        let scale_factor = (inputs_count as NodeValue).powf(-0.5);
+        init_stratergy.apply(
+            layer.weights.iter_mut().chain(layer.bias.iter_mut()),
+            inputs_count,
+        );
 
-        match init_stratergy {
-            LayerInitStrategy::Zero => Self { ..empty },
-            LayerInitStrategy::Random(rng) => Self {
-                weights: empty
-                    .weights
-                    .iter()
-                    .map(|_| rng.rand() * scale_factor)
-                    .collect(),
-                bias: empty
-                    .bias
-                    .iter()
-                    .map(|_| rng.rand() * scale_factor)
-                    .collect(),
-                ..empty
-            },
-        }
+        layer
     }
 
     pub fn compute(&self, inputs: &LayerValues) -> Result<LayerValues, ()> {
@@ -465,6 +475,7 @@ impl Layer {
             } => {
                 let (weights_gradients, bias_gradients) =
                     self.compute_gradients_iter(gradients, layer_inputs)?;
+
                 let pending_gradients = self
                     .pending_gradients
                     .get_or_insert(PendingLayerGradients::new(&self));
@@ -633,6 +644,7 @@ impl LayerValues {
             .zip(v2.iter())
             .map(|(&x, &y)| x * y)
             .sum::<NodeValue>();
+
         let norm1 = v1.iter().map(|&x| x * x).sum::<NodeValue>().sqrt();
         let norm2 = v2.iter().map(|&x| x * x).sum::<NodeValue>().sqrt();
 
@@ -646,7 +658,34 @@ impl LayerValues {
 
 pub enum LayerInitStrategy {
     Zero,
-    Random(Rc<dyn RNG>),
+    PositiveRandom(Rc<dyn RNG>),
+    ScaledFullRandom(Rc<dyn RNG>),
+    FullRandom(Rc<dyn RNG>),
+}
+
+impl LayerInitStrategy {
+    pub fn apply<'a>(&self, values: impl Iterator<Item = &'a mut NodeValue>, inputs_count: usize) {
+        match self {
+            LayerInitStrategy::Zero => {}
+            LayerInitStrategy::PositiveRandom(rng) => {
+                let scale_factor = (inputs_count as NodeValue).powf(-0.5);
+                for value in values {
+                    *value = rng.rand() * scale_factor;
+                }
+            }
+            LayerInitStrategy::ScaledFullRandom(rng) => {
+                let scale_factor = (inputs_count as NodeValue).powf(-0.5);
+                for value in values {
+                    *value = rng.rand() * scale_factor * 2.0 - 1.0;
+                }
+            }
+            LayerInitStrategy::FullRandom(rng) => {
+                for value in values {
+                    *value = rng.rand() * 2.0 - 1.0;
+                }
+            }
+        }
+    }
 }
 
 pub enum LayerLearnStrategy {
@@ -680,8 +719,14 @@ pub enum NetworkLearnStrategy {
         training_pairs: Vec<(LayerValues, LayerValues)>,
         batch_size: usize,
         learn_rate: NodeValue,
+        batch_sampling: BatchSamplingStrategy,
     },
     Multi(Vec<NetworkLearnStrategy>),
+}
+
+pub enum BatchSamplingStrategy {
+    Sequential,
+    Shuffle(Rc<dyn RNG>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -689,6 +734,8 @@ pub enum NetworkActivationMode {
     Linear,
     SoftMax,
     Sigmoid,
+    Tanh,
+    RelU,
 }
 
 impl NetworkActivationMode {
@@ -703,6 +750,8 @@ impl NetworkActivationMode {
             NetworkActivationMode::Sigmoid => {
                 LayerValues(output.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect())
             }
+            NetworkActivationMode::Tanh => LayerValues(output.iter().map(|x| x.tanh()).collect()),
+            NetworkActivationMode::RelU => LayerValues(output.iter().map(|x| x.max(0.0)).collect()),
         }
     }
     fn derivative(&self, output: &LayerValues) -> LayerValues {
@@ -727,6 +776,12 @@ impl NetworkActivationMode {
                 sigmoid.iter_mut().for_each(|x| *x = *x * (1.0 - *x));
                 sigmoid
             }
+            NetworkActivationMode::Tanh => {
+                let mut sigmoid = self.apply(output);
+                sigmoid.iter_mut().for_each(|x| *x = 1.0 - x.powi(2));
+                sigmoid
+            }
+            NetworkActivationMode::RelU => output.iter().map(|x| x.signum().max(0.0)).collect(),
         }
     }
 }
@@ -783,8 +838,10 @@ mod tests {
     #[test]
     fn can_compute_hidden_layer_network_rands() {
         let shape = NetworkShape::new(2, 2, vec![8]);
-        let mut network =
-            Network::new(&shape, LayerInitStrategy::Random(Rc::new(JsRng::default())));
+        let mut network = Network::new(
+            &shape,
+            LayerInitStrategy::PositiveRandom(Rc::new(JsRng::default())),
+        );
         network.set_activation_mode(NetworkActivationMode::SoftMax);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
 
@@ -796,7 +853,7 @@ mod tests {
     fn can_network_learn_randomly() {
         let shape = NetworkShape::new(2, 2, vec![8]);
         let rng = Rc::new(JsRng::default());
-        let mut network = Network::new(&shape, LayerInitStrategy::Random(rng.clone()));
+        let mut network = Network::new(&shape, LayerInitStrategy::PositiveRandom(rng.clone()));
         network.set_activation_mode(NetworkActivationMode::SoftMax);
 
         let output_1 = network.compute([2.0, 2.0].iter().into()).unwrap();
@@ -853,6 +910,34 @@ mod tests {
         let batch_size = None;
 
         for round in 1..10_000 {
+            let error = multi_sample::run_training_iteration(
+                &mut network,
+                &training_pairs,
+                learn_rate,
+                round,
+                batch_size,
+            );
+
+            if error < 1e-6 {
+                println!("DONE round = {round}, network_cost = {error}");
+                break;
+            }
+        }
+
+        multi_sample::assert_training_outputs(&training_pairs, network);
+    }
+
+    #[test]
+    fn can_network_learn_grad_descent_tanh_simple_orthoganal_inputs() {
+        let training_pairs = [([0.0, 1.0], [0.1, 0.9]), ([1.0, 0.0], [0.9, 0.1])];
+        let mut network = multi_sample::create_network(
+            NetworkShape::new(2, 2, vec![]),
+            NetworkActivationMode::Tanh,
+        );
+        let learn_rate = 1e-1;
+        let batch_size = None;
+
+        for round in 1..100_000 {
             let error = multi_sample::run_training_iteration(
                 &mut network,
                 &training_pairs,
@@ -941,7 +1026,7 @@ mod tests {
             NetworkShape::new(2, 2, vec![6, 6]),
             NetworkActivationMode::Linear,
         );
-        let learn_rate = 1e-1;
+        let learn_rate = 1e-2;
         let batch_size = None;
 
         for round in 1..200 {
@@ -991,21 +1076,55 @@ mod tests {
     }
 
     #[test]
+    fn can_network_learn_batch_grad_descent_sigmoid_binary_classifier() {
+        let training_pairs = [
+            ([2.0, 3.0, -1.0], [1.0]),
+            ([3.0, -1.0, 0.5], [-1.0]),
+            ([0.5, 1.0, 1.0], [-1.0]),
+            ([1.0, 1.0, -1.0], [1.0]),
+        ];
+        let mut network = multi_sample::create_network(
+            NetworkShape::new(3, 1, vec![4, 4]),
+            NetworkActivationMode::Tanh,
+        );
+
+        let learn_rate = 0.05;
+        let batch_size = Some(training_pairs.len());
+
+        for round in 1..10_000 {
+            let error = multi_sample::run_training_iteration(
+                &mut network,
+                &training_pairs,
+                learn_rate,
+                round,
+                batch_size,
+            );
+
+            if error < 1e-4 {
+                println!("DONE round = {round}, network_cost = {error}");
+                break;
+            }
+        }
+
+        multi_sample::assert_training_outputs(&training_pairs, network);
+    }
+
+    #[test]
     #[ignore = "review later as failure cause unknown"]
     fn can_network_learn_batch_grad_descent_sigmoid_multi_sample() {
         let training_pairs = [
-            ([0.0, 1.0], [0.25, 0.75]),
-            ([0.5, 1.0], [0.75, 0.25]),
-            ([0.2, 1.0], [0.1, 0.0]),
+            ([0.0, 1.0], [0.3, 0.4]),
+            ([0.5, 1.0], [0.4, 0.3]),
+            ([0.2, 1.0], [0.5, 0.0]),
         ];
         let mut network = multi_sample::create_network(
-            NetworkShape::new(2, 2, vec![16, 4, 4]),
+            NetworkShape::new(2, 2, vec![16, 8, 4, 20]),
             NetworkActivationMode::Sigmoid,
         );
-        let learn_rate = 1e-1;
-        let batch_size = Some(5);
+        let learn_rate = 1e-2;
+        let batch_size = Some(training_pairs.len());
 
-        for round in 1..100_000 {
+        for round in 1..1_000_000 {
             let error = multi_sample::run_training_iteration(
                 &mut network,
                 &training_pairs,
@@ -1077,14 +1196,15 @@ mod tests {
             activation_mode: NetworkActivationMode,
         ) -> Network {
             let rng = Rc::new(JsRng::default());
-            let mut network = Network::new(&shape, LayerInitStrategy::Random(rng.clone()));
+            let mut network =
+                Network::new(&shape, LayerInitStrategy::ScaledFullRandom(rng.clone()));
             network.set_activation_mode(activation_mode);
             network
         }
 
-        pub(crate) fn run_training_iteration<const N: usize>(
+        pub(crate) fn run_training_iteration<const N: usize, const O: usize>(
             network: &mut Network,
-            training_pairs: &[([f64; N], [f64; N])],
+            training_pairs: &[([f64; N], [f64; O])],
             learn_rate: f64,
             round: i32,
             batch_size: Option<usize>,
@@ -1115,8 +1235,8 @@ mod tests {
             error
         }
 
-        pub(crate) fn assert_training_outputs<const N: usize>(
-            training_pairs: &[([f64; N], [f64; N])],
+        pub(crate) fn assert_training_outputs<const N: usize, const O: usize>(
+            training_pairs: &[([f64; N], [f64; O])],
             network: Network,
         ) {
             let mut outputs = vec![];
@@ -1127,23 +1247,21 @@ mod tests {
             }
 
             for ((_, target_output), output_2) in training_pairs.iter().zip(outputs) {
-                assert!(
-                    (target_output[0] - output_2[0]).abs() < 0.05,
-                    "{target_output:?} and {output_2:?} dont match"
-                );
-                assert!(
-                    (target_output[1] - output_2[1]).abs() < 0.05,
-                    "{target_output:?} and {output_2:?} dont match"
-                );
+                for (x, y) in target_output.iter().zip(output_2.iter()) {
+                    assert!(
+                        (x - y).abs() < 0.05,
+                        "{target_output:?} and {output_2:?} dont match"
+                    );
+                }
             }
         }
 
         pub mod gradient_decent {
             use super::*;
 
-            pub(crate) fn compute_single_training_iteration<const N: usize>(
+            pub(crate) fn compute_single_training_iteration<const N: usize, const O: usize>(
                 network: &mut Network,
-                training_pairs: &[([f64; N], [f64; N])],
+                training_pairs: &[([f64; N], [f64; O])],
                 learn_rate: f64,
             ) -> f64 {
                 let mut error = 0.0;
@@ -1161,9 +1279,9 @@ mod tests {
                 error
             }
 
-            pub(crate) fn compute_batch_training_iteration<const N: usize>(
+            pub(crate) fn compute_batch_training_iteration<const N: usize, const O: usize>(
                 network: &mut Network,
-                training_pairs: &[([f64; N], [f64; N])],
+                training_pairs: &[([f64; N], [f64; O])],
                 learn_rate: f64,
                 batch_size: usize,
             ) -> f64 {
@@ -1175,6 +1293,7 @@ mod tests {
                             .collect(),
                         batch_size,
                         learn_rate,
+                        batch_sampling: BatchSamplingStrategy::Sequential,
                     })
                     .unwrap()
                     .unwrap()
