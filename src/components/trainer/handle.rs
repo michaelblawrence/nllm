@@ -37,6 +37,7 @@ impl EmbeddingHandle {
         Embedding::new(
             Default::default(),
             Default::default(),
+            vec![],
             Rc::new(JsRng::default()),
         )
     }

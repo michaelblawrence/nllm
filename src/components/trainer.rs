@@ -22,16 +22,18 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
     let embedding_training_config = (*props.config).clone();
 
     let chart_points = use_state(|| vec![]);
+    let nll_chart_points = use_state(|| vec![]);
     let train_iter_count = use_state(|| 0);
     let generated_phrase = use_state(|| String::new());
 
     let (embedding_handle, vocab_and_phrases, train_remaining_iters) =
         use_embeddings(props.config.clone(), {
             let chart_points = chart_points.clone();
+            let nll_chart_points = nll_chart_points.clone();
             let train_iter_count = train_iter_count.clone();
             let generated_phrase = generated_phrase.clone();
 
-            move |embedding, error| {
+            move |embedding, error, pvt| {
                 let mut errors = (*chart_points).clone();
                 errors.push((errors.len() as f64, error));
 
@@ -39,14 +41,23 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
                 train_iter_count.set(*train_iter_count + 1);
                 generated_phrase.set(embedding.predict_iter("money").join(" "));
 
+                let (_, _, training_set) = &*pvt;
+                let nll = embedding.nll_batch(&training_set).unwrap();
+                let mut nlls = (*nll_chart_points).clone();
+                nlls.push((nlls.len() as f64, nll));
+
+                nll_chart_points.set(nlls);
+
                 embedding
             }
         }, {
             let chart_points = chart_points.clone();
+            let nll_chart_points = nll_chart_points.clone();
             let generated_phrase = generated_phrase.clone();
 
             move || {
                 chart_points.set(vec![]);
+                nll_chart_points.set(vec![]);
                 generated_phrase.set(String::new());
             }
         });
@@ -89,7 +100,10 @@ pub fn EmbeddingTrainer(props: &EmbeddingTrainerProps) -> Html {
                 <p>{format!("Queued iterations = {}",*train_remaining_iters)}</p>
                 <p>{&*generated_phrase}</p>
             </div>
+            <p>{"Training Errors"}</p>
             <PlotComponent points={(*chart_points).clone()} />
+            <p>{"Testing Loss (NLL)"}</p>
+            <PlotComponent points={(*nll_chart_points).clone()} />
             <EmbeddingNearest
                 vocab_and_phrases={(*vocab_and_phrases).clone()}
                 embedding={(*embedding_handle).clone()}
@@ -125,7 +139,7 @@ mod hook {
         UseStateHandle<usize>,
     )
     where
-        F: FnOnce(Embedding, f64) -> Embedding + 'static,
+        F: FnOnce(Embedding, f64, Rc<VocabAndPhrases>) -> Embedding + 'static,
         C: FnOnce() -> () + 'static,
     {
         let vocab_and_phrases =
@@ -154,11 +168,11 @@ mod hook {
                                 &mut embedding_instance,
                                 &phrases,
                                 config.train_rate,
-                                config.word_locality_factor,
+                                config.batch_size,
                                 testing_phrases,
                             );
 
-                            with_emedding_fn(embedding_instance, error)
+                            with_emedding_fn(embedding_instance, error, (*vocab_and_phrases).clone())
                         },
                     ));
 
@@ -217,6 +231,7 @@ mod hook {
                     embedding_handle.set(embedding_handle.replace(Embedding::new(
                         vocab.clone(),
                         config.embedding_size,
+                        vec![config.hidden_layer_nodes],
                         Rc::new(JsRng::default()),
                     )));
 
@@ -242,10 +257,11 @@ mod parser {
     #[derive(Clone, PartialEq, Serialize, Deserialize)]
     pub struct TrainEmbeddingConfig {
         pub embedding_size: usize,
+        pub hidden_layer_nodes: usize,
         pub training_rounds: usize,
         pub max_phrases_count: usize,
         pub max_vocab_words_count: usize,
-        pub word_locality_factor: usize,
+        pub batch_size: usize,
         pub train_rate: NodeValue,
         pub test_phrases_pct: NodeValue,
     }
@@ -254,19 +270,19 @@ mod parser {
         embedding: &mut Embedding,
         phrases: &Vec<Vec<String>>,
         train_rate: f64,
-        word_locality_factor: usize,
+        batch_size: usize,
         testing_phrases: &Vec<Vec<String>>,
     ) -> f64 {
         let train_timer_label = &"embedding train";
         web_sys::console::time_with_label(train_timer_label);
 
-        embedding
-            .train(&phrases, train_rate, word_locality_factor)
+        let loss = embedding
+            .train_v2(&phrases, train_rate, 1, batch_size)
             .unwrap();
 
         web_sys::console::time_end_with_label(train_timer_label);
-
-        embedding.compute_error_batch(&testing_phrases).unwrap()
+        
+        loss
     }
 
     pub(crate) fn split_training_and_testing(

@@ -1,3 +1,4 @@
+use wasm_bindgen::__rt::WasmRefCell;
 use yew::prelude::*;
 
 use crate::ml;
@@ -18,16 +19,22 @@ impl PlotComponentProps {
     }
 }
 
+static mut PLOT_COUNTER: usize = 0;
+
 #[function_component(PlotComponent)]
 pub fn plot_component(props: &PlotComponentProps) -> Html {
-    let plot_id = "plot-div";
+    let plot_id = use_state(|| {
+        let next_counter = get_next_counter();
+        format!("plot-div-{}", next_counter)
+    });
     let plot = use_state(|| construct_plot(props));
 
     let p = yew_hooks::use_async::<_, _, ()>({
         let plot = plot.clone();
+        let plot_id = plot_id.clone();
 
         async move {
-            plotly::bindings::react(plot_id, &*plot).await;
+            plotly::bindings::react(plot_id.as_str(), &*plot).await;
             Ok(())
         }
     });
@@ -45,8 +52,16 @@ pub fn plot_component(props: &PlotComponentProps) -> Html {
     );
 
     html! {
-        <div id={plot_id}></div>
+        <div id={(*plot_id).clone()}></div>
     }
+}
+
+// TODO: use guid etc. rather than counter for id creation
+fn get_next_counter() -> usize {
+    unsafe {
+        PLOT_COUNTER += 1;
+    }
+    unsafe { PLOT_COUNTER }
 }
 
 fn construct_plot(props: &PlotComponentProps) -> plotly::Plot {

@@ -19,12 +19,13 @@ fn App() -> Html {
                 Rc::new(input_config.clone())
             } else {
                 Rc::new(TrainEmbeddingConfig {
-                    embedding_size: 2,
+                    embedding_size: 4,
+                    hidden_layer_nodes: 15,
                     training_rounds: 0,
-                    max_phrases_count: 300,
-                    max_vocab_words_count: 125,
-                    word_locality_factor: 2,
-                    train_rate: 1e-2,
+                    max_phrases_count: 150,
+                    max_vocab_words_count: 100,
+                    batch_size: 32,
+                    train_rate: 1e-1,
                     test_phrases_pct: 20.0,
                 })
             }
