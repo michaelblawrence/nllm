@@ -252,7 +252,7 @@ mod parser {
 
     use serde::{Deserialize, Serialize};
 
-    use crate::ml::{embeddings::Embedding, JsRng, NodeValue, ShuffleRng};
+    use crate::ml::{embeddings::Embedding, JsRng, NodeValue, ShuffleRng, RNG};
 
     #[derive(Clone, PartialEq, Serialize, Deserialize)]
     pub struct TrainEmbeddingConfig {
@@ -317,7 +317,8 @@ mod parser {
             })
             .collect();
 
-        JsRng::default().shuffle_vec(&mut phrases);
+        let rng: &dyn RNG = &JsRng::default();
+        rng.shuffle_vec(&mut phrases);
 
         let vocab = phrases
             .iter()
@@ -331,7 +332,7 @@ mod parser {
         let vocab: HashSet<(String, usize)> = vocab.collect();
         let mut vocab: Vec<_> = vocab.into_iter().collect();
 
-        JsRng::default().shuffle_vec(&mut vocab);
+        rng.shuffle_vec(&mut vocab);
         vocab.sort_by_key(|(_, count)| -(*count as i64));
 
         let vocab = vocab.into_iter().map(|(v, _)| v);
