@@ -5,6 +5,8 @@ use std::{
     rc::Rc,
 };
 
+use tracing::debug;
+
 use super::{
     BatchSamplingStrategy, LayerInitStrategy, LayerValues, Network, NetworkActivationMode,
     NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, RNG, JsRng,
@@ -127,10 +129,10 @@ impl Embedding {
                     batch_sampling: BatchSamplingStrategy::Shuffle(self.rng.clone()),
                 })?;
             costs.push(cost);
-            // println!(
-            //     " -- net train iter cost {}",
-            //     cost.clone().unwrap_or_default()
-            // );
+            debug!(
+                " -- net train iter cost {}",
+                cost.clone().unwrap_or_default()
+            );
         }
 
         let cost = costs.iter().flatten().sum::<NodeValue>() / costs.len() as NodeValue;
@@ -193,7 +195,7 @@ impl Embedding {
             counter += 1;
         }
         let cost = cost_sum / counter as NodeValue;
-        // println!(" -- net train iter cost {cost}");
+        debug!(" -- net train iter cost {cost}");
 
         Ok(cost)
     }
@@ -402,7 +404,7 @@ impl Embedding {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
             .ok_or(())?;
 
-        let (furthest_vocab, furthest_dot_product) = dot_products
+        let (_furthest_vocab, furthest_dot_product) = dot_products
             .iter()
             .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
             .ok_or(())?;
@@ -440,6 +442,9 @@ impl Default for Embedding {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+
+    use test_log::test;
+    use tracing::info;
 
     use self::training::{TestEmbeddingConfig, TestEmbeddingConfigV2};
 
@@ -574,7 +579,7 @@ mod tests {
             .unwrap();
 
         let seed_word = "first";
-        println!(
+        info!(
             "Lets see what we can generate starting with the word '{seed_word}'\n\t{}",
             embedding.predict_iter(seed_word).collect::<Vec<_>>().join(" ")
         );
@@ -871,7 +876,7 @@ mod tests {
             {
                 let (validation_error, nll) = validation_errors.last().unwrap();
 
-                println!(
+                info!(
                 "embed! round = {}, prediction accuracy: {}%, training_loss = {} validation_cost = {}, nll = {}",
                 round_1based, predictions_pct, training_error, validation_error, nll
             );
@@ -909,7 +914,7 @@ mod tests {
                             }
                         }
                         if seen_pairs.insert((predicted.clone(), actual.clone())) {
-                            println!(
+                            info!(
                                 "embed! round = {}, ✅ correctly identified new prediction pairing.. '{} {}' was predicted correctly",
                                 round + 1,
                                 last_words.join(" "),
@@ -918,10 +923,11 @@ mod tests {
                         }
                     } else {
                         if seen_pairs.insert((predicted.clone(), actual.clone())) {
-                            // println!(
-                            //     "  embed! round = {}, ❌ found new messed up prediction pairing.. '{last_word} {predicted}' was predicted instead of '{last_word} {actual}'",
-                            //     round + 1
-                            // );
+                            debug!(
+                                "  embed! round = {}, ❌ found new messed up prediction pairing.. '{last_word} {predicted}' was predicted instead of '{last_word} {actual}'",
+                                round + 1,
+                                last_word = last_words.join(" "),
+                            );
                         }
                     }
 

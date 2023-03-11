@@ -1,6 +1,6 @@
 use std::{collections::HashSet, rc::Rc};
 
-use web_sys::console::log_1;
+use tracing::info;
 use yew::prelude::*;
 
 use crate::ml::{JsRng, RNG};
@@ -33,7 +33,7 @@ pub fn EmbeddingNearest(props: &EmbeddingNearestProps) -> Html {
                 handle::EmbeddingHandle,
                 _,
             )| {
-                log_1(&format!("iter hint = {i}").into());
+                info!("iter hint = {i}");
                 nearest_message.set(format!(
                     "Nearest vocab word to '{}' is ...",
                     nearest_target.clone().unwrap_or_else(|| "...".to_string())
@@ -41,7 +41,7 @@ pub fn EmbeddingNearest(props: &EmbeddingNearestProps) -> Html {
 
                 if let Some(word) = nearest_target {
                     let nearest = embedding.borrow().nearest(&word);
-                    log_1(&format!("nearest = {nearest:?}").into());
+                    info!("nearest = {nearest:?}");
 
                     match nearest {
                         Ok(next_nearest) => nearest_message.set(format!(

@@ -1,4 +1,3 @@
-use wasm_bindgen::__rt::WasmRefCell;
 use yew::prelude::*;
 
 use crate::ml;

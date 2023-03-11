@@ -251,6 +251,7 @@ mod parser {
     use std::collections::{HashMap, HashSet};
 
     use serde::{Deserialize, Serialize};
+    use tracing::instrument;
 
     use crate::ml::{embeddings::Embedding, JsRng, NodeValue, ShuffleRng, RNG};
 
@@ -267,6 +268,7 @@ mod parser {
         pub test_phrases_pct: NodeValue,
     }
 
+    #[instrument(skip_all)]
     pub(crate) fn train_embedding(
         embedding: &mut Embedding,
         phrases: &Vec<Vec<String>>,

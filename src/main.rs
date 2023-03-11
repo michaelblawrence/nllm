@@ -3,6 +3,7 @@ mod ml;
 
 use std::rc::Rc;
 
+use tracing_subscriber::prelude::*;
 use yew::prelude::*;
 use yew_hooks::use_local_storage;
 
@@ -55,5 +56,21 @@ fn App() -> Html {
 }
 
 fn main() {
+    use tracing_subscriber::fmt::{self, format, time};
+
+    let fmt_layer = fmt::layer()
+        .with_ansi(true)
+        .with_timer(time::UtcTime::rfc_3339())
+        .with_writer(tracing_web::MakeConsoleWriter)
+        .with_span_events(format::FmtSpan::ACTIVE);
+
+    let perf_layer = tracing_web::performance_layer()
+        .with_details_from_fields(format::Pretty::default());
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(perf_layer)
+        .init();
+
     yew::Renderer::<App>::new().render();
 }

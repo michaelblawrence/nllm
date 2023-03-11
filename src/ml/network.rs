@@ -787,10 +787,10 @@ impl std::fmt::Debug for LayerInitStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Zero => write!(f, "Zero"),
-            Self::PositiveRandom(arg0) => f.debug_tuple("PositiveRandom").finish(),
-            Self::ScaledFullRandom(arg0) => f.debug_tuple("ScaledFullRandom").finish(),
-            Self::FullRandom(arg0) => f.debug_tuple("FullRandom").finish(),
-            Self::NoBias(arg0) => f.debug_tuple("NoBias").finish(),
+            Self::PositiveRandom(_) => f.debug_tuple("PositiveRandom").finish(),
+            Self::ScaledFullRandom(_) => f.debug_tuple("ScaledFullRandom").finish(),
+            Self::FullRandom(_) => f.debug_tuple("FullRandom").finish(),
+            Self::NoBias(_) => f.debug_tuple("NoBias").finish(),
         }
     }
 }
@@ -933,6 +933,9 @@ impl Default for NetworkActivationMode {
 mod tests {
     use std::rc::Rc;
 
+    use test_log::test;
+    use tracing::info;
+
     use crate::ml::JsRng;
 
     use super::*;
@@ -1042,7 +1045,7 @@ mod tests {
             );
 
             if error < 1e-6 {
-                println!("DONE round = {round}, network_cost = {error}");
+                info!("DONE round = {round}, network_cost = {error}");
                 break;
             }
         }
@@ -1075,7 +1078,7 @@ mod tests {
             );
 
             if error < 1e-6 {
-                println!("DONE round = {round}, network_cost = {error}");
+                info!("DONE round = {round}, network_cost = {error}");
                 break;
             }
         }
@@ -1108,7 +1111,7 @@ mod tests {
             );
 
             if error < 1e-6 {
-                println!("DONE round = {round}, network_cost = {error}");
+                info!("DONE round = {round}, network_cost = {error}");
                 break;
             }
         }
@@ -1145,7 +1148,7 @@ mod tests {
             );
 
             if error < 1e-6 {
-                println!("DONE round = {round}, network_cost = {error}");
+                info!("DONE round = {round}, network_cost = {error}");
                 break;
             }
         }
@@ -1182,7 +1185,7 @@ mod tests {
             );
 
             if error < 1e-6 {
-                println!("DONE round = {round}, network_cost = {error}");
+                info!("DONE round = {round}, network_cost = {error}");
                 break;
             }
         }
@@ -1215,7 +1218,7 @@ mod tests {
             );
 
             if error < 1e-6 {
-                println!("DONE round = {round}, network_cost = {error}");
+                info!("DONE round = {round}, network_cost = {error}");
                 break;
             }
         }
@@ -1248,7 +1251,7 @@ mod tests {
             );
 
             if error < 1e-6 {
-                println!("DONE round = {round}, network_cost = {error}");
+                info!("DONE round = {round}, network_cost = {error}");
                 break;
             }
         }
@@ -1287,7 +1290,7 @@ mod tests {
             );
 
             if error < 1e-4 {
-                println!("DONE round = {round}, network_cost = {error}");
+                info!("DONE round = {round}, network_cost = {error}");
                 break;
             }
         }
@@ -1325,7 +1328,7 @@ mod tests {
             );
 
             if error < 1e-6 {
-                println!("DONE round = {round}, network_cost = {error}");
+                info!("DONE round = {round}, network_cost = {error}");
                 break;
             }
         }
@@ -1422,7 +1425,7 @@ mod tests {
                 || (round < 10000 && round % 1000 == 0)
                 || round % 10000 == 0
             {
-                println!("round = {round}, network_cost = {error}");
+                info!("round = {round}, network_cost = {error}");
             }
 
             error
@@ -1435,7 +1438,7 @@ mod tests {
             let mut outputs = vec![];
             for (network_input, target_output) in training_pairs {
                 let output_2 = network.compute(network_input.iter().into()).unwrap();
-                println!("target = {target_output:?}, final_output = {output_2:?}");
+                info!("target = {target_output:?}, final_output = {output_2:?}");
                 outputs.push(output_2);
             }
 

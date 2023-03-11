@@ -1,4 +1,5 @@
-use web_sys::{console::log_1, HtmlTextAreaElement};
+use tracing::info;
+use web_sys::HtmlTextAreaElement;
 use yew::prelude::*;
 
 #[derive(Properties, PartialEq, Clone)]
@@ -17,7 +18,7 @@ pub fn json_editor(props: &JsonEditorProps) -> Html {
             .target_dyn_into::<HtmlTextAreaElement>()
             .map(|x| x.value())
         {
-            log_1(&(&value).into());
+            info!("{} ", &value);
             on_json_change.emit(value);
         }
     };
