@@ -1,5 +1,7 @@
 use std::ops::Deref;
 
+use anyhow::{Context, Result};
+
 use crate::ml::NodeValue;
 
 #[cfg(test)]
@@ -34,7 +36,7 @@ pub trait ShuffleRng {
 }
 
 pub trait SamplingRng {
-    fn sample_uniform(&self, probabilities: &Vec<NodeValue>) -> Result<usize, ()>;
+    fn sample_uniform(&self, probabilities: &Vec<NodeValue>) -> Result<usize>;
 }
 
 impl<T: Deref<Target = dyn RNG>> ShuffleRng for T {
@@ -49,7 +51,7 @@ impl<T: Deref<Target = dyn RNG>> ShuffleRng for T {
 }
 
 impl<T: Deref<Target = dyn RNG>> SamplingRng for T {
-    fn sample_uniform(&self, probabilities: &Vec<NodeValue>) -> Result<usize, ()> {
+    fn sample_uniform(&self, probabilities: &Vec<NodeValue>) -> Result<usize> {
         let (sampled_idx, _) = probabilities.iter().enumerate().fold(
             (None, self.rand()),
             |(sampled_idx, state), (p_idx, p)| {
@@ -61,6 +63,6 @@ impl<T: Deref<Target = dyn RNG>> SamplingRng for T {
                 }
             },
         );
-        sampled_idx.ok_or(())
+        sampled_idx.context("failed to sample from provided probabilities")
     }
 }

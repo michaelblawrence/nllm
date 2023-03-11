@@ -5,11 +5,12 @@ use std::{
     rc::Rc,
 };
 
+use anyhow::{anyhow, Context, Result};
 use tracing::debug;
 
 use super::{
-    BatchSamplingStrategy, LayerInitStrategy, LayerValues, Network, NetworkActivationMode,
-    NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, RNG, JsRng,
+    BatchSamplingStrategy, JsRng, LayerInitStrategy, LayerValues, Network, NetworkActivationMode,
+    NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, RNG,
 };
 
 pub struct Embedding {
@@ -75,7 +76,7 @@ impl Embedding {
         phrases: &Vec<Vec<String>>,
         learn_rate: NodeValue,
         batch_size: usize,
-    ) -> Result<NodeValue, ()> {
+    ) -> Result<NodeValue> {
         let control_vocab_idx = self
             .vocab
             .get(&CONTROL_VOCAB.to_string())
@@ -85,7 +86,7 @@ impl Embedding {
         // TODO: validate this in a better place
         if word_locality_factor < 1 {
             dbg!(word_locality_factor);
-            return Err(()); // need at least one sample
+            return Err(anyhow!("need at least one sample"));
         }
 
         let indexed_phrases = phrases.iter().flat_map(|phrase| {
@@ -130,8 +131,9 @@ impl Embedding {
                 })?;
             costs.push(cost);
             debug!(
-                " -- net train iter cost {}",
-                cost.clone().unwrap_or_default()
+                " -- net train iter cost {} (N = {})",
+                cost.clone().unwrap_or_default(),
+                training_pairs.len()
             );
         }
 
@@ -145,7 +147,7 @@ impl Embedding {
         phrases: &Vec<Vec<String>>,
         learn_rate: NodeValue,
         word_locality_factor: usize,
-    ) -> Result<NodeValue, ()> {
+    ) -> Result<NodeValue> {
         let indexed_phrases = phrases.iter().map(|phrase| {
             phrase
                 .iter()
@@ -200,7 +202,7 @@ impl Embedding {
         Ok(cost)
     }
 
-    pub fn predict_next(&self, last_words: &Vec<&str>) -> Result<String, ()> {
+    pub fn predict_next(&self, last_words: &Vec<&str>) -> Result<String> {
         let network_input = self.get_padded_network_input(last_words)?;
         let output = self.network.compute(network_input)?;
 
@@ -211,12 +213,12 @@ impl Embedding {
             .vocab
             .iter()
             .find(|(_, vocab_idx)| **vocab_idx == sampled_idx)
-            .ok_or(())?
+            .context("sampled vocab word should be in vocab dict")?
             .0
             .clone())
     }
 
-    pub fn predict_from(&self, last_word: &str) -> Result<String, ()> {
+    pub fn predict_from(&self, last_word: &str) -> Result<String> {
         let last_words = iter::repeat(CONTROL_VOCAB)
             .take(self.input_stride_width - 1)
             .chain([last_word].into_iter())
@@ -232,17 +234,21 @@ impl Embedding {
             .vocab
             .iter()
             .find(|(_, vocab_idx)| **vocab_idx == sampled_idx)
-            .ok_or(())?
+            .context("sampled vocab word should be in vocab dict")?
             .0
             .clone())
     }
 
-    pub fn nll(&self, last_words: &Vec<&str>, expected_next_word: &str) -> Result<NodeValue, ()> {
+    pub fn nll(&self, last_words: &Vec<&str>, expected_next_word: &str) -> Result<NodeValue> {
         let network_input = self.get_padded_network_input(&last_words)?;
         let output = self.network.compute(network_input)?;
 
         // TODO: do softmax in net?
-        let expected_vocab_idx = *self.vocab.get(&expected_next_word.to_string()).ok_or(())?;
+        let expected_vocab_idx = *self
+            .vocab
+            .get(&expected_next_word.to_string())
+            .context("provided vocab word should be in vocab dict")?;
+
         let probabilities = NetworkActivationMode::SoftMax.apply(&output);
 
         let log_logits = probabilities
@@ -253,7 +259,7 @@ impl Embedding {
         Ok(-log_logits)
     }
 
-    pub fn nll_batch(&self, phrases: &Vec<Vec<String>>) -> Result<NodeValue, ()> {
+    pub fn nll_batch(&self, phrases: &Vec<Vec<String>>) -> Result<NodeValue> {
         let word_locality_factor = 1;
         let control_vocab = CONTROL_VOCAB.to_string();
         let indexed_phrases = phrases
@@ -313,16 +319,20 @@ impl Embedding {
         })
     }
 
-    fn get_padded_network_input(&self, last_words: &Vec<&str>) -> Result<LayerValues, ()> {
+    fn get_padded_network_input(&self, last_words: &Vec<&str>) -> Result<LayerValues> {
         let vocab_idxs = iter::repeat(&CONTROL_VOCAB)
             .take(self.input_stride_width.saturating_sub(last_words.len()))
             .chain(last_words.iter())
             .skip(last_words.len().saturating_sub(self.input_stride_width))
-            .map(|vocab_word| self.vocab.get(&vocab_word.to_string()).ok_or(()))
+            .map(|vocab_word| {
+                self.vocab
+                    .get(&vocab_word.to_string())
+                    .context("can not find vocab word")
+            })
             .collect::<Vec<_>>();
 
         if let Some(Err(e)) = vocab_idxs.iter().find(|v| v.is_err()) {
-            return Err(*e);
+            return Err(anyhow!("failed to resolve vocab from dict: {e}"));
         }
 
         let network_input = vocab_idxs
@@ -333,7 +343,7 @@ impl Embedding {
         Ok(network_input)
     }
 
-    pub fn compute_error_batch(&self, phrases: &Vec<Vec<String>>) -> Result<NodeValue, ()> {
+    pub fn compute_error_batch(&self, phrases: &Vec<Vec<String>>) -> Result<NodeValue> {
         let mut errors = vec![];
 
         for testing_phrase in phrases.iter() {
@@ -349,7 +359,7 @@ impl Embedding {
         Ok(error)
     }
 
-    pub fn compute_error(&self, phrase: &Vec<String>) -> Result<NodeValue, ()> {
+    pub fn compute_error(&self, phrase: &Vec<String>) -> Result<NodeValue> {
         let indexed_phrase = phrase
             .iter()
             .map(|word| self.vocab.get(&word.to_string()))
@@ -363,25 +373,28 @@ impl Embedding {
         let mut errors = vec![];
 
         for word_vectors in vectored_phrase.chunks_exact(self.input_stride_width + 1) {
-            if let Some((last_word_vector, context_word_vectors)) = word_vectors.split_last() {
-                let error = self.network.compute_error(
-                    context_word_vectors
-                        .into_iter()
-                        .flatten()
-                        .cloned()
-                        .collect(),
-                    &LayerValues::new(last_word_vector.clone()),
-                )?;
-                let error: NodeValue = error.iter().sum();
-                errors.push(error);
-            }
+            let (last_word_vector, context_word_vectors) = word_vectors
+                .split_last()
+                .context("should have last element")?;
+
+            let context_word_vectors = context_word_vectors.into_iter().flatten();
+            let inputs = context_word_vectors.cloned().collect();
+            let target_outputs = LayerValues::new(last_word_vector.clone());
+
+            let error = self.network.compute_error(inputs, &target_outputs)?;
+            let error: NodeValue = error.iter().sum();
+            errors.push(error);
         }
 
         Ok(errors.iter().sum::<NodeValue>() / errors.len() as NodeValue)
     }
 
-    pub fn embeddings(&self, vocab_entry: &str) -> Result<LayerValues, ()> {
-        let vocab_index = self.vocab.get(vocab_entry).ok_or(())?;
+    pub fn embeddings(&self, vocab_entry: &str) -> Result<LayerValues> {
+        let vocab_index = self
+            .vocab
+            .get(vocab_entry)
+            .context("provided vocab word should be in vocab dict")?;
+
         Ok(self
             .network
             .node_weights(0, *vocab_index)?
@@ -389,7 +402,7 @@ impl Embedding {
             .into())
     }
 
-    pub fn nearest(&self, vocab_entry: &str) -> Result<(String, NodeValue), ()> {
+    pub fn nearest(&self, vocab_entry: &str) -> Result<(String, NodeValue)> {
         let candidate_embedding = self.embeddings(vocab_entry)?;
         let mut dot_products = vec![];
 
@@ -402,12 +415,12 @@ impl Embedding {
         let (nearest_vocab, nearest_dot_product) = dot_products
             .iter()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-            .ok_or(())?;
+            .context("can not sort dot product collection")?;
 
         let (_furthest_vocab, furthest_dot_product) = dot_products
             .iter()
             .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-            .ok_or(())?;
+            .context("can not sort dot product collection")?;
 
         let available_range = 1.0 - furthest_dot_product;
         let similarity_fact = (nearest_dot_product - furthest_dot_product) / available_range;
@@ -428,14 +441,8 @@ impl Default for Embedding {
         let rng = Rc::new(JsRng::default());
         let size = 0;
         let input_stride_width = 1;
-        
-        Embedding::new(
-            vocab,
-            size,
-            input_stride_width,
-            hidden_layer_shape,
-            rng,
-        )
+
+        Embedding::new(vocab, size, input_stride_width, hidden_layer_shape, rng)
     }
 }
 
@@ -482,12 +489,12 @@ mod tests {
         let embedding = training::setup_and_train_embeddings_v2(
             (vocab, phrases, testing_phrases),
             TestEmbeddingConfigV2 {
-                embedding_size: 2,
+                embedding_size: 6,
                 hidden_layer_nodes: 100,
                 input_stride_width: 3,
                 batch_size: 32,
-                training_rounds: 100,
-                train_rate: 1e-3,
+                training_rounds: 100000,
+                train_rate: 1e-2,
                 activation_mode: NetworkActivationMode::Tanh,
                 // activation_mode: NetworkActivationMode::Sigmoid,
             },
@@ -581,7 +588,10 @@ mod tests {
         let seed_word = "first";
         info!(
             "Lets see what we can generate starting with the word '{seed_word}'\n\t{}",
-            embedding.predict_iter(seed_word).collect::<Vec<_>>().join(" ")
+            embedding
+                .predict_iter(seed_word)
+                .collect::<Vec<_>>()
+                .join(" ")
         );
     }
 
@@ -700,7 +710,7 @@ mod tests {
         dbg!(diffs);
         dbg!((&init_nearest, &current_nearest));
         assert_ne!(&each_layer_weights, &current_layer_weights);
-        assert_ne!(&init_nearest, &current_nearest);
+        assert_ne!(init_nearest.unwrap(), current_nearest.unwrap());
     }
 
     #[test]
@@ -870,15 +880,18 @@ mod tests {
         ) {
             let round_1based = round + 1;
             if round_1based <= 50
-                || (round_1based < 1000 && round_1based % 100 == 0)
-                || (round_1based < 10000 && round_1based % 1000 == 0)
+                || (round_1based <= 1000 && round_1based % 100 == 0)
+                || (round_1based <= 10000 && round_1based % 1000 == 0)
+                || (round_1based <= 100000 && round_1based % 10000 == 0)
+                || (round_1based <= 1000000 && round_1based % 100000 == 0)
                 || round_1based == training_rounds
             {
                 let (validation_error, nll) = validation_errors.last().unwrap();
 
                 info!(
-                "embed! round = {}, prediction accuracy: {}%, training_loss = {} validation_cost = {}, nll = {}",
-                round_1based, predictions_pct, training_error, validation_error, nll
+                // "round = {:<6} |  training_loss = {:<10.8}, prediction_acc: {:>4.1}%, validation_loss = {:<10.8}, nll = {:<10.3}",
+                "round = {:<6} |  train_loss = {:<10.8}, val_pred_acc: {:0>4.1}%, val_loss = {:<6.4}, val_nll = {:<10.3}",
+                round_1based, training_error, predictions_pct, validation_error, nll
             );
             }
         }
@@ -915,16 +928,15 @@ mod tests {
                         }
                         if seen_pairs.insert((predicted.clone(), actual.clone())) {
                             info!(
-                                "embed! round = {}, ✅ correctly identified new prediction pairing.. '{} {}' was predicted correctly",
+                                "round = {:<6} |   ✅ correctly identified new prediction pairing.. '{last_word} {predicted}' was predicted correctly",
                                 round + 1,
-                                last_words.join(" "),
-                                predicted
+                                last_word = last_words.join(" "),
                             );
                         }
                     } else {
                         if seen_pairs.insert((predicted.clone(), actual.clone())) {
                             debug!(
-                                "  embed! round = {}, ❌ found new messed up prediction pairing.. '{last_word} {predicted}' was predicted instead of '{last_word} {actual}'",
+                                "round = {:<6} |  ❌ found new messed up prediction pairing.. '{last_word} {predicted}' was predicted instead of '{last_word} {actual}'",
                                 round + 1,
                                 last_word = last_words.join(" "),
                             );
