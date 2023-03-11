@@ -1,2 +1,6 @@
 /target
 /dist
+/out
+/.vscode
+/res
+!/res/scripts

@@ -162,14 +162,13 @@ mod hook {
 
                     embedding_handle.set(embedding_handle.replace_with(
                         |mut embedding_instance| {
-                            let (_, phrases, testing_phrases) = &**vocab_and_phrases;
+                            let (_, phrases, _) = &**vocab_and_phrases;
 
                             let error = parser::train_embedding(
                                 &mut embedding_instance,
                                 &phrases,
                                 config.train_rate,
                                 config.batch_size,
-                                testing_phrases,
                             );
 
                             with_emedding_fn(embedding_instance, error, (*vocab_and_phrases).clone())
@@ -231,6 +230,7 @@ mod hook {
                     embedding_handle.set(embedding_handle.replace(Embedding::new(
                         vocab.clone(),
                         config.embedding_size,
+                        config.input_stride_width,
                         vec![config.hidden_layer_nodes],
                         Rc::new(JsRng::default()),
                     )));
@@ -261,6 +261,7 @@ mod parser {
         pub training_rounds: usize,
         pub max_phrases_count: usize,
         pub max_vocab_words_count: usize,
+        pub input_stride_width: usize,
         pub batch_size: usize,
         pub train_rate: NodeValue,
         pub test_phrases_pct: NodeValue,
@@ -271,13 +272,12 @@ mod parser {
         phrases: &Vec<Vec<String>>,
         train_rate: f64,
         batch_size: usize,
-        testing_phrases: &Vec<Vec<String>>,
     ) -> f64 {
         let train_timer_label = &"embedding train";
         web_sys::console::time_with_label(train_timer_label);
 
         let loss = embedding
-            .train_v2(&phrases, train_rate, 1, batch_size)
+            .train_v2(&phrases, train_rate, batch_size)
             .unwrap();
 
         web_sys::console::time_end_with_label(train_timer_label);

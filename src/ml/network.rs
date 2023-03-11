@@ -3,79 +3,19 @@ use std::{
     rc::Rc,
 };
 
+use crate::ml::{RNG, ShuffleRng};
+
 #[cfg(not(short_floats))]
 pub type NodeValue = f64;
 
 #[cfg(short_floats)]
 type NodeValue = f32;
 
-#[cfg(test)]
-#[derive(Default)]
-pub struct JsRng(std::cell::RefCell<rand::rngs::ThreadRng>);
-
-#[cfg(not(test))]
-#[derive(Default)]
-pub struct JsRng;
-
-impl RNG for JsRng {
-    #[cfg(test)]
-    fn rand(&self) -> NodeValue {
-        use rand::Rng;
-        self.0.borrow_mut().gen()
-    }
-    #[cfg(not(test))]
-    fn rand(&self) -> NodeValue {
-        js_sys::Math::random() as NodeValue
-    }
-}
-
-pub trait RNG {
-    fn rand(&self) -> NodeValue;
-    fn rand_range(&self, min: usize, exclusive_max: usize) -> usize {
-        (self.rand() * (exclusive_max - min) as NodeValue) as usize + min
-    }
-}
-
-pub trait ShuffleRng {
-    fn shuffle_vec<T>(&self, vec: &mut Vec<T>);
-}
-
-pub trait SamplingRng {
-    fn sample_uniform(&self, probabilities: &Vec<NodeValue>) -> Result<usize, ()>;
-}
-
-impl<T: Deref<Target = dyn RNG>> ShuffleRng for T {
-    fn shuffle_vec<E>(&self, vec: &mut Vec<E>) {
-        let len = vec.len();
-
-        for i in 0..len {
-            let j = self.rand_range(i, len);
-            vec.swap(i, j);
-        }
-    }
-}
-impl<T: Deref<Target = dyn RNG>> SamplingRng for T {
-    fn sample_uniform(&self, probabilities: &Vec<NodeValue>) -> Result<usize, ()> {
-        let (sampled_idx, _) = probabilities.iter().enumerate().fold(
-            (None, self.rand()),
-            |(sampled_idx, state), (p_idx, p)| {
-                let next_state = state - p;
-                match sampled_idx {
-                    Some(sampled_idx) => (Some(sampled_idx), next_state),
-                    None if next_state <= 0.0 => (Some(p_idx), next_state),
-                    None => (None, next_state),
-                }
-            },
-        );
-        sampled_idx.ok_or(())
-    }
-}
 
 #[derive(Debug)]
 pub struct NetworkShape {
-    inputs_count: (usize, LayerInitStrategy),
-    outputs_count: (usize, LayerInitStrategy),
-    hidden_layer_shape: Vec<(usize, LayerInitStrategy)>,
+    inputs_count: usize,
+    layers_shape: Vec<LayerShape>,
 }
 
 impl NetworkShape {
@@ -86,11 +26,12 @@ impl NetworkShape {
         init_stratergy: LayerInitStrategy,
     ) -> Self {
         Self {
-            inputs_count: (inputs_count, LayerInitStrategy::Zero),
-            outputs_count: (outputs_count, init_stratergy.clone()),
-            hidden_layer_shape: hidden_layer_shape
+            inputs_count: inputs_count,
+            layers_shape: hidden_layer_shape
                 .into_iter()
                 .map(|layer_size| (layer_size, init_stratergy.clone()))
+                .chain([(outputs_count, init_stratergy.clone())])
+                .map(|x| x.into())
                 .collect(),
         }
     }
@@ -98,47 +39,91 @@ impl NetworkShape {
     pub fn new_embedding(
         token_count: usize,
         embedding_size: usize,
+        embedding_stride: Option<usize>,
         hidden_layer_shape: Vec<usize>,
         hidden_layer_init_stratergy: LayerInitStrategy,
         rng: Rc<dyn RNG>,
     ) -> Self {
-        let embedding_layer_shape = [(embedding_size, LayerInitStrategy::NoBias(rng))];
-        let embedding_layer_shape = embedding_layer_shape.into_iter();
+        let embedding_layer_shape = LayerShape {
+            node_count: embedding_size,
+            strategy: LayerInitStrategy::NoBias(rng),
+            stride_count: embedding_stride,
+        };
         let hidden_layer_shape = hidden_layer_shape.into_iter();
         let stratergy = hidden_layer_init_stratergy;
+
         Self {
-            inputs_count: (token_count, LayerInitStrategy::Zero),
-            outputs_count: (token_count, stratergy.clone()),
-            hidden_layer_shape: embedding_layer_shape
-                .chain(hidden_layer_shape.map(|n| (n, stratergy.clone())))
+            inputs_count: token_count,
+            layers_shape: [embedding_layer_shape]
+                .into_iter()
+                .chain(hidden_layer_shape.map(|n| (n, stratergy.clone()).into()))
+                .chain([(token_count, stratergy.clone()).into()])
                 .collect(),
         }
     }
 
-    pub fn iter<'a>(&'a self) -> impl Iterator<Item = (usize, LayerInitStrategy)> + 'a {
-        [&self.inputs_count]
+    pub fn iter<'a>(&'a self) -> impl Iterator<Item = LayerShape> + 'a {
+        [&(self.inputs_count, LayerInitStrategy::Zero).into()]
             .into_iter()
-            .chain(self.hidden_layer_shape.iter())
-            .chain([&self.outputs_count])
+            .chain(self.layers_shape.iter())
             .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LayerShape {
+    node_count: usize,
+    strategy: LayerInitStrategy,
+    stride_count: Option<usize>,
+    // softmax_enabled: bool,
+    // activation_enabled: bool,
+}
+
+impl From<(usize, LayerInitStrategy)> for LayerShape {
+    fn from((node_count, strategy): (usize, LayerInitStrategy)) -> Self {
+        LayerShape {
+            node_count,
+            strategy,
+            stride_count: None,
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct Network {
     layers: Vec<Layer>,
+    shape: NetworkShape,
+    // TODO: can refactor this out into network shape
     activation_mode: NetworkActivationMode,
+    // TODO: can refactor this out into network shape
     softmax_output_enabled: bool,
+    // TODO: can refactor this out into network shape
     first_layer_activation_enabled: bool,
 }
 
 impl Network {
-    pub fn new(shape: &NetworkShape) -> Self {
+    pub fn new(shape: NetworkShape) -> Self {
         let mut layers = vec![];
 
-        for pair in shape.iter().collect::<Vec<_>>().windows(2) {
-            if let [(lhs, _), (rhs, init_stratergy)] = pair {
-                layers.push(Layer::new(*rhs, *lhs, &init_stratergy))
+        for (pair_idx, pair) in shape.iter().collect::<Vec<_>>().windows(2).enumerate() {
+            if let [lhs, rhs] = pair {
+                let layer_input_nodes = lhs.node_count * lhs.stride_count.unwrap_or(1);
+
+                let layer = if let Some(stride_count) = rhs.stride_count {
+                    let mut layer = Layer::new(rhs.node_count, layer_input_nodes, &rhs.strategy);
+                    assert_eq!(
+                        0, pair_idx,
+                        "layer stride not yet supported for non-starting layers"
+                    );
+                    layer.set_stride_count(stride_count);
+                    layer
+                } else {
+                    Layer::new(rhs.node_count, layer_input_nodes, &rhs.strategy)
+                };
+
+                layers.push(layer)
             } else {
                 panic!("failed to window layer shape");
             }
@@ -147,25 +132,29 @@ impl Network {
         Self {
             layers,
             activation_mode: Default::default(),
+            shape,
             softmax_output_enabled: false,
             first_layer_activation_enabled: true,
         }
     }
 
+    // TODO: can refactor this out into network shape
     pub fn set_activation_mode(&mut self, activation_mode: NetworkActivationMode) {
         self.activation_mode = activation_mode;
     }
 
+    // TODO: can refactor this out into network shape
     pub fn set_softmax_output_enabled(&mut self, enabled: bool) {
         self.softmax_output_enabled = enabled;
     }
 
+    // TODO: can refactor this out into network shape
     pub fn set_first_layer_activation_enabled(&mut self, enabled: bool) {
         self.first_layer_activation_enabled = enabled;
     }
 
     pub fn compute(&self, inputs: LayerValues) -> Result<LayerValues, ()> {
-        inputs.assert_length_equals(self.inputs_count()?)?;
+        inputs.assert_length_equals(self.input_vector_size()?)?;
 
         let (last_layer, layers) = self.layers.split_last().expect("should have final layer");
         let mut output = inputs;
@@ -402,24 +391,35 @@ impl Network {
             .layers
             .get(layer_idx)
             .ok_or(())?
-            .node_weights(node_index))
+            .node_weights(node_index)?)
     }
 
     pub fn layer_count(&self) -> usize {
         self.layers.len()
     }
 
-    fn inputs_count(&self) -> Result<usize, ()> {
-        let first_layer = &self.layers.iter().next().ok_or(())?;
-        Ok(first_layer.inputs_count)
+    fn input_vector_size(&self) -> Result<usize, ()> {
+        self.layers
+            .first()
+            .map(|layer| layer.input_vector_size())
+            .ok_or(())
     }
 
     fn final_layer_activation(&self) -> NetworkActivationMode {
+        // let last_layer = self.shape.layers_shape.last();
+        // let softmax_output_enabled = last_layer
+        //     .map(|layer| layer.softmax_enabled)
+        //     .unwrap_or(false);
+        // if softmax_output_enabled {
         if self.softmax_output_enabled {
             NetworkActivationMode::SoftMax
         } else {
             self.activation_mode
         }
+    }
+
+    pub fn shape(&self) -> &NetworkShape {
+        &self.shape
     }
 }
 
@@ -430,29 +430,7 @@ pub struct Layer {
     pending_gradients: Option<PendingLayerGradients>,
     inputs_count: usize,
     size: usize,
-}
-
-pub struct PendingLayerGradients {
-    weights: Vec<NodeValue>,
-    bias: Vec<NodeValue>,
-}
-
-impl std::fmt::Debug for PendingLayerGradients {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingLayerGradients")
-            .field("weights_count", &self.weights.len())
-            .field("bias_count", &self.bias.len())
-            .finish()
-    }
-}
-
-impl PendingLayerGradients {
-    pub fn new(parent: &Layer) -> Self {
-        Self {
-            weights: vec![0.0; parent.inputs_count * parent.size()],
-            bias: vec![0.0; parent.size()],
-        }
-    }
+    stride_count: Option<usize>,
 }
 
 impl Layer {
@@ -467,6 +445,7 @@ impl Layer {
             pending_gradients: None,
             inputs_count,
             size,
+            stride_count: None,
         };
 
         init_stratergy.apply(
@@ -481,18 +460,22 @@ impl Layer {
     }
 
     pub fn compute(&self, inputs: &LayerValues) -> Result<LayerValues, ()> {
-        inputs
-            .assert_length_equals(self.inputs_count)
-            .map_err(|_| format!("{self:?}"))
-            .unwrap();
+        inputs.assert_length_equals(self.input_vector_size())?;
 
-        let mut outputs = match &self.bias {
-            Some(bias) => bias.clone(),
-            None => vec![0.0; self.size],
+        let mut outputs = match (&self.bias, self.stride_count) {
+            (None, None) => vec![0.0; self.size],
+            (None, Some(stride_count)) => vec![0.0; self.size * stride_count],
+            (Some(bias), None) => bias.clone(),
+            (Some(bias), Some(stride_count)) => bias
+                .iter()
+                .cycle()
+                .take(self.size * stride_count)
+                .cloned()
+                .collect(),
         };
 
         for (input_index, input) in inputs.iter().enumerate() {
-            let weights = self.node_weights(input_index);
+            let weights = self.node_weights(input_index % self.inputs_count)?;
             for (output_idx, weight) in weights.enumerate() {
                 outputs[output_idx] += input * weight;
             }
@@ -537,13 +520,12 @@ impl Layer {
                 layer_inputs,
                 learn_rate,
             } => {
-                let (weights_gradients, bias_gradients) =
-                    self.compute_gradients_iter(gradients, layer_inputs)?;
+                let weights_gradients = self.weights_gradients_iter(&gradients, layer_inputs)?;
 
-                for (x, grad) in self.weights.iter_mut().zip(weights_gradients) {
+                for (x, grad) in self.weights.iter_mut().zip(weights_gradients.iter()) {
                     *x = *x - (grad * learn_rate)
                 }
-                for (x, grad) in self.bias.iter_mut().flatten().zip(bias_gradients) {
+                for (x, grad) in self.bias.iter_mut().flatten().zip(gradients.iter()) {
                     *x = *x - (grad * learn_rate)
                 }
             }
@@ -551,19 +533,20 @@ impl Layer {
                 gradients,
                 layer_inputs,
             } => {
-                let (weights_gradients, bias_gradients) =
-                    self.compute_gradients_iter(gradients, layer_inputs)?;
+                let weights_gradients = self.weights_gradients_iter(&gradients, layer_inputs)?;
 
                 let pending_gradients = self
                     .pending_gradients
                     .get_or_insert(PendingLayerGradients::new(&self));
 
-                for (grad, pending_grad) in
-                    weights_gradients.zip(pending_gradients.weights.iter_mut())
+                for (grad, pending_grad) in weights_gradients
+                    .iter()
+                    .zip(pending_gradients.weights.iter_mut())
                 {
                     *pending_grad += grad;
                 }
-                for (grad, pending_grad) in bias_gradients.zip(pending_gradients.bias.iter_mut()) {
+                for (grad, pending_grad) in gradients.iter().zip(pending_gradients.bias.iter_mut())
+                {
                     *pending_grad += grad;
                 }
             }
@@ -594,30 +577,40 @@ impl Layer {
         Ok(())
     }
 
-    fn compute_gradients_iter<'a>(
+    fn weights_gradients_iter<'a>(
         &self,
         gradients: &'a LayerValues,
         layer_inputs: &'a LayerValues,
-    ) -> Result<
-        (
-            impl Iterator<Item = NodeValue> + 'a,
-            impl Iterator<Item = NodeValue> + 'a,
-        ),
-        (),
-    > {
-        if self.weights.len() != gradients.len() * layer_inputs.len() {
-            dbg!(self.weights.len(), gradients.len() * layer_inputs.len());
+    ) -> Result<Vec<NodeValue>, ()> {
+        let stride_count = self.stride_count.unwrap_or(1);
+        let weights_len = self.weights.len();
+        let scaled_weights_len = weights_len * stride_count * stride_count;
+
+        if scaled_weights_len != gradients.len() * layer_inputs.len() {
+            dbg!(
+                weights_len,
+                gradients.len() * layer_inputs.len(),
+                stride_count
+            );
             return Err(());
         }
 
         let weights_gradients = layer_inputs
-            .iter()
-            .flat_map(|layer_input| gradients.iter().map(move |grad| (layer_input, grad)))
-            .map(move |(layer_input, grad)| grad * *layer_input);
+            .chunks(self.inputs_count)
+            .zip(gradients.chunks(self.size))
+            .fold(
+                vec![0.0; weights_len],
+                |mut state, (layer_inputs, gradients)| {
+                    layer_inputs
+                        .into_iter()
+                        .flat_map(|layer_input| gradients.iter().map(move |g| g * layer_input))
+                        .zip(state.iter_mut())
+                        .for_each(|(gradient, x)| *x += gradient);
+                    state
+                },
+            );
 
-        let bias_gradients = gradients.iter().cloned();
-
-        Ok((weights_gradients, bias_gradients))
+        Ok(weights_gradients)
     }
 
     pub fn size(&self) -> usize {
@@ -650,11 +643,51 @@ impl Layer {
         Ok(LayerValues(error))
     }
 
-    fn node_weights<'a>(&'a self, node_index: usize) -> impl Iterator<Item = &'a NodeValue> {
-        // TODO: handle invalid idx case
+    fn node_weights<'a>(
+        &'a self,
+        node_index: usize,
+    ) -> Result<impl Iterator<Item = &'a NodeValue>, ()> {
         let n = self.size();
         let start = n * node_index;
-        self.weights[start..start + n].into_iter()
+        let end = start + n;
+
+        if end > self.weights.len() {
+            return Err(());
+        }
+
+        Ok(self.weights[start..end].into_iter())
+    }
+
+    fn set_stride_count(&mut self, stride_count: usize) {
+        self.stride_count = Some(stride_count);
+    }
+
+    pub fn input_vector_size(&self) -> usize {
+        let stride_count = self.stride_count.unwrap_or(1);
+        self.inputs_count * stride_count
+    }
+}
+
+pub struct PendingLayerGradients {
+    weights: Vec<NodeValue>,
+    bias: Vec<NodeValue>,
+}
+
+impl std::fmt::Debug for PendingLayerGradients {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLayerGradients")
+            .field("weights_count", &self.weights.len())
+            .field("bias_count", &self.bias.len())
+            .finish()
+    }
+}
+
+impl PendingLayerGradients {
+    pub fn new(parent: &Layer) -> Self {
+        Self {
+            weights: vec![0.0; parent.inputs_count * parent.size()],
+            bias: vec![0.0; parent.size()],
+        }
     }
 }
 
@@ -900,28 +933,30 @@ impl Default for NetworkActivationMode {
 mod tests {
     use std::rc::Rc;
 
+    use crate::ml::JsRng;
+
     use super::*;
 
     #[test]
     fn can_create_network() {
         let shape = NetworkShape::new(2, 2, vec![], LayerInitStrategy::Zero);
-        let network = Network::new(&shape);
+        let network = Network::new(shape);
 
-        assert_eq!(2, network.inputs_count().unwrap());
+        assert_eq!(2, network.input_vector_size().unwrap());
     }
 
     #[test]
     fn can_create_hidden_layer_network() {
         let shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::Zero);
-        let network = Network::new(&shape);
+        let network = Network::new(shape);
 
-        assert_eq!(2, network.inputs_count().unwrap());
+        assert_eq!(2, network.input_vector_size().unwrap());
     }
 
     #[test]
     fn can_compute_hidden_layer_network_zeros_linear_activation() {
         let shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::Zero);
-        let mut network = Network::new(&shape);
+        let mut network = Network::new(shape);
         network.set_activation_mode(NetworkActivationMode::Linear);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
 
@@ -931,7 +966,7 @@ mod tests {
     #[test]
     fn can_compute_hidden_layer_network_zeros() {
         let shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::Zero);
-        let mut network = Network::new(&shape);
+        let mut network = Network::new(shape);
         network.set_activation_mode(NetworkActivationMode::SoftMax);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
 
@@ -947,7 +982,7 @@ mod tests {
             vec![8],
             LayerInitStrategy::PositiveRandom(Rc::new(JsRng::default())),
         );
-        let mut network = Network::new(&shape);
+        let mut network = Network::new(shape);
         network.set_activation_mode(NetworkActivationMode::SoftMax);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
 
@@ -964,7 +999,7 @@ mod tests {
             vec![8],
             LayerInitStrategy::PositiveRandom(rng.clone()),
         );
-        let mut network = Network::new(&shape);
+        let mut network = Network::new(shape);
         network.set_activation_mode(NetworkActivationMode::SoftMax);
 
         let output_1 = network.compute([2.0, 2.0].iter().into()).unwrap();
@@ -1350,14 +1385,12 @@ mod tests {
 
     mod multi_sample {
         use super::*;
-        use std::rc::Rc;
 
         pub(crate) fn create_network(
             shape: NetworkShape,
             activation_mode: NetworkActivationMode,
         ) -> Network {
-            let rng = Rc::new(JsRng::default());
-            let mut network = Network::new(&shape);
+            let mut network = Network::new(shape);
             network.set_activation_mode(activation_mode);
             network
         }

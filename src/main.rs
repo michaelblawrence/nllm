@@ -20,12 +20,13 @@ fn App() -> Html {
             } else {
                 Rc::new(TrainEmbeddingConfig {
                     embedding_size: 4,
-                    hidden_layer_nodes: 15,
+                    hidden_layer_nodes: 100,
                     training_rounds: 0,
-                    max_phrases_count: 150,
-                    max_vocab_words_count: 100,
+                    max_phrases_count: 550,
+                    max_vocab_words_count: 500,
+                    input_stride_width: 1,
                     batch_size: 32,
-                    train_rate: 1e-1,
+                    train_rate: 1e-4,
                     test_phrases_pct: 20.0,
                 })
             }
