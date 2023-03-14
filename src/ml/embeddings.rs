@@ -527,10 +527,10 @@ mod tests {
         let embedding = training::setup_and_train_embeddings_v2(
             (vocab.clone(), phrases, testing_phrases),
             TestEmbeddingConfigV2 {
-                embedding_size: 15,
-                hidden_layer_nodes: 150,
-                input_stride_width: 4,
-                batch_size: 32,
+                embedding_size: 5,
+                hidden_layer_nodes: 125,
+                input_stride_width: 3,
+                batch_size: 16,
                 training_rounds: 1000,
                 train_rate: 1e-4,
                 // activation_mode: NetworkActivationMode::Tanh,

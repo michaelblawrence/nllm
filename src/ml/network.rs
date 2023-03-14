@@ -336,11 +336,12 @@ impl Network {
             .collect::<Vec<_>>()
             .into_iter();
 
-        for ((layer, layer_activation_mode), (layer_input, layer_weighted_outputs)) in
-            self.layers.iter_mut()
-                .zip(activations_iter)
-                .rev()
-                .zip(layer_io_iter)
+        for ((layer, layer_activation_mode), (layer_input, layer_weighted_outputs)) in self
+            .layers
+            .iter_mut()
+            .zip(activations_iter)
+            .rev()
+            .zip(layer_io_iter)
         {
             // key
             //  c <-> cost
@@ -906,7 +907,16 @@ impl NetworkActivationMode {
         match self {
             NetworkActivationMode::Linear => output.iter().map(|_| 1.0).collect(),
             // TODO: fix this approx deriv.
-            NetworkActivationMode::SoftMax => self.apply(output),
+            // NetworkActivationMode::SoftMax => self.apply(output),
+            NetworkActivationMode::SoftMax => self
+                .apply(output)
+                .iter()
+                .zip(
+                    self.apply(&output.iter().map(|x| x + 0.0001).collect())
+                        .iter(),
+                )
+                .map(|(a, b)| (b - a) / 0.0001)
+                .collect(),
             // NetworkActivationMode::SoftMax => {
             //     let softmax = self.apply(output);
             //     softmax
