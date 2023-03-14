@@ -1,4 +1,5 @@
-use tracing::info;
+use serde_json::Value;
+use tracing::debug;
 use web_sys::HtmlTextAreaElement;
 use yew::prelude::*;
 
@@ -8,18 +9,41 @@ pub struct JsonEditorProps {
     pub on_json_change: Callback<String>,
     #[prop_or_default]
     pub json_input: String,
+    #[prop_or_default]
+    pub input_invalid: bool,
+}
+
+fn is_valid_json(value: &str) -> bool {
+    serde_json::from_str::<Value>(value).is_err()
 }
 
 #[function_component(JsonEditor)]
 pub fn json_editor(props: &JsonEditorProps) -> Html {
     let on_json_change = props.on_json_change.clone();
-    let on_json_input = move |event: InputEvent| {
-        if let Some(value) = event
-            .target_dyn_into::<HtmlTextAreaElement>()
-            .map(|x| x.value())
+    let input_invalid = props.input_invalid.clone();
+
+    let invalid_json = use_state(|| false);
+    use_effect_with_deps(
         {
-            info!("{} ", &value);
-            on_json_change.emit(value);
+            let invalid_json = invalid_json.clone();
+            move |json_input: &String| {
+                invalid_json.set(is_valid_json(&json_input));
+                || {}
+            }
+        },
+        props.json_input.clone(),
+    );
+    let on_json_input = {
+        let invalid_json = invalid_json.clone();
+        move |event: InputEvent| {
+            if let Some(value) = event
+                .target_dyn_into::<HtmlTextAreaElement>()
+                .map(|x| x.value())
+            {
+                debug!("JSON: {} ", &value);
+                invalid_json.set(is_valid_json(&value));
+                on_json_change.emit(value);
+            }
         }
     };
 
@@ -33,6 +57,9 @@ pub fn json_editor(props: &JsonEditorProps) -> Html {
             <textarea
                 oninput={on_json_input}
                 value={props.json_input.clone()}
+                class={classes!(
+                    (*invalid_json || input_invalid).then_some("json-invalid"),
+                )}
             />
         </div>
     }
