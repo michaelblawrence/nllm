@@ -17,6 +17,7 @@ type NodeValue = f32;
 pub struct NetworkShape {
     inputs_count: usize,
     layers_shape: Vec<LayerShape>,
+    activation_mode: NetworkActivationMode,
 }
 
 impl NetworkShape {
@@ -34,6 +35,7 @@ impl NetworkShape {
                 .chain([(outputs_count, init_stratergy.clone())])
                 .map(|x| x.into())
                 .collect(),
+            activation_mode: Default::default(),
         }
     }
 
@@ -49,17 +51,20 @@ impl NetworkShape {
             node_count: embedding_size,
             strategy: LayerInitStrategy::NoBias(rng),
             stride_count: embedding_stride,
+            activation_mode: Some(NetworkActivationMode::Linear),
         };
-        let hidden_layer_shape = hidden_layer_shape.into_iter();
         let stratergy = hidden_layer_init_stratergy;
+        let final_layer: LayerShape = (token_count, stratergy.clone()).into();
+        let hidden_layer_shape = hidden_layer_shape.into_iter();
 
         Self {
             inputs_count: token_count,
             layers_shape: [embedding_layer_shape]
                 .into_iter()
                 .chain(hidden_layer_shape.map(|n| (n, stratergy.clone()).into()))
-                .chain([(token_count, stratergy.clone()).into()])
+                .chain([final_layer.with_activation_mode(NetworkActivationMode::SoftMax)])
                 .collect(),
+            activation_mode: Default::default(),
         }
     }
 
@@ -71,6 +76,19 @@ impl NetworkShape {
             .collect::<Vec<_>>()
             .into_iter()
     }
+
+    pub fn layer_activation(&self, layer_idx: usize) -> Result<NetworkActivationMode> {
+        let layer_shape = &self
+            .layers_shape
+            .get(layer_idx)
+            .context("provided layer index should be valid")?;
+
+        Ok(layer_shape.activation_mode.unwrap_or(self.activation_mode))
+    }
+
+    pub fn set_activation_mode(&mut self, activation_mode: NetworkActivationMode) {
+        self.activation_mode = activation_mode;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -78,8 +96,16 @@ pub struct LayerShape {
     node_count: usize,
     strategy: LayerInitStrategy,
     stride_count: Option<usize>,
-    // softmax_enabled: bool,
-    // activation_enabled: bool,
+    activation_mode: Option<NetworkActivationMode>,
+}
+
+impl LayerShape {
+    fn with_activation_mode(self, mode: NetworkActivationMode) -> Self {
+        Self {
+            activation_mode: Some(mode),
+            ..self
+        }
+    }
 }
 
 impl From<(usize, LayerInitStrategy)> for LayerShape {
@@ -88,6 +114,7 @@ impl From<(usize, LayerInitStrategy)> for LayerShape {
             node_count,
             strategy,
             stride_count: None,
+            activation_mode: None,
         }
     }
 }
@@ -96,12 +123,6 @@ impl From<(usize, LayerInitStrategy)> for LayerShape {
 pub struct Network {
     layers: Vec<Layer>,
     shape: NetworkShape,
-    // TODO: can refactor this out into network shape
-    activation_mode: NetworkActivationMode,
-    // TODO: can refactor this out into network shape
-    softmax_output_enabled: bool,
-    // TODO: can refactor this out into network shape
-    first_layer_activation_enabled: bool,
 }
 
 impl Network {
@@ -130,28 +151,7 @@ impl Network {
             }
         }
 
-        Self {
-            layers,
-            activation_mode: Default::default(),
-            shape,
-            softmax_output_enabled: false,
-            first_layer_activation_enabled: true,
-        }
-    }
-
-    // TODO: can refactor this out into network shape
-    pub fn set_activation_mode(&mut self, activation_mode: NetworkActivationMode) {
-        self.activation_mode = activation_mode;
-    }
-
-    // TODO: can refactor this out into network shape
-    pub fn set_softmax_output_enabled(&mut self, enabled: bool) {
-        self.softmax_output_enabled = enabled;
-    }
-
-    // TODO: can refactor this out into network shape
-    pub fn set_first_layer_activation_enabled(&mut self, enabled: bool) {
-        self.first_layer_activation_enabled = enabled;
+        Self { layers, shape }
     }
 
     pub fn compute(&self, inputs: LayerValues) -> Result<LayerValues> {
@@ -293,12 +293,7 @@ impl Network {
 
         for (layer_idx, layer) in layers.iter().enumerate() {
             let x = layer.compute(&output)?;
-
-            let z = if self.first_layer_activation_enabled || layer_idx != 0 {
-                self.activation_mode.apply(&x)
-            } else {
-                x.clone()
-            };
+            let z = self.layer_activation(layer_idx)?.apply(&x);
 
             output = if !disable_alloc {
                 layers_activations.push((x, z));
@@ -313,7 +308,7 @@ impl Network {
         }
 
         let x = last_layer.compute(&output)?;
-        let z = self.final_layer_activation().apply(&x);
+        let z = self.final_layer_activation()?.apply(&x);
 
         if !disable_alloc {
             layers_activations.push((x, z.clone()));
@@ -330,16 +325,22 @@ impl Network {
     ) -> Result<f64> {
         let mut layer_d = None;
         let mut output_layer_error = 0.0;
-        let final_activation_mode = self.final_layer_activation();
         let layer_io_iter = layers_activations
             .iter()
             .rev()
             .skip(1)
             .map(|(_x, z)| z)
             .zip(layers_activations.iter().rev().map(|(x, _z)| x));
+        let activations_iter = (0..self.layers.len())
+            .map(|i| self.layer_activation(i))
+            .collect::<Vec<_>>()
+            .into_iter();
 
-        for ((layer_idx, layer), (layer_input, layer_weighted_outputs)) in
-            self.layers.iter_mut().enumerate().rev().zip(layer_io_iter)
+        for ((layer, layer_activation_mode), (layer_input, layer_weighted_outputs)) in
+            self.layers.iter_mut()
+                .zip(activations_iter)
+                .rev()
+                .zip(layer_io_iter)
         {
             // key
             //  c <-> cost
@@ -352,33 +353,24 @@ impl Network {
             //    dc/da = error_d
             //    dz/dw = layer.learn (network layer inputs)
 
-            let (layer_activation_mode, error_d) = match layer_d.take() {
-                Some(prev_layer_error_d) => {
-                    let error_d = LayerValues(prev_layer_error_d);
-                    let activation_mode = if self.first_layer_activation_enabled || layer_idx != 0 {
-                        self.activation_mode
-                    } else {
-                        NetworkActivationMode::Linear
-                    };
-
-                    (activation_mode, error_d)
-                }
+            let error_d = match layer_d.take() {
+                Some(prev_layer_error_d) => LayerValues(prev_layer_error_d),
                 None => {
                     let last = layers_activations.last();
                     let (_, layer_output) = last.expect("should have a final layer");
-                    let error_d = layer.calculate_error_d(&layer_output, &target_outputs)?;
                     output_layer_error =
                         layer.calculate_error(&layer_output, &target_outputs)?.ave();
 
-                    (final_activation_mode, error_d)
+                    layer.calculate_error_d(&layer_output, &target_outputs)?
                 }
             };
 
-            let activation_d = layer_activation_mode.derivative(&layer_weighted_outputs);
+            let activation_d = layer_activation_mode?.derivative(&layer_weighted_outputs);
             let activated_layer_d = activation_d.multiply_iter(&error_d);
             let activated_layer_d = activated_layer_d.collect();
             let input_gradients = layer.compute_d(&activated_layer_d)?;
             let input_gradients = input_gradients.collect::<Vec<NodeValue>>();
+            layer_d = Some(input_gradients);
 
             let strategy = match enqueue_batch {
                 true => LayerLearnStrategy::EnqueueBatchGradientDecent {
@@ -393,7 +385,6 @@ impl Network {
             };
 
             layer.learn(&strategy)?;
-            layer_d = Some(input_gradients);
         }
         Ok(output_layer_error)
     }
@@ -421,17 +412,15 @@ impl Network {
             .context("unable to get first layer")
     }
 
-    fn final_layer_activation(&self) -> NetworkActivationMode {
-        // let last_layer = self.shape.layers_shape.last();
-        // let softmax_output_enabled = last_layer
-        //     .map(|layer| layer.softmax_enabled)
-        //     .unwrap_or(false);
-        // if softmax_output_enabled {
-        if self.softmax_output_enabled {
-            NetworkActivationMode::SoftMax
-        } else {
-            self.activation_mode
-        }
+    #[inline]
+    fn layer_activation(&self, layer_idx: usize) -> Result<NetworkActivationMode> {
+        self.shape.layer_activation(layer_idx)
+    }
+
+    #[inline]
+    fn final_layer_activation(&self) -> Result<NetworkActivationMode> {
+        let last_idx = self.shape.layers_shape.len() - 1;
+        self.layer_activation(last_idx)
     }
 
     pub fn shape(&self) -> &NetworkShape {
@@ -916,20 +905,22 @@ impl NetworkActivationMode {
     fn derivative(&self, output: &LayerValues) -> LayerValues {
         match self {
             NetworkActivationMode::Linear => output.iter().map(|_| 1.0).collect(),
-            NetworkActivationMode::SoftMax => {
-                let softmax = self.apply(output);
-                softmax
-                    .iter()
-                    .enumerate()
-                    .map(|(j, sj)| {
-                        softmax
-                            .iter()
-                            .enumerate()
-                            .map(|(i, si)| if i == j { si * (1.0 - si) } else { si * -sj })
-                            .sum::<NodeValue>()
-                    })
-                    .collect()
-            }
+            // TODO: fix this approx deriv.
+            NetworkActivationMode::SoftMax => self.apply(output),
+            // NetworkActivationMode::SoftMax => {
+            //     let softmax = self.apply(output);
+            //     softmax
+            //         .iter()
+            //         .enumerate()
+            //         .map(|(j, sj)| {
+            //             softmax
+            //                 .iter()
+            //                 .enumerate()
+            //                 .map(|(i, si)| if i == j { si * (1.0 - si) } else { si * -sj })
+            //                 .sum::<NodeValue>()
+            //         })
+            //         .collect()
+            // }
             NetworkActivationMode::Sigmoid => {
                 let mut sigmoid = self.apply(output);
                 sigmoid.iter_mut().for_each(|x| *x = *x * (1.0 - *x));
@@ -980,9 +971,9 @@ mod tests {
 
     #[test]
     fn can_compute_hidden_layer_network_zeros_linear_activation() {
-        let shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::Zero);
-        let mut network = Network::new(shape);
-        network.set_activation_mode(NetworkActivationMode::Linear);
+        let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::Zero);
+        shape.set_activation_mode(NetworkActivationMode::Linear);
+        let network = Network::new(shape);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
 
         assert_eq!(vec![0.0, 0.0], *output);
@@ -990,9 +981,9 @@ mod tests {
 
     #[test]
     fn can_compute_hidden_layer_network_zeros() {
-        let shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::Zero);
-        let mut network = Network::new(shape);
-        network.set_activation_mode(NetworkActivationMode::SoftMax);
+        let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::Zero);
+        shape.set_activation_mode(NetworkActivationMode::SoftMax);
+        let network = Network::new(shape);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
 
         assert_eq!(vec![0.5, 0.5], *output);
@@ -1001,14 +992,14 @@ mod tests {
 
     #[test]
     fn can_compute_hidden_layer_network_rands() {
-        let shape = NetworkShape::new(
+        let mut shape = NetworkShape::new(
             2,
             2,
             vec![8],
             LayerInitStrategy::PositiveRandom(Rc::new(JsRng::default())),
         );
-        let mut network = Network::new(shape);
-        network.set_activation_mode(NetworkActivationMode::SoftMax);
+        shape.set_activation_mode(NetworkActivationMode::SoftMax);
+        let network = Network::new(shape);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
 
         assert_ne!(vec![0.5, 0.5], *output);
@@ -1018,14 +1009,14 @@ mod tests {
     #[test]
     fn can_network_learn_randomly() {
         let rng = Rc::new(JsRng::default());
-        let shape = NetworkShape::new(
+        let mut shape = NetworkShape::new(
             2,
             2,
             vec![8],
             LayerInitStrategy::PositiveRandom(rng.clone()),
         );
+        shape.set_activation_mode(NetworkActivationMode::SoftMax);
         let mut network = Network::new(shape);
-        network.set_activation_mode(NetworkActivationMode::SoftMax);
 
         let output_1 = network.compute([2.0, 2.0].iter().into()).unwrap();
         network
@@ -1412,11 +1403,11 @@ mod tests {
         use super::*;
 
         pub(crate) fn create_network(
-            shape: NetworkShape,
+            mut shape: NetworkShape,
             activation_mode: NetworkActivationMode,
         ) -> Network {
-            let mut network = Network::new(shape);
-            network.set_activation_mode(activation_mode);
+            shape.set_activation_mode(activation_mode);
+            let network = Network::new(shape);
             network
         }
 

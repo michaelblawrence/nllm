@@ -9,8 +9,8 @@ use anyhow::{anyhow, Context, Result};
 use tracing::debug;
 
 use super::{
-    BatchSamplingStrategy, JsRng, LayerInitStrategy, LayerValues, Network, NetworkActivationMode,
-    NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, RNG,
+    BatchSamplingStrategy, JsRng, LayerInitStrategy, LayerValues, Network, NetworkLearnStrategy,
+    NetworkShape, NodeValue, SamplingRng, RNG,
 };
 
 pub struct Embedding {
@@ -20,12 +20,12 @@ pub struct Embedding {
     input_stride_width: usize,
 }
 
-const CONTROL_VOCAB: &str = &"<BREAK>";
+const CONTROL_VOCAB: &str = &"<CTRL>";
 
 impl Embedding {
     pub fn new(
         vocab: HashSet<String>,
-        size: usize,
+        embedding_dimensions: usize,
         input_stride_width: usize,
         hidden_layer_shape: Vec<usize>,
         rng: Rc<dyn RNG>,
@@ -41,23 +41,18 @@ impl Embedding {
             .collect();
 
         let hidden_layer_init_stratergy = LayerInitStrategy::ScaledFullRandom(rng.clone());
+        let mut network_shape = NetworkShape::new_embedding(
+            vocab.len(),
+            embedding_dimensions,
+            Some(input_stride_width),
+            hidden_layer_shape,
+            hidden_layer_init_stratergy,
+            rng.clone(),
+        );
 
-        let network = {
-            let network_shape = NetworkShape::new_embedding(
-                vocab.len(),
-                size,
-                Some(input_stride_width),
-                hidden_layer_shape,
-                hidden_layer_init_stratergy,
-                rng.clone(),
-            );
-            let mut network = Network::new(network_shape);
+        network_shape.set_activation_mode(super::NetworkActivationMode::Tanh);
 
-            network.set_activation_mode(super::NetworkActivationMode::Sigmoid);
-            network.set_softmax_output_enabled(false);
-            network.set_first_layer_activation_enabled(false);
-            network
-        };
+        let network = Network::new(network_shape);
 
         Self {
             network,
@@ -67,9 +62,9 @@ impl Embedding {
         }
     }
 
-    pub fn set_activation_mode(&mut self, activation_mode: NetworkActivationMode) {
-        self.network.set_activation_mode(activation_mode);
-    }
+    // pub fn set_activation_mode(&mut self, activation_mode: NetworkActivationMode) {
+    //     self.network.set_activation_mode(activation_mode);
+    // }
 
     pub fn train_v2(
         &mut self,
@@ -204,9 +199,7 @@ impl Embedding {
 
     pub fn predict_next(&self, last_words: &Vec<&str>) -> Result<String> {
         let network_input = self.get_padded_network_input(last_words)?;
-        let output = self.network.compute(network_input)?;
-
-        let probabilities = NetworkActivationMode::SoftMax.apply(&output);
+        let probabilities = self.compute_probabilities(network_input)?;
         let sampled_idx = self.rng.sample_uniform(&probabilities)?;
 
         Ok(self
@@ -224,10 +217,7 @@ impl Embedding {
             .chain([last_word].into_iter())
             .collect();
         let network_input = self.get_padded_network_input(&last_words)?;
-
-        let output = self.network.compute(network_input)?;
-
-        let probabilities = NetworkActivationMode::SoftMax.apply(&output);
+        let probabilities = self.compute_probabilities(network_input)?;
         let sampled_idx = self.rng.sample_uniform(&probabilities)?;
 
         Ok(self
@@ -241,15 +231,13 @@ impl Embedding {
 
     pub fn nll(&self, last_words: &Vec<&str>, expected_next_word: &str) -> Result<NodeValue> {
         let network_input = self.get_padded_network_input(&last_words)?;
-        let output = self.network.compute(network_input)?;
 
-        // TODO: do softmax in net?
         let expected_vocab_idx = *self
             .vocab
             .get(&expected_next_word.to_string())
             .context("provided vocab word should be in vocab dict")?;
 
-        let probabilities = NetworkActivationMode::SoftMax.apply(&output);
+        let probabilities = self.compute_probabilities(network_input)?;
 
         let log_logits = probabilities
             .get(expected_vocab_idx)
@@ -257,6 +245,15 @@ impl Embedding {
             .ln();
 
         Ok(-log_logits)
+    }
+
+    fn compute_probabilities(
+        &self,
+        network_input: LayerValues,
+    ) -> Result<LayerValues, anyhow::Error> {
+        let probabilities = self.network.compute(network_input)?;
+        // let probabilities = NetworkActivationMode::SoftMax.apply(&output);
+        Ok(probabilities)
     }
 
     pub fn nll_batch(&self, phrases: &Vec<Vec<String>>) -> Result<NodeValue> {
@@ -382,7 +379,7 @@ impl Embedding {
             let target_outputs = LayerValues::new(last_word_vector.clone());
 
             let error = self.network.compute_error(inputs, &target_outputs)?;
-            let error: NodeValue = error.iter().sum();
+            let error: NodeValue = error.ave();
             errors.push(error);
         }
 
@@ -492,10 +489,10 @@ mod tests {
                 embedding_size: 6,
                 hidden_layer_nodes: 100,
                 input_stride_width: 3,
-                batch_size: 32,
+                batch_size: 1,
                 training_rounds: 100000,
-                train_rate: 1e-2,
-                activation_mode: NetworkActivationMode::Tanh,
+                train_rate: 1e-4,
+                // activation_mode: NetworkActivationMode::Tanh,
                 // activation_mode: NetworkActivationMode::Sigmoid,
             },
         );
@@ -536,7 +533,7 @@ mod tests {
                 batch_size: 32,
                 training_rounds: 1000,
                 train_rate: 1e-4,
-                activation_mode: NetworkActivationMode::Tanh,
+                // activation_mode: NetworkActivationMode::Tanh,
                 // activation_mode: NetworkActivationMode::Sigmoid,
             },
         );
@@ -800,7 +797,7 @@ mod tests {
             pub input_stride_width: usize,
             pub batch_size: usize,
             pub train_rate: NodeValue,
-            pub activation_mode: NetworkActivationMode,
+            // pub activation_mode: NetworkActivationMode,
         }
 
         pub fn setup_and_train_embeddings_v2(
@@ -811,7 +808,7 @@ mod tests {
             ),
             config: TestEmbeddingConfigV2,
         ) -> Embedding {
-            let rng = Rc::new(JsRng::default());
+            let rng: Rc<dyn RNG> = Rc::new(JsRng::default());
             let mut embedding = Embedding::new(
                 vocab,
                 config.embedding_size,
@@ -819,11 +816,21 @@ mod tests {
                 vec![config.hidden_layer_nodes],
                 rng.clone(),
             );
-            embedding.set_activation_mode(config.activation_mode);
+            // TODO: enable setting this with builder pattern
+            // embedding.set_activation_mode(config.activation_mode);
 
             let mut seen_pairs = HashSet::new();
 
             for round in 0..config.training_rounds {
+                let phrases = {
+                    let batch_size = config.batch_size * config.batch_size;
+                    let max_len = phrases.len() - batch_size;
+                    let max_len = max_len.max(batch_size);
+                    let n = rng.rand_range(0, max_len);
+                    let mut phrases = phrases.iter().skip(n).take(batch_size).cloned().collect::<Vec<_>>();
+                    rng.shuffle_vec(&mut phrases);
+                    phrases
+                };
                 let training_error = embedding
                     .train_v2(&phrases, config.train_rate, config.batch_size)
                     .unwrap();
@@ -886,12 +893,20 @@ mod tests {
                 || (round_1based <= 1000000 && round_1based % 100000 == 0)
                 || round_1based == training_rounds
             {
-                let (validation_error, nll) = validation_errors.last().unwrap();
+                let val_count = validation_errors.len() as NodeValue;
+                let (validation_error, nll) =
+                    validation_errors
+                        .iter()
+                        .fold((0.0, 0.0), |sum, (validation_error, nll)| {
+                            (
+                                sum.0 + (validation_error / val_count),
+                                sum.1 + (nll / val_count),
+                            )
+                        });
 
                 info!(
-                // "round = {:<6} |  training_loss = {:<10.8}, prediction_acc: {:>4.1}%, validation_loss = {:<10.8}, nll = {:<10.3}",
-                "round = {:<6} |  train_loss = {:<10.8}, val_pred_acc: {:0>4.1}%, val_loss = {:<6.4}, val_nll = {:<10.3}",
-                round_1based, training_error, predictions_pct, validation_error, nll
+                    "round = {:<6} |  train_loss = {:<10.8}, val_pred_acc: {:0>4.1}%, val_loss = {:6e}, val_nll = {:<10.3}",
+                    round_1based, training_error, predictions_pct, validation_error, nll
             );
             }
         }
