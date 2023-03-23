@@ -106,6 +106,10 @@ impl LayerShape {
             ..self
         }
     }
+
+    pub fn mode_override(&self) -> Option<NetworkActivationMode> {
+        self.activation_mode
+    }
 }
 
 impl From<(usize, LayerInitStrategy)> for LayerShape {
@@ -175,7 +179,7 @@ impl Network {
     ) -> Result<LayerValues> {
         let last_layer = self.layers.last().context("should have a final layer")?;
         let outputs = self.compute(inputs)?;
-        let errors = last_layer.calculate_error(&outputs, &target_outputs)?;
+        let errors = last_layer.calculate_error(&outputs, &target_outputs, &self.final_layer_activation()?)?;
         Ok(errors)
     }
 
@@ -359,10 +363,11 @@ impl Network {
                 None => {
                     let last = layers_activations.last();
                     let (_, layer_output) = last.expect("should have a final layer");
+                    let mode = layer_activation_mode.as_ref().unwrap();
                     output_layer_error =
-                        layer.calculate_error(&layer_output, &target_outputs)?.ave();
+                        layer.calculate_error(&layer_output, &target_outputs, &mode)?.ave();
 
-                    layer.calculate_error_d(&layer_output, &target_outputs)?
+                    layer.calculate_error_d(&layer_output, &target_outputs, &mode)?
                 }
             };
 
@@ -480,10 +485,12 @@ impl Layer {
                 .collect(),
         };
 
+        let size = self.size();
         for (input_index, input) in inputs.iter().enumerate() {
             let weights = self.node_weights(input_index % self.inputs_count)?;
+            let stride_idx = input_index / self.inputs_count;
             for (output_idx, weight) in weights.enumerate() {
-                outputs[output_idx] += input * weight;
+                outputs[output_idx + (stride_idx * size)] += input * weight;
             }
         }
 
@@ -630,6 +637,29 @@ impl Layer {
         &self,
         outputs: &LayerValues,
         expected_outputs: &LayerValues,
+        mode: &NetworkActivationMode,
+    ) -> Result<LayerValues> {
+        match mode {
+            NetworkActivationMode::SoftMax => {
+                expected_outputs
+                    .iter()
+                    .zip(outputs.iter())
+                    .map(|(expected, actual)| match *expected {
+                        1.0 => Ok(-actual.ln()),
+                        0.0 => Ok(0.0),
+                        _ => Err(anyhow!("target outputs should be one-hot encoded"))
+                    })
+                    .collect()
+            },
+            _ => self.calculate_msd_error(outputs, expected_outputs)
+        }
+        
+    }
+
+    pub fn calculate_msd_error(
+        &self,
+        outputs: &LayerValues,
+        expected_outputs: &LayerValues,
     ) -> Result<LayerValues> {
         let mut error = vec![];
         for (actual, expected) in outputs.iter().zip(expected_outputs.iter()) {
@@ -640,6 +670,28 @@ impl Layer {
     }
 
     pub fn calculate_error_d(
+        &self,
+        outputs: &LayerValues,
+        expected_outputs: &LayerValues,
+        mode: &NetworkActivationMode,
+    ) -> Result<LayerValues> {
+        match mode {
+            // NetworkActivationMode::SoftMax => {
+            //     expected_outputs
+            //         .iter()
+            //         .zip(outputs.iter())
+            //         .map(|(expected, actual)| match *expected {
+            //             1.0 => Ok(-1.0 / actual),
+            //             0.0 => Ok(0.0),
+            //             _ => Err(anyhow!("target outputs should be one-hot encoded"))
+            //         })
+            //         .collect()
+            // },
+            _ => self.calculate_msd_error_d(outputs, expected_outputs)
+        }
+    }
+
+    pub fn calculate_msd_error_d(
         &self,
         outputs: &LayerValues,
         expected_outputs: &LayerValues,
@@ -907,16 +959,21 @@ impl NetworkActivationMode {
         match self {
             NetworkActivationMode::Linear => output.iter().map(|_| 1.0).collect(),
             // TODO: fix this approx deriv.
-            // NetworkActivationMode::SoftMax => self.apply(output),
-            NetworkActivationMode::SoftMax => self
-                .apply(output)
-                .iter()
-                .zip(
-                    self.apply(&output.iter().map(|x| x + 0.0001).collect())
-                        .iter(),
-                )
-                .map(|(a, b)| (b - a) / 0.0001)
-                .collect(),
+            NetworkActivationMode::SoftMax => self.apply(output),
+            // NetworkActivationMode::SoftMax => {
+            //     let dx = 0.0001;
+            //     let apply_1 = self.apply(&output);
+            // // adding to all inputs here makes no meaningful to computed probs, so this is a very very poor dydx approx
+            //     let apply_2 = self.apply(&output.iter().map(|x| x + dx).collect());
+            //     let mut v = vec![];
+
+            //     for (x1, x2) in apply_1.iter().zip(apply_2.iter()) {
+            //         let dy = x2 - x1;
+            //         let dydx = dy / dx;
+            //         v.push(dydx);
+            //     }
+            //     LayerValues::new(v)
+            // }
             // NetworkActivationMode::SoftMax => {
             //     let softmax = self.apply(output);
             //     softmax

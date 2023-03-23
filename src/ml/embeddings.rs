@@ -9,8 +9,8 @@ use anyhow::{anyhow, Context, Result};
 use tracing::debug;
 
 use super::{
-    BatchSamplingStrategy, JsRng, LayerInitStrategy, LayerValues, Network, NetworkLearnStrategy,
-    NetworkShape, NodeValue, SamplingRng, RNG,
+    BatchSamplingStrategy, JsRng, LayerInitStrategy, LayerValues, Network, NetworkActivationMode,
+    NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, RNG,
 };
 
 pub struct Embedding {
@@ -88,11 +88,11 @@ impl Embedding {
             phrase
                 .iter()
                 .flat_map(|word| self.vocab.get(&word.to_string()))
-                .chain([control_vocab_idx])
+                .chain(iter::repeat(control_vocab_idx).take(word_locality_factor - 1))
         });
 
         let vectored_phrases = iter::repeat(control_vocab_idx)
-            .take(word_locality_factor)
+            .take(word_locality_factor - 1)
             .chain(indexed_phrases)
             .map(|&vocab_idx| self.one_hot(vocab_idx).collect::<Vec<_>>())
             .collect::<Vec<_>>();
@@ -100,7 +100,7 @@ impl Embedding {
         let windowed_word_vectors = vectored_phrases.windows(word_locality_factor + 1).map(
             |word_vectors| match word_vectors.split_last() {
                 Some((last, rest)) => (rest, last),
-                None => panic!("should have "),
+                None => panic!("should have last"),
             },
         );
 
@@ -251,8 +251,19 @@ impl Embedding {
         &self,
         network_input: LayerValues,
     ) -> Result<LayerValues, anyhow::Error> {
-        let probabilities = self.network.compute(network_input)?;
-        // let probabilities = NetworkActivationMode::SoftMax.apply(&output);
+        let network_shape = &self.network.shape();
+        let last_layer_shape = network_shape
+            .iter()
+            .last()
+            .context("should have final layer defined")?;
+
+        let post_apply_mode = match last_layer_shape.mode_override() {
+            Some(NetworkActivationMode::SoftMax) => NetworkActivationMode::Linear,
+            _ => NetworkActivationMode::SoftMax,
+        };
+
+        let output = self.network.compute(network_input)?;
+        let probabilities = post_apply_mode.apply(&output);
         Ok(probabilities)
     }
 
@@ -453,6 +464,53 @@ mod tests {
     use self::training::{TestEmbeddingConfig, TestEmbeddingConfigV2};
 
     use super::*;
+
+    #[test]
+    #[ignore = "takes too long"]
+    fn embeddings_work_simple_counter_prediction_v2() {
+        let phrases = ["zero one two three four five six seven eight nine ten"];
+
+        let phrases: Vec<Vec<String>> = phrases
+            .into_iter()
+            .map(|phrase| {
+                phrase
+                    .split_whitespace()
+                    .map(|word| word.to_string())
+                    .collect()
+            })
+            .collect();
+
+        let vocab: HashSet<String> = phrases
+            .iter()
+            .flat_map(|phrase| phrase.iter())
+            .cloned()
+            .collect();
+
+        let testing_phrases = phrases.clone();
+
+        let embedding = training::setup_and_train_embeddings_v2(
+            (vocab, phrases, testing_phrases),
+            TestEmbeddingConfigV2 {
+                embedding_size: 2,
+                hidden_layer_nodes: 30,
+                input_stride_width: 3,
+                batch_size: 3,
+                training_rounds: 1000_000,
+                train_rate: 1e-5,
+                // activation_mode: NetworkActivationMode::Tanh,
+                // activation_mode: NetworkActivationMode::Sigmoid,
+            },
+        );
+
+        assert_eq!("one", embedding.predict_from("zero").unwrap().as_str());
+        assert_eq!(
+            "six",
+            embedding
+                .predict_next(&["three", "four", "five"].into_iter().collect())
+                .unwrap()
+                .as_str()
+        );
+    }
 
     #[test]
     #[ignore = "takes too long"]
@@ -822,15 +880,15 @@ mod tests {
             let mut seen_pairs = HashSet::new();
 
             for round in 0..config.training_rounds {
-                let phrases = {
-                    let batch_size = config.batch_size * config.batch_size;
-                    let max_len = phrases.len() - batch_size;
-                    let max_len = max_len.max(batch_size);
-                    let n = rng.rand_range(0, max_len);
-                    let mut phrases = phrases.iter().skip(n).take(batch_size).cloned().collect::<Vec<_>>();
-                    rng.shuffle_vec(&mut phrases);
-                    phrases
-                };
+                // let phrases = {
+                //     let batch_size = config.batch_size * config.batch_size;
+                //     let max_len = phrases.len() - batch_size.min(phrases.len());
+                //     let max_len = max_len.max(batch_size);
+                //     let n = rng.rand_range(0, max_len);
+                //     let mut phrases = phrases.iter().skip(n).take(batch_size).cloned().collect::<Vec<_>>();
+                //     rng.shuffle_vec(&mut phrases);
+                //     phrases
+                // };
                 let training_error = embedding
                     .train_v2(&phrases, config.train_rate, config.batch_size)
                     .unwrap();
@@ -905,7 +963,7 @@ mod tests {
                         });
 
                 info!(
-                    "round = {:<6} |  train_loss = {:<10.8}, val_pred_acc: {:0>4.1}%, val_loss = {:6e}, val_nll = {:<10.3}",
+                    "round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<10.3}",
                     round_1based, training_error, predictions_pct, validation_error, nll
             );
             }
@@ -922,7 +980,9 @@ mod tests {
             let mut total_first_word_predictions = 0;
 
             for testing_phrase in testing_phrases.iter() {
-                for testing_phrase_window in testing_phrase.windows(embedding.input_stride_width) {
+                for testing_phrase_window in
+                    testing_phrase.windows(embedding.input_stride_width + 1)
+                {
                     let (last_word_vector, context_word_vectors) =
                         testing_phrase_window.split_last().unwrap();
 
