@@ -467,8 +467,86 @@ mod tests {
 
     #[test]
     #[ignore = "takes too long"]
+    fn embeddings_work_medium_len_phrases_prediction_v2() {
+        let (_, phrases) = training::parse_vocab_and_phrases();
+        let rng: &dyn RNG = &JsRng::default();
+
+        let mut phrases: Vec<Vec<String>> = phrases
+            .into_iter()
+            .filter(|phrase| phrase.len() > 12 && phrase.len() < 20)
+            .collect();
+
+        let vocab_counts = phrases
+            .iter()
+            .flat_map(|phrase| phrase.iter())
+            .cloned()
+            .fold(HashMap::new(), |mut counts, word| {
+                counts.entry(word).and_modify(|x| *x += 1).or_insert(1_i32);
+                counts
+            });
+
+        phrases.sort_by_key(|phrase| {
+            phrase
+                .iter()
+                .map(|word| vocab_counts[word].pow(2))
+                .sum::<i32>()
+        });
+        use itertools::Itertools;
+
+        phrases.truncate(40);
+        info!(
+            "First 3 phrases: {:#?}",
+            phrases[0..3]
+                .iter()
+                .map(|phrase| (
+                    phrase.join(" "),
+                    phrase
+                        .iter()
+                        .map(|word| vocab_counts[word].pow(2))
+                        .join("|")
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        let vocab: HashSet<String> = phrases
+            .iter()
+            .flat_map(|phrase| phrase.iter())
+            .cloned()
+            .collect();
+
+        dbg!((phrases.len(), vocab.len()));
+
+        crate::ml::ShuffleRng::shuffle_vec(&rng, &mut phrases);
+
+        // let testing_phrases = phrases.split_off(phrases.len() / 10);
+        let testing_phrases = phrases.clone();
+
+        let embedding = training::setup_and_train_embeddings_v2(
+            (vocab.clone(), phrases, testing_phrases),
+            TestEmbeddingConfigV2 {
+                embedding_size: 2,
+                hidden_layer_nodes: 80,
+                input_stride_width: 3,
+                batch_size: 4,
+                training_rounds: 25_000,
+                train_rate: 1e-3,
+            },
+        );
+
+        training::write_results_to_disk(&embedding, &vocab, "convo-midlen");
+    }
+
+    #[test]
+    #[ignore = "takes too long"]
     fn embeddings_work_simple_counter_prediction_v2() {
-        let phrases = ["zero one two three four five six seven eight nine ten"];
+        let phrases = [
+            "zero one two three four five six seven eight nine ten",
+            "cero uno dos tres cuatro cinco seis siete ocho nueve diez",
+            "zero uno due tre quattro cinque sei sette otto nove dieci",
+            "nul een twee drie vier vijf zes zeven acht negen tien",
+            "null eins zwei drei vier fünf sechs sieben acht neun zehn",
+            "sero un dau tri pedwar pump chwech saith wyth naw deg",
+        ];
 
         let phrases: Vec<Vec<String>> = phrases
             .into_iter()
@@ -489,18 +567,18 @@ mod tests {
         let testing_phrases = phrases.clone();
 
         let embedding = training::setup_and_train_embeddings_v2(
-            (vocab, phrases, testing_phrases),
+            (vocab.clone(), phrases, testing_phrases),
             TestEmbeddingConfigV2 {
                 embedding_size: 2,
                 hidden_layer_nodes: 30,
                 input_stride_width: 3,
                 batch_size: 3,
-                training_rounds: 1000_000,
-                train_rate: 1e-5,
-                // activation_mode: NetworkActivationMode::Tanh,
-                // activation_mode: NetworkActivationMode::Sigmoid,
+                training_rounds: 100_000,
+                train_rate: 1e-2,
             },
         );
+
+        training::write_results_to_disk(&embedding, &vocab, "counter-lang");
 
         assert_eq!("one", embedding.predict_from("zero").unwrap().as_str());
         assert_eq!(
@@ -596,49 +674,7 @@ mod tests {
             },
         );
 
-        let systime = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-
-        std::fs::File::create(format!("out-{systime}_nearest.json"))
-            .unwrap()
-            .write_all(
-                serde_json::to_string_pretty(&{
-                    let mut map = HashMap::new();
-
-                    for v in vocab.iter() {
-                        let nearest = embedding
-                            .nearest(&v)
-                            .map(|(x, _)| x)
-                            .unwrap_or_else(|_| "<none>".to_string());
-                        map.insert(v, nearest);
-                    }
-                    map
-                })
-                .unwrap()
-                .as_bytes(),
-            )
-            .unwrap();
-
-        std::fs::File::create(format!("out-{systime}_predictions.json"))
-            .unwrap()
-            .write_all(
-                serde_json::to_string_pretty(&{
-                    let mut map = HashMap::new();
-
-                    for v in vocab.iter() {
-                        let predict = embedding
-                            .predict_from(&v)
-                            .unwrap_or_else(|_| "<none>".to_string());
-                        map.insert(v, predict);
-                    }
-                    map
-                })
-                .unwrap()
-                .as_bytes(),
-            )
-            .unwrap();
+        training::write_results_to_disk(&embedding, &vocab, "convo-big");
 
         let seed_word = "first";
         info!(
@@ -1042,6 +1078,70 @@ mod tests {
                         as usize,
             );
             testing_phrases
+        }
+
+        pub fn write_results_to_disk(embedding: &Embedding, vocab: &HashSet<String>, label: &str) {
+            use itertools::Itertools;
+
+            let systime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+
+            std::fs::File::create(format!("out/out-{label}-{systime}_nearest.json"))
+                .unwrap()
+                .write_all(
+                    serde_json::to_string_pretty(&{
+                        let mut map = HashMap::new();
+
+                        for v in vocab.iter() {
+                            let nearest = embedding
+                                .nearest(&v)
+                                .map(|(x, _)| x)
+                                .unwrap_or_else(|_| "<none>".to_string());
+                            map.insert(v, nearest);
+                        }
+                        map
+                    })
+                    .unwrap()
+                    .as_bytes(),
+                )
+                .unwrap();
+
+            std::fs::File::create(format!("out/out-{label}-{systime}_predictions.json"))
+                .unwrap()
+                .write_all(
+                    serde_json::to_string_pretty(&{
+                        let mut map = HashMap::new();
+
+                        for v in vocab.iter() {
+                            let predict = embedding
+                                .predict_from(&v)
+                                .unwrap_or_else(|_| "<none>".to_string());
+                            map.insert(v, predict);
+                        }
+                        map
+                    })
+                    .unwrap()
+                    .as_bytes(),
+                )
+                .unwrap();
+
+            std::fs::File::create(format!("out/out-{label}-{systime}_embeddings.csv"))
+                .unwrap()
+                .write_fmt(format_args!(
+                    "{}",
+                    vocab
+                        .iter()
+                        .map(|word| {
+                            format!(
+                                "{word},{}",
+                                embedding.embeddings(&word).unwrap().iter().join(",")
+                            )
+                        })
+                        .join("\n")
+                ))
+                .unwrap();
         }
     }
 }
