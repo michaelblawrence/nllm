@@ -63,6 +63,11 @@ impl<T: Deref<Target = dyn RNG>> SamplingRng for T {
                 }
             },
         );
-        sampled_idx.context("failed to sample from provided probabilities")
+
+        let sampled_idx = sampled_idx.with_context(|| {
+            format!("failed to sample from provided probabilities: {probabilities:?}")
+        })?;
+
+        Ok(sampled_idx)
     }
 }

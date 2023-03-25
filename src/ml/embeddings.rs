@@ -498,7 +498,7 @@ mod tests {
         });
         use itertools::Itertools;
 
-        phrases.truncate(40);
+        phrases.truncate(125);
         info!(
             "First 3 phrases: {:#?}",
             phrases[0..3]
@@ -530,11 +530,11 @@ mod tests {
             (vocab.clone(), phrases, testing_phrases),
             TestEmbeddingConfigV2 {
                 embedding_size: 2,
-                hidden_layer_nodes: 80,
+                hidden_layer_nodes: 35,
                 input_stride_width: 3,
-                batch_size: 4,
+                batch_size: 8,
                 training_rounds: 25_000,
-                train_rate: 1e-3,
+                train_rate: 1e-2,
             },
         );
 
@@ -589,7 +589,7 @@ mod tests {
         assert_eq!(
             "six",
             embedding
-                .predict_next(&["three", "four", "five"].into_iter().collect())
+                .predict_next(&["three", "four", "five"])
                 .unwrap()
                 .as_str()
         );
@@ -829,6 +829,8 @@ mod tests {
     }
 
     mod training {
+        use std::time::{Duration, Instant};
+
         use serde_json::Value;
 
         use crate::ml::{JsRng, ShuffleRng};
@@ -876,13 +878,15 @@ mod tests {
                 let (validation_errors, predictions_pct) =
                     validate_embeddings(&embedding, &testing_phrases, &mut seen_pairs, round);
 
-                report_training_round(
-                    round,
-                    config.training_rounds,
-                    training_error,
-                    validation_errors,
-                    predictions_pct,
-                );
+                if should_report_round(round, config.training_rounds) {
+                    report_training_round(
+                        round,
+                        training_error,
+                        validation_errors,
+                        predictions_pct,
+                        None
+                    );
+                }
             }
 
             embedding
@@ -919,6 +923,7 @@ mod tests {
             // embedding.set_activation_mode(config.activation_mode);
 
             let mut seen_pairs = HashSet::new();
+            let mut last_report_time: Option<(Instant, usize)> = None;
 
             for round in 0..config.training_rounds {
                 // let phrases = {
@@ -939,16 +944,20 @@ mod tests {
                     .train_v2(&phrases, config.train_rate, config.batch_size)
                     .unwrap();
 
-                let (validation_errors, predictions_pct) =
-                    validate_embeddings(&embedding, &testing_phrases, &mut seen_pairs, round);
+                if should_report_round(round, config.training_rounds) {
+                    let (validation_errors, predictions_pct) =
+                        validate_embeddings(&embedding, &testing_phrases, &mut seen_pairs, round);
 
-                report_training_round(
-                    round,
-                    config.training_rounds,
-                    training_error,
-                    validation_errors,
-                    predictions_pct,
-                );
+                    report_training_round(
+                        round,
+                        training_error,
+                        validation_errors,
+                        predictions_pct,
+                        last_report_time.map(|(last_dt, round)| (last_dt.elapsed(), round)),
+                    );
+
+                    last_report_time = Some((std::time::Instant::now(), round));
+                }
             }
 
             embedding
@@ -982,37 +991,42 @@ mod tests {
             (vocab, phrases)
         }
 
-        fn report_training_round(
-            round: usize,
-            training_rounds: usize,
-            training_error: f64,
-            validation_errors: Vec<(f64, f64)>,
-            predictions_pct: f64,
-        ) {
+        fn should_report_round(round: usize, training_rounds: usize) -> bool {
             let round_1based = round + 1;
-            if round_1based <= 50
+
+            round_1based <= 50
                 || (round_1based <= 1000 && round_1based % 100 == 0)
                 || (round_1based <= 10000 && round_1based % 1000 == 0)
                 || (round_1based <= 100000 && round_1based % 10000 == 0)
                 || (round_1based <= 1000000 && round_1based % 100000 == 0)
                 || round_1based == training_rounds
-            {
-                let val_count = validation_errors.len() as NodeValue;
-                let (validation_error, nll) =
-                    validation_errors
-                        .iter()
-                        .fold((0.0, 0.0), |sum, (validation_error, nll)| {
-                            (
-                                sum.0 + (validation_error / val_count),
-                                sum.1 + (nll / val_count),
-                            )
-                        });
+        }
 
-                info!(
-                    "round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<10.3}",
-                    round_1based, training_error, predictions_pct, validation_error, nll
+        fn report_training_round(
+            round: usize,
+            training_error: f64,
+            validation_errors: Vec<(f64, f64)>,
+            predictions_pct: f64,
+            last_report_time: Option<(Duration, usize)>,
+        ) {
+            let val_count = validation_errors.len() as NodeValue;
+            let (validation_error, nll) =
+                validation_errors
+                    .iter()
+                    .fold((0.0, 0.0), |sum, (validation_error, nll)| {
+                        (
+                            sum.0 + (validation_error / val_count),
+                            sum.1 + (nll / val_count),
+                        )
+                    });
+
+            let ms_per_round = last_report_time.map(|(duration, last_round)| duration.as_millis() / (round - last_round) as u128);
+            let ms_per_round = ms_per_round.map(|ms_per_round| format!("(ms/round={ms_per_round:<4.1})")).unwrap_or_default();
+
+            info!(
+                    "round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<6.3} {ms_per_round}",
+                    round + 1, training_error, predictions_pct, validation_error, nll
             );
-            }
         }
 
         fn validate_embeddings(
@@ -1048,7 +1062,7 @@ mod tests {
                             }
                         }
                         if seen_pairs.insert((predicted.clone(), actual.clone())) {
-                            info!(
+                            debug!(
                                 "round = {:<6} |   ✅ correctly identified new prediction pairing.. '{last_word} {predicted}' was predicted correctly",
                                 round + 1,
                                 last_word = last_words.join(" "),

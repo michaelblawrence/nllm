@@ -179,7 +179,11 @@ impl Network {
     ) -> Result<LayerValues> {
         let last_layer = self.layers.last().context("should have a final layer")?;
         let outputs = self.compute(inputs)?;
-        let errors = last_layer.calculate_error(&outputs, &target_outputs, &self.final_layer_activation()?)?;
+        let errors = last_layer.calculate_error(
+            &outputs,
+            &target_outputs,
+            &self.final_layer_activation()?,
+        )?;
         Ok(errors)
     }
 
@@ -195,7 +199,11 @@ impl Network {
             .layers
             .last()
             .context("should have final layer")?
-            .calculate_error(target_outputs, &layer_output, &self.final_layer_activation()?)?
+            .calculate_error(
+                &layer_output,
+                target_outputs,
+                &self.final_layer_activation()?,
+            )?
             .ave();
 
         Ok(output_layer_error)
@@ -243,9 +251,6 @@ impl Network {
                     return Ok(None);
                 }
 
-                let mut sum_error = 0.0;
-                let training_pairs_len = training_pairs.len();
-
                 let batches = match batch_sampling {
                     BatchSamplingStrategy::Sequential => {
                         training_pairs.into_iter().chunks(batch_size)
@@ -257,25 +262,43 @@ impl Network {
                     }
                 };
 
-                let mut layer_learn_actions = vec![];
+                let mut network_errors = vec![];
 
-                for training_pairs in batches.into_iter() {
-                    for (inputs, target_outputs) in training_pairs {
-                        let layers_activations = self.compute_all_layers_activations(inputs)?;
+                for batch in batches.into_iter() {
+                    let all_layers_activations = batch
+                        .map(|(inputs, target_outputs)| {
+                            let layers_activations = self.compute_all_layers_activations(inputs)?;
+                            Ok((layers_activations, target_outputs))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
 
-                        let output_layer_error =
-                            self.compute_error_precomputed(&layers_activations, &target_outputs)?;
+                    let batch_errors = all_layers_activations
+                        .iter()
+                        .map(|(layers_activations, target_outputs)| {
+                            let output_layer_error = self
+                                .compute_error_precomputed(&layers_activations, &target_outputs);
+                            output_layer_error
+                        })
+                        .collect::<Result<Vec<_>>>()?;
 
-                        let learn_actions = self
-                            .perform_gradient_decent_step(&layers_activations, &target_outputs)?;
+                    let layer_learn_actions = all_layers_activations
+                        .iter()
+                        .map(|(layers_activations, target_outputs)| {
+                            let learn_actions = self
+                                .perform_gradient_decent_step(&layers_activations, &target_outputs);
+                            learn_actions
+                        })
+                        .collect::<Result<Vec<_>>>()?;
 
-                        sum_error += output_layer_error;
-                        layer_learn_actions.push(learn_actions);
-                    }
+                    let learn_actions = layer_learn_actions.iter().flatten();
+                    self.apply_pending_layer_actions(learn_actions, learn_rate)?;
+
+                    let batch_errors = LayerValues::new(batch_errors);
+                    network_errors.push(batch_errors.ave())
                 }
-                self.apply_pending_layer_actions(layer_learn_actions.iter().flatten(), learn_rate)?;
 
-                Some(sum_error / training_pairs_len as NodeValue)
+                let network_errors = LayerValues::new(network_errors);
+                Some(network_errors.ave())
             }
             NetworkLearnStrategy::Multi(strategies) => {
                 for strategy in strategies.into_iter() {
@@ -398,9 +421,11 @@ impl Network {
                     let (_, layer_output) = layers_activations
                         .last()
                         .context("should always have final layer")?;
-                    state
-                        .layer
-                        .calculate_error_d(&layer_output, &target_outputs, &state.activation_mode)?
+                    state.layer.calculate_error_d(
+                        &layer_output,
+                        &target_outputs,
+                        &state.activation_mode,
+                    )?
                 }
             };
 
@@ -636,20 +661,19 @@ impl Layer {
         mode: &NetworkActivationMode,
     ) -> Result<LayerValues> {
         match mode {
-            NetworkActivationMode::SoftMax => {
-                expected_outputs
-                    .iter()
-                    .zip(outputs.iter())
-                    .map(|(expected, actual)| match *expected {
-                        1.0 => Ok(-actual.ln()),
-                        0.0 => Ok(0.0),
-                        _ => Err(anyhow!("target outputs should be one-hot encoded"))
-                    })
-                    .collect()
-            },
-            _ => self.calculate_msd_error(outputs, expected_outputs)
+            NetworkActivationMode::SoftMax => expected_outputs
+                .iter()
+                .zip(outputs.iter())
+                .map(|(expected, actual)| match *expected {
+                    1.0 => Ok(-actual.ln()),
+                    0.0 => Ok(0.0),
+                    _ => Err(anyhow!(
+                        "target outputs should be one-hot encoded: {expected_outputs:?}"
+                    )),
+                })
+                .collect(),
+            _ => self.calculate_msd_error(outputs, expected_outputs),
         }
-        
     }
 
     pub fn calculate_msd_error(
@@ -683,7 +707,7 @@ impl Layer {
             //         })
             //         .collect()
             // },
-            _ => self.calculate_msd_error_d(outputs, expected_outputs)
+            _ => self.calculate_msd_error_d(outputs, expected_outputs),
         }
     }
 
@@ -870,17 +894,17 @@ impl LayerInitStrategy {
             ScaledFullRandom(rng) | NoBias(rng) => {
                 let scale_factor = (inputs_count as NodeValue).powf(-0.5) * 2.0;
                 for value in values {
-                    *value = Self::full_rand(rng) * scale_factor;
+                    *value = Self::full_rand(rng.as_ref()) * scale_factor;
                 }
             }
             FullRandom(rng) => {
                 for value in values {
-                    *value = Self::full_rand(rng);
+                    *value = Self::full_rand(rng.as_ref());
                 }
             }
         }
     }
-    fn full_rand(rng: &Rc<dyn RNG>) -> NodeValue {
+    fn full_rand(rng: &dyn RNG) -> NodeValue {
         rng.rand() * 2.0 - 1.0
     }
 }
