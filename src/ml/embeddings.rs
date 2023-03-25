@@ -197,7 +197,7 @@ impl Embedding {
         Ok(cost)
     }
 
-    pub fn predict_next(&self, last_words: &Vec<&str>) -> Result<String> {
+    pub fn predict_next(&self, last_words: &[&str]) -> Result<String> {
         let network_input = self.get_padded_network_input(last_words)?;
         let probabilities = self.compute_probabilities(network_input)?;
         let sampled_idx = self.rng.sample_uniform(&probabilities)?;
@@ -212,11 +212,11 @@ impl Embedding {
     }
 
     pub fn predict_from(&self, last_word: &str) -> Result<String> {
-        let last_words = iter::repeat(CONTROL_VOCAB)
+        let last_words: Vec<_> = iter::repeat(CONTROL_VOCAB)
             .take(self.input_stride_width - 1)
             .chain([last_word].into_iter())
             .collect();
-        let network_input = self.get_padded_network_input(&last_words)?;
+        let network_input = self.get_padded_network_input(&last_words[..])?;
         let probabilities = self.compute_probabilities(network_input)?;
         let sampled_idx = self.rng.sample_uniform(&probabilities)?;
 
@@ -230,7 +230,7 @@ impl Embedding {
     }
 
     pub fn nll(&self, last_words: &Vec<&str>, expected_next_word: &str) -> Result<NodeValue> {
-        let network_input = self.get_padded_network_input(&last_words)?;
+        let network_input = self.get_padded_network_input(&last_words[..])?;
 
         let expected_vocab_idx = *self
             .vocab
@@ -316,7 +316,12 @@ impl Embedding {
                 *seen_words.entry(last_word.clone()).or_insert(0) += 1;
 
                 curr_word = self
-                    .predict_next(&recent_generated_words.iter().map(|a| a.as_str()).collect())
+                    .predict_next(
+                        &recent_generated_words
+                            .iter()
+                            .map(|a| a.as_str())
+                            .collect::<Vec<_>>()[..],
+                    )
                     .ok()?;
                 while recent_generated_words.len() > self.input_stride_width {
                     recent_generated_words.pop_front();
@@ -327,7 +332,7 @@ impl Embedding {
         })
     }
 
-    fn get_padded_network_input(&self, last_words: &Vec<&str>) -> Result<LayerValues> {
+    fn get_padded_network_input(&self, last_words: &[&str]) -> Result<LayerValues> {
         let vocab_idxs = iter::repeat(&CONTROL_VOCAB)
             .take(self.input_stride_width.saturating_sub(last_words.len()))
             .chain(last_words.iter())
@@ -918,10 +923,15 @@ mod tests {
             for round in 0..config.training_rounds {
                 // let phrases = {
                 //     let batch_size = config.batch_size * config.batch_size;
-                //     let max_len = phrases.len() - batch_size.min(phrases.len());
+                //     let max_len = phrases.len() - batch_size;
                 //     let max_len = max_len.max(batch_size);
                 //     let n = rng.rand_range(0, max_len);
-                //     let mut phrases = phrases.iter().skip(n).take(batch_size).cloned().collect::<Vec<_>>();
+                //     let mut phrases = phrases
+                //         .iter()
+                //         .skip(n)
+                //         .take(batch_size)
+                //         .cloned()
+                //         .collect::<Vec<_>>();
                 //     rng.shuffle_vec(&mut phrases);
                 //     phrases
                 // };
@@ -1025,9 +1035,9 @@ mod tests {
                     let last_words = context_word_vectors
                         .into_iter()
                         .map(|x| x.as_str())
-                        .collect();
+                        .collect::<Vec<_>>();
 
-                    let predicted = embedding.predict_next(&last_words).unwrap();
+                    let predicted = embedding.predict_next(&last_words[..]).unwrap();
                     let actual = last_word_vector;
 
                     if &predicted == actual {

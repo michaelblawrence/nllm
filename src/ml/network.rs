@@ -183,6 +183,24 @@ impl Network {
         Ok(errors)
     }
 
+    fn compute_error_precomputed(
+        &self,
+        layers_activations: &Vec<(LayerValues, LayerValues)>,
+        target_outputs: &LayerValues,
+    ) -> Result<f64> {
+        let last = layers_activations.last();
+        let (_, layer_output) = last.expect("should have a final layer");
+
+        let output_layer_error = self
+            .layers
+            .last()
+            .context("should have final layer")?
+            .calculate_error(target_outputs, &layer_output, &self.final_layer_activation()?)?
+            .ave();
+
+        Ok(output_layer_error)
+    }
+
     pub fn learn(&mut self, strategy: NetworkLearnStrategy) -> Result<Option<NodeValue>> {
         let cost = match strategy {
             NetworkLearnStrategy::MutateRng { rand_amount, rng } => {
@@ -192,7 +210,7 @@ impl Network {
                     rng,
                 };
                 for layer in self.layers.iter_mut() {
-                    layer.learn(&strategy)?;
+                    layer.learn(&strategy, 1.0)?;
                 }
 
                 None
@@ -204,12 +222,13 @@ impl Network {
             } => {
                 let layers_activations = self.compute_all_layers_activations(inputs)?;
 
-                let output_layer_error = self.perform_gradient_decent_step(
-                    layers_activations,
-                    target_outputs,
-                    learn_rate,
-                    false,
-                )?;
+                let output_layer_error =
+                    self.compute_error_precomputed(&layers_activations, &target_outputs)?;
+
+                let learn_actions =
+                    self.perform_gradient_decent_step(&layers_activations, &target_outputs)?;
+
+                self.apply_pending_layer_actions(learn_actions.iter(), learn_rate)?;
 
                 Some(output_layer_error)
             }
@@ -238,25 +257,23 @@ impl Network {
                     }
                 };
 
+                let mut layer_learn_actions = vec![];
+
                 for training_pairs in batches.into_iter() {
                     for (inputs, target_outputs) in training_pairs {
                         let layers_activations = self.compute_all_layers_activations(inputs)?;
 
-                        let output_layer_error = self.perform_gradient_decent_step(
-                            layers_activations,
-                            target_outputs,
-                            learn_rate,
-                            true,
-                        )?;
+                        let output_layer_error =
+                            self.compute_error_precomputed(&layers_activations, &target_outputs)?;
+
+                        let learn_actions = self
+                            .perform_gradient_decent_step(&layers_activations, &target_outputs)?;
 
                         sum_error += output_layer_error;
+                        layer_learn_actions.push(learn_actions);
                     }
                 }
-                if training_pairs_len > 0 {
-                    for layer in self.layers.iter_mut() {
-                        layer.apply_batch_gradients(learn_rate)?;
-                    }
-                }
+                self.apply_pending_layer_actions(layer_learn_actions.iter().flatten(), learn_rate)?;
 
                 Some(sum_error / training_pairs_len as NodeValue)
             }
@@ -321,32 +338,46 @@ impl Network {
     }
 
     fn perform_gradient_decent_step(
-        &mut self,
-        layers_activations: Vec<(LayerValues, LayerValues)>,
-        target_outputs: LayerValues,
-        learn_rate: f64,
-        enqueue_batch: bool,
-    ) -> Result<f64> {
-        let mut layer_d = None;
-        let mut output_layer_error = 0.0;
+        &self,
+        layers_activations: &Vec<(LayerValues, LayerValues)>,
+        target_outputs: &LayerValues,
+    ) -> Result<Vec<(usize, LayerLearnStrategy)>> {
+        struct LayerIntermediate<'a> {
+            layer: &'a Layer,
+            layer_id: usize,
+            layer_input: &'a LayerValues,
+            layer_weighted_outputs: &'a LayerValues,
+            activation_mode: NetworkActivationMode,
+        }
         let layer_io_iter = layers_activations
-            .iter()
-            .rev()
-            .skip(1)
-            .map(|(_x, z)| z)
-            .zip(layers_activations.iter().rev().map(|(x, _z)| x));
-        let activations_iter = (0..self.layers.len())
-            .map(|i| self.layer_activation(i))
-            .collect::<Vec<_>>()
-            .into_iter();
+            .windows(2)
+            .map(|pair| (&pair[0].1, &pair[1].0));
 
-        for ((layer, layer_activation_mode), (layer_input, layer_weighted_outputs)) in self
+        let activations_iter = self
             .layers
-            .iter_mut()
-            .zip(activations_iter)
-            .rev()
-            .zip(layer_io_iter)
-        {
+            .iter()
+            .enumerate()
+            .map(|(i, layer)| (layer, i, self.layer_activation(i)));
+
+        let mut layer_learn_actions = vec![];
+        let mut layer_d = None;
+
+        let layer_states =
+            activations_iter
+                .zip(layer_io_iter)
+                .map(|((layer, idx, mode), (l_input, l_output))| {
+                    Ok(LayerIntermediate {
+                        layer,
+                        layer_id: idx,
+                        layer_input: l_input,
+                        layer_weighted_outputs: l_output,
+                        activation_mode: mode?,
+                    })
+                });
+
+        let layer_states = layer_states.collect::<Result<Vec<_>>>()?;
+
+        for state in layer_states.iter().rev() {
             // key
             //  c <-> cost
             //  a <-> layer activation
@@ -358,41 +389,37 @@ impl Network {
             //    dc/da = error_d
             //    dz/dw = layer.learn (network layer inputs)
 
+            let layer_input = state.layer_input;
+            let layer_weighted_outputs = state.layer_weighted_outputs;
+
             let error_d = match layer_d.take() {
                 Some(prev_layer_error_d) => LayerValues(prev_layer_error_d),
                 None => {
-                    let last = layers_activations.last();
-                    let (_, layer_output) = last.expect("should have a final layer");
-                    let mode = layer_activation_mode.as_ref().unwrap();
-                    output_layer_error =
-                        layer.calculate_error(&layer_output, &target_outputs, &mode)?.ave();
-
-                    layer.calculate_error_d(&layer_output, &target_outputs, &mode)?
+                    let (_, layer_output) = layers_activations
+                        .last()
+                        .context("should always have final layer")?;
+                    state
+                        .layer
+                        .calculate_error_d(&layer_output, &target_outputs, &state.activation_mode)?
                 }
             };
 
-            let activation_d = layer_activation_mode?.derivative(&layer_weighted_outputs);
+            let activation_d = state.activation_mode.derivative(&layer_weighted_outputs);
             let activated_layer_d = activation_d.multiply_iter(&error_d);
             let activated_layer_d = activated_layer_d.collect();
-            let input_gradients = layer.compute_d(&activated_layer_d)?;
+            let input_gradients = state.layer.compute_d(&activated_layer_d)?;
             let input_gradients = input_gradients.collect::<Vec<NodeValue>>();
             layer_d = Some(input_gradients);
 
-            let strategy = match enqueue_batch {
-                true => LayerLearnStrategy::EnqueueBatchGradientDecent {
-                    gradients: &activated_layer_d,
-                    layer_inputs: &layer_input,
-                },
-                false => LayerLearnStrategy::GradientDecent {
-                    gradients: &activated_layer_d,
-                    layer_inputs: &layer_input,
-                    learn_rate,
-                },
+            let strategy = LayerLearnStrategy::GradientDecent {
+                gradients: activated_layer_d,
+                layer_inputs: layer_input.clone(),
             };
 
-            layer.learn(&strategy)?;
+            layer_learn_actions.push((state.layer_id, strategy));
         }
-        Ok(output_layer_error)
+
+        Ok(layer_learn_actions)
     }
 
     pub fn node_weights(
@@ -409,6 +436,23 @@ impl Network {
 
     pub fn layer_count(&self) -> usize {
         self.layers.len()
+    }
+
+    fn apply_pending_layer_actions<'a, I: Iterator<Item = &'a (usize, LayerLearnStrategy)>>(
+        &mut self,
+        learn_actions: I,
+        learn_rate: f64,
+    ) -> Result<()> {
+        for (layer_idx, learn_strategy) in learn_actions.into_iter() {
+            let layer = self
+                .layers
+                .get_mut(*layer_idx)
+                .context("this layer index should be present")?;
+
+            layer.learn(&learn_strategy, learn_rate)?;
+        }
+
+        Ok(())
     }
 
     fn input_vector_size(&self) -> Result<usize> {
@@ -438,7 +482,6 @@ impl Network {
 pub struct Layer {
     weights: Vec<NodeValue>,
     bias: Option<Vec<NodeValue>>,
-    pending_gradients: Option<PendingLayerGradients>,
     inputs_count: usize,
     size: usize,
     stride_count: Option<usize>,
@@ -453,7 +496,6 @@ impl Layer {
                 LayerInitStrategy::NoBias(_) => None,
                 _ => Some(vec![0.0; size]),
             },
-            pending_gradients: None,
             inputs_count,
             size,
             stride_count: None,
@@ -486,11 +528,13 @@ impl Layer {
         };
 
         let size = self.size();
+
         for (input_index, input) in inputs.iter().enumerate() {
             let weights = self.node_weights(input_index % self.inputs_count)?;
             let stride_idx = input_index / self.inputs_count;
-            for (output_idx, weight) in weights.enumerate() {
-                outputs[output_idx + (stride_idx * size)] += input * weight;
+            for (weight_idx, weight) in weights.enumerate() {
+                let output_idx = weight_idx + (stride_idx * size);
+                outputs[output_idx] += input * weight;
             }
         }
 
@@ -512,7 +556,7 @@ impl Layer {
         Ok(iter)
     }
 
-    pub fn learn(&mut self, strategy: &LayerLearnStrategy) -> Result<()> {
+    pub fn learn(&mut self, strategy: &LayerLearnStrategy, learn_rate: NodeValue) -> Result<()> {
         match strategy {
             LayerLearnStrategy::MutateRng {
                 weight_factor,
@@ -531,7 +575,6 @@ impl Layer {
             LayerLearnStrategy::GradientDecent {
                 gradients,
                 layer_inputs,
-                learn_rate,
             } => {
                 let weights_gradients = self.weights_gradients_iter(&gradients, &layer_inputs)?;
 
@@ -542,54 +585,7 @@ impl Layer {
                     *x = *x - (grad * learn_rate)
                 }
             }
-            LayerLearnStrategy::EnqueueBatchGradientDecent {
-                gradients,
-                layer_inputs,
-            } => {
-                let weights_gradients = self.weights_gradients_iter(&gradients, &layer_inputs)?;
-
-                let pending_gradients = self
-                    .pending_gradients
-                    .get_or_insert(PendingLayerGradients::new(&self));
-
-                for (grad, pending_grad) in weights_gradients
-                    .iter()
-                    .zip(pending_gradients.weights.iter_mut())
-                {
-                    *pending_grad += grad;
-                }
-                for (grad, pending_grad) in gradients.iter().zip(pending_gradients.bias.iter_mut())
-                {
-                    *pending_grad += grad;
-                }
-            }
         }
-        Ok(())
-    }
-
-    pub fn apply_batch_gradients(&mut self, learn_rate: f64) -> Result<()> {
-        let pending_gradients = self
-            .pending_gradients
-            .take()
-            .context("no pending gradients to apply")?;
-
-        for (x, grad) in self
-            .weights
-            .iter_mut()
-            .zip(pending_gradients.weights.iter())
-        {
-            *x = *x - (grad * learn_rate)
-        }
-
-        for (x, grad) in self
-            .bias
-            .iter_mut()
-            .flatten()
-            .zip(pending_gradients.bias.iter())
-        {
-            *x = *x - (grad * learn_rate)
-        }
-
         Ok(())
     }
 
@@ -889,20 +885,15 @@ impl LayerInitStrategy {
     }
 }
 
-pub enum LayerLearnStrategy<'a> {
+pub enum LayerLearnStrategy {
     MutateRng {
         weight_factor: NodeValue,
         bias_factor: NodeValue,
         rng: Rc<dyn RNG>,
     },
     GradientDecent {
-        gradients: &'a LayerValues,
-        layer_inputs: &'a LayerValues,
-        learn_rate: NodeValue,
-    },
-    EnqueueBatchGradientDecent {
-        gradients: &'a LayerValues,
-        layer_inputs: &'a LayerValues,
+        gradients: LayerValues,
+        layer_inputs: LayerValues,
     },
 }
 
