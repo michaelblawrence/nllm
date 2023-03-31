@@ -1,18 +1,18 @@
 use std::{
     collections::{HashMap, HashSet},
     io::stdin,
+    ops::ControlFlow,
     rc::Rc,
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        Arc,
-    },
+    sync::{mpsc, Arc},
     thread,
 };
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser};
 use config::TrainEmbeddingConfig;
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use itertools::Itertools;
+use messages::{TrainerHandleActions, TrainerMessage};
 use plane::ml::{embeddings::Embedding, JsRng, NetworkActivationMode, NodeValue, RNG};
 use serde::{Deserialize, Serialize};
 use tracing::{info, metadata::LevelFilter};
@@ -121,23 +121,124 @@ mod config {
 
 fn main() -> Result<()> {
     configure_logging();
-
-    let cli = config::Cli::parse();
-    let (config, resumed_state) = match cli.command() {
-        config::Command::TrainEmbedding(config) => (config, None),
-        config::Command::LoadEmbedding(config) => {
-            let rng = Rc::new(JsRng::default());
-            let (snapshot, mut config, state) =
-                training::read_model_from_disk(&config.file_path, rng)?;
-
-            config.pause_on_start = true;
-            (config, Some((snapshot, state)))
-        }
-    };
+    let (config, resumed_state) = parse_cli_args()?;
 
     let config_clone = config.clone();
+    let (tx, handle) = messages::TrainerHandle::new(move |embedding, msg| {
+        handle_trainer_message(msg, embedding, &config_clone)
+    });
 
-    let (tx, handle) = TrainerHandle::new(move |embedding, msg| match msg {
+    let config_clone = config.clone();
+    let thread = thread::spawn(move || {
+        let embedding = training::setup_and_train_embeddings_v2(config_clone, handle);
+
+        training::write_results_to_disk(&embedding, "bin-convo-midlen");
+    });
+
+    if let Some((snapshot, state)) = resumed_state {
+        tx.send(TrainerMessage::ReplaceEmbeddingState(snapshot, state));
+    }
+
+    let config_clone = config.clone();
+    let ui_thread = thread::spawn(move || {
+        use KeyCode::Char;
+
+        loop {
+            let event = event::read().unwrap();
+            match event {
+                Event::Key(KeyEvent { code: Char(c), .. }) => {
+                    match parse_repl_char(c, &tx, &config_clone) {
+                        Ok(_) => (),
+                        Err(_) => return,
+                    }
+                }
+                _ => (),
+            }
+        }
+    });
+
+    thread.join().unwrap();
+    ui_thread.join().unwrap();
+
+    Ok(())
+}
+
+fn parse_repl_char(
+    c: char,
+    tx: &mpsc::Sender<TrainerMessage>,
+    config: &TrainEmbeddingConfig,
+) -> Result<(), ()> {
+    match c {
+        'r' => {
+            tx.send(TrainerMessage::PrintStatus);
+        }
+        'a' => {
+            tx.send(TrainerMessage::TogglePrintAllStatus);
+        }
+        'x' => {
+            tx.send(TrainerMessage::ReloadFromSnapshot);
+        }
+        'z' => {
+            tx.send(TrainerMessage::ForceSnapshot);
+        }
+        'n' => {
+            tx.send(TrainerMessage::PredictRandomPhrase);
+        }
+        'w' => {
+            tx.send(TrainerMessage::WriteStatsToDisk);
+        }
+        'W' => {
+            tx.send(TrainerMessage::WriteEmbeddingTsvToDisk);
+        }
+        's' => {
+            tx.send(TrainerMessage::WriteModelToDisk);
+        }
+        ',' => {
+            tx.send(TrainerMessage::MultiplyLearnRateBy(0.5));
+        }
+        '.' => {
+            tx.send(TrainerMessage::MultiplyLearnRateBy(2.0));
+        }
+        'e' => {
+            tx.send(TrainerMessage::IncreaseMaxRounds(config.training_rounds));
+        }
+        'p' => {
+            tx.send(TrainerMessage::TogglePause);
+        }
+        'q' => {
+            tx.send(TrainerMessage::Halt);
+            return Err(());
+        }
+        'h' => {
+            println!(
+                r"Trainer help: 
+                        'r' => report status
+                        'n' => print new random phrase
+                        'x' => reload from auto-save snapshot
+                        'z' => force snapshot
+                        'w' => write stats to disk
+                        'W' => write embedding tsv to disk
+                        's' => save model to disk
+                        ',' => divide learn rate by 2
+                        '.' => multiply learn rate by 2
+                        'e' => extend training rounds
+                        'h' => display help
+                        'p' => toggle pause
+                        'q' => quit
+                        "
+            )
+        }
+        _ => (),
+    }
+    Ok(())
+}
+
+fn handle_trainer_message(
+    msg: TrainerMessage,
+    embedding: &Embedding,
+    config: &TrainEmbeddingConfig,
+) -> TrainerHandleActions {
+    match msg {
         TrainerMessage::PrintStatus => TrainerHandleActions::PrintStatus,
         TrainerMessage::Halt => TrainerHandleActions::Halt,
         TrainerMessage::TogglePause => TrainerHandleActions::TogglePause,
@@ -152,8 +253,8 @@ fn main() -> Result<()> {
             training::write_embedding_tsv_to_disk(
                 &embedding,
                 "embed",
-                &config_clone.output_dir,
-                &config_clone.output_label,
+                &config.output_dir,
+                &config.output_label,
             );
             TrainerHandleActions::Nothing
         }
@@ -165,11 +266,11 @@ fn main() -> Result<()> {
         TrainerMessage::WriteModelAndMetadataToDisk(metadata) => {
             training::write_model_to_disk(
                 &embedding,
-                &config_clone,
+                &config,
                 &metadata,
                 "embed",
-                &config_clone.output_dir,
-                &config_clone.output_label,
+                &config.output_dir,
+                &config.output_label,
             );
             TrainerHandleActions::Nothing
         }
@@ -185,179 +286,110 @@ fn main() -> Result<()> {
         TrainerMessage::ReplaceEmbeddingState(embedding, state) => {
             TrainerHandleActions::ReplaceEmbeddingState(embedding, state)
         }
-    });
-
-    let training_rounds = config.training_rounds;
-
-    let thread = thread::spawn(move || {
-        let embedding = training::setup_and_train_embeddings_v2(config, handle);
-
-        training::write_results_to_disk(&embedding, "bin-convo-midlen");
-    });
-
-    if let Some((snapshot, state)) = resumed_state {
-        tx.send(TrainerMessage::ReplaceEmbeddingState(snapshot, state));
     }
+}
 
-    let ui_thread = thread::spawn(move || {
-        let tx = tx;
-        loop {
-            use crossterm::event::{self, Event, KeyCode, KeyEvent};
-            if let Event::Key(KeyEvent {
-                code: KeyCode::Char(c),
-                ..
-            }) = event::read().unwrap()
-            {
-                match c {
-                    'r' => {
-                        tx.send(TrainerMessage::PrintStatus);
-                    }
-                    'a' => {
-                        tx.send(TrainerMessage::TogglePrintAllStatus);
-                    }
-                    'x' => {
-                        tx.send(TrainerMessage::ReloadFromSnapshot);
-                    }
-                    'z' => {
-                        tx.send(TrainerMessage::ForceSnapshot);
-                    }
-                    'n' => {
-                        tx.send(TrainerMessage::PredictRandomPhrase);
-                    }
-                    'w' => {
-                        tx.send(TrainerMessage::WriteStatsToDisk);
-                    }
-                    'W' => {
-                        tx.send(TrainerMessage::WriteEmbeddingTsvToDisk);
-                    }
-                    's' => {
-                        tx.send(TrainerMessage::WriteModelToDisk);
-                    }
-                    ',' => {
-                        tx.send(TrainerMessage::MultiplyLearnRateBy(0.5));
-                    }
-                    '.' => {
-                        tx.send(TrainerMessage::MultiplyLearnRateBy(2.0));
-                    }
-                    'e' => {
-                        tx.send(TrainerMessage::IncreaseMaxRounds(training_rounds));
-                    }
-                    'p' => {
-                        tx.send(TrainerMessage::TogglePause);
-                    }
-                    'q' => {
-                        tx.send(TrainerMessage::Halt);
-                        return;
-                    }
-                    'h' => {
-                        println!(
-                            r"Trainer help: 
-                        'r' => report status
-                        'n' => print new random phrase
-                        'x' => reload from auto-save snapshot
-                        'z' => force snapshot
-                        'w' => write stats to disk
-                        'W' => write embedding tsv to disk
-                        's' => save model to disk
-                        ',' => divide learn rate by 2
-                        '.' => multiply learn rate by 2
-                        'e' => extend training rounds
-                        'h' => display help
-                        'p' => toggle pause
-                        'q' => quit
-                        "
-                        )
-                    }
-                    _ => (),
-                }
-            }
+fn parse_cli_args() -> Result<(
+    TrainEmbeddingConfig,
+    Option<(String, messages::TrainerStateMetadata)>,
+)> {
+    let cli = config::Cli::parse();
+    let (config, resumed_state) = match cli.command() {
+        config::Command::TrainEmbedding(config) => (config, None),
+        config::Command::LoadEmbedding(config) => {
+            let rng = Rc::new(JsRng::default());
+            let (snapshot, mut config, state) =
+                training::read_model_from_disk(&config.file_path, rng)?;
+
+            config.pause_on_start = true;
+            (config, Some((snapshot, state)))
         }
-    });
-
-    thread.join().unwrap();
-    ui_thread.join().unwrap();
-
-    Ok(())
+    };
+    Ok((config, resumed_state))
 }
 
 fn configure_logging() {
-    // Start configuring a `fmt` subscriber
     let subscriber = tracing_subscriber::fmt()
-        // Use a more compact, abbreviated log format
         .compact()
-        // Display source code file paths
-        // .with_file(true)
-        // Display source code line numbers
-        // .with_line_number(true)
-        // Display the thread ID an event was recorded on
-        // .with_thread_ids(true)
-        // Don't display the event's target (module path)
         .with_target(false)
         .with_max_level(LevelFilter::INFO)
-        // Build the subscriber
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).unwrap();
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TrainerStateMetadata {
-    learn_rate: f64,
-    training_rounds: usize,
-    current_round: usize,
-    training_report: Option<training::TrainerReport>,
-}
+mod messages {
+    use anyhow::Result;
+    use serde::{Deserialize, Serialize};
 
-pub enum TrainerMessage {
-    PrintStatus,
-    TogglePrintAllStatus,
-    ReloadFromSnapshot,
-    ForceSnapshot,
-    WriteStatsToDisk,
-    WriteEmbeddingTsvToDisk,
-    WriteModelToDisk,
-    WriteModelAndMetadataToDisk(TrainerStateMetadata),
-    MultiplyLearnRateBy(NodeValue),
-    IncreaseMaxRounds(usize),
-    PredictRandomPhrase,
-    TogglePause,
-    Halt,
-    ReplaceEmbeddingState(String, TrainerStateMetadata),
-}
+    use std::sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    };
 
-pub enum TrainerHandleActions {
-    Nothing,
-    LearnRateMulMut(NodeValue),
-    IncreaseMaxRounds(usize),
-    DispatchWithMetadata(Arc<dyn Fn(TrainerStateMetadata) -> TrainerMessage>),
-    TogglePause,
-    TogglePrintAllStatus,
-    ReloadFromSnapshot,
-    ForceSnapshot,
-    PrintStatus,
-    Halt,
-    ReplaceEmbeddingState(String, TrainerStateMetadata),
-}
+    use plane::ml::{embeddings::Embedding, NodeValue};
 
-pub struct TrainerHandle<Message: Send, F> {
-    tx: Sender<Message>,
-    rx: Receiver<Message>,
-    handler: F,
-}
+    use crate::training::{self, TrainerReport};
 
-impl<Message, F> TrainerHandle<Message, F>
-where
-    Message: Send,
-    F: Fn(&Embedding, Message) -> TrainerHandleActions,
-{
-    fn new(handler: F) -> (Sender<Message>, Self) {
-        let (tx, rx) = mpsc::channel();
-
-        (tx.clone(), Self { tx, rx, handler })
+    pub enum TrainerMessage {
+        PrintStatus,
+        TogglePrintAllStatus,
+        ReloadFromSnapshot,
+        ForceSnapshot,
+        WriteStatsToDisk,
+        WriteEmbeddingTsvToDisk,
+        WriteModelToDisk,
+        WriteModelAndMetadataToDisk(TrainerStateMetadata),
+        MultiplyLearnRateBy(NodeValue),
+        IncreaseMaxRounds(usize),
+        PredictRandomPhrase,
+        TogglePause,
+        Halt,
+        ReplaceEmbeddingState(String, TrainerStateMetadata),
     }
 
-    pub fn send(&self, t: Message) -> Result<(), mpsc::SendError<Message>> {
-        self.tx.send(t)
+    pub enum TrainerHandleActions {
+        Nothing,
+        LearnRateMulMut(NodeValue),
+        IncreaseMaxRounds(usize),
+        DispatchWithMetadata(Arc<dyn Fn(TrainerStateMetadata) -> TrainerMessage>),
+        TogglePause,
+        TogglePrintAllStatus,
+        ReloadFromSnapshot,
+        ForceSnapshot,
+        PrintStatus,
+        Halt,
+        ReplaceEmbeddingState(String, TrainerStateMetadata),
+    }
+
+    pub struct TrainerHandle<Message: Send, F> {
+        pub tx: Sender<Message>,
+        pub rx: Receiver<Message>,
+        pub handler: F,
+    }
+
+    impl<Message, F> TrainerHandle<Message, F>
+    where
+        Message: Send,
+        F: Fn(&Embedding, Message) -> TrainerHandleActions,
+    {
+        pub fn new(handler: F) -> (Sender<Message>, Self) {
+            let (tx, rx) = mpsc::channel();
+
+            (tx.clone(), Self { tx, rx, handler })
+        }
+
+        pub fn send(&self, t: Message) -> Result<(), mpsc::SendError<Message>> {
+            self.tx.send(t)
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct TrainerStateMetadata {
+        pub learn_rate: f64,
+        pub training_rounds: usize,
+        pub current_round: usize,
+        pub training_report: Option<TrainerReport>,
     }
 }
 
@@ -376,7 +408,10 @@ mod training {
     use serde_json::Value;
     use tracing::{debug, error, info};
 
-    use crate::config::TrainEmbeddingConfig;
+    use crate::{
+        config::TrainEmbeddingConfig,
+        messages::{TrainerHandleActions, TrainerStateMetadata},
+    };
 
     use super::*;
 
@@ -384,7 +419,7 @@ mod training {
         F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions,
     >(
         config: TrainEmbeddingConfig,
-        handle: TrainerHandle<TrainerMessage, F>,
+        handle: messages::TrainerHandle<TrainerMessage, F>,
     ) -> Embedding {
         let rng: Rc<dyn RNG> = Rc::new(JsRng::default());
 
@@ -945,9 +980,12 @@ mod training {
     }
 
     mod output {
-        use std::{fs::DirBuilder, path::{PathBuf, Path}};
+        use std::{
+            fs::DirBuilder,
+            path::{Path, PathBuf},
+        };
 
-        use crate::TrainerStateMetadata;
+        use crate::messages::TrainerStateMetadata;
 
         pub fn create_output_fpath(
             fname_prefix_ext: (&str, &str),
