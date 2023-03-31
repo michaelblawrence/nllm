@@ -47,7 +47,7 @@ pub(crate) fn train_embedding(
     let phrases = processed_phrases.as_ref().unwrap_or(phrases);
 
     let loss = embedding
-        .train_v2(&phrases, train_rate, batch_size)
+        .train(&phrases, train_rate, batch_size)
         .unwrap();
 
     web_sys::console::time_end_with_label(train_timer_label);

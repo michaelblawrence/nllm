@@ -70,7 +70,7 @@ impl Embedding {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    pub fn train_v2(
+    pub fn train(
         &mut self,
         phrases: &Vec<Vec<String>>,
         learn_rate: NodeValue,
@@ -137,66 +137,6 @@ impl Embedding {
         }
 
         let cost = costs.iter().flatten().sum::<NodeValue>() / costs.len() as NodeValue;
-
-        Ok(cost)
-    }
-
-    pub fn train(
-        &mut self,
-        phrases: &Vec<Vec<String>>,
-        learn_rate: NodeValue,
-        word_locality_factor: usize,
-    ) -> Result<NodeValue> {
-        let indexed_phrases = phrases.iter().map(|phrase| {
-            phrase
-                .iter()
-                .map(|word| self.vocab.get(&word.to_string()))
-                .take_while(|word| word.is_some())
-                .flatten()
-        });
-
-        let vectored_phrases = indexed_phrases
-            .map(|phrase| {
-                phrase
-                    .map(|&vocab_idx| self.one_hot(vocab_idx).collect::<Vec<_>>())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        let mut counter = 0;
-        let mut cost_sum = 0.0;
-
-        for phrase in vectored_phrases {
-            let random_word_vectors = phrase.windows(word_locality_factor).map(|word_vectors| {
-                let index_0 = self.rng.rand_range(0, word_vectors.len());
-                let index_1 = self.rng.rand_range(0, word_vectors.len() - 1);
-
-                if index_1 >= index_0 {
-                    (&word_vectors[index_0], &word_vectors[index_1 + 1])
-                } else {
-                    (&word_vectors[index_1], &word_vectors[index_0])
-                }
-            });
-
-            let training_pairs = random_word_vectors
-                .map(|(x, y)| (LayerValues::new(x.clone()), LayerValues::new(y.clone())))
-                .collect();
-
-            let cost = self
-                .network
-                .learn(NetworkLearnStrategy::BatchGradientDecent {
-                    training_pairs,
-                    batch_size: 100,
-                    learn_rate,
-                    batch_sampling: BatchSamplingStrategy::Sequential,
-                })?;
-
-            let cost = cost.unwrap_or_default();
-            cost_sum += cost;
-            counter += 1;
-        }
-        let cost = cost_sum / counter as NodeValue;
-        debug!(" -- net train iter cost {cost}");
 
         Ok(cost)
     }
@@ -622,81 +562,9 @@ mod tests {
     use test_log::test;
     use tracing::info;
 
-    use self::training::{TestEmbeddingConfig, TestEmbeddingConfigV2};
+    use self::training::TestEmbeddingConfig;
 
     use super::*;
-
-    #[test]
-    #[ignore = "takes too long"]
-    fn embeddings_work_medium_len_phrases_prediction_v2() {
-        let phrases = training::parse_phrases();
-        let rng: &dyn RNG = &JsRng::default();
-
-        let mut phrases: Vec<Vec<String>> = phrases
-            .into_iter()
-            .filter(|phrase| phrase.len() > 12 && phrase.len() < 20)
-            .collect();
-
-        let vocab_counts = phrases
-            .iter()
-            .flat_map(|phrase| phrase.iter())
-            .cloned()
-            .fold(HashMap::new(), |mut counts, word| {
-                counts.entry(word).and_modify(|x| *x += 1).or_insert(1_i32);
-                counts
-            });
-
-        phrases.sort_by_key(|phrase| {
-            phrase
-                .iter()
-                .map(|word| vocab_counts[word].pow(2))
-                .sum::<i32>()
-        });
-        use itertools::Itertools;
-
-        phrases.truncate(125);
-        info!(
-            "First 3 phrases: {:#?}",
-            phrases[0..3]
-                .iter()
-                .map(|phrase| (
-                    phrase.join(" "),
-                    phrase
-                        .iter()
-                        .map(|word| vocab_counts[word].pow(2))
-                        .join("|")
-                ))
-                .collect::<Vec<_>>()
-        );
-
-        let vocab: HashSet<String> = phrases
-            .iter()
-            .flat_map(|phrase| phrase.iter())
-            .cloned()
-            .collect();
-
-        dbg!((phrases.len(), vocab.len()));
-
-        crate::ml::ShuffleRng::shuffle_vec(&rng, &mut phrases);
-
-        // let testing_phrases = phrases.split_off(phrases.len() / 10);
-        let testing_phrases = phrases.clone();
-
-        let embedding = training::setup_and_train_embeddings_v2(
-            (vocab.clone(), phrases, testing_phrases),
-            TestEmbeddingConfigV2 {
-                embedding_size: 2,
-                hidden_layer_nodes: 35,
-                input_stride_width: 3,
-                batch_size: 8,
-                training_rounds: 25_000,
-                train_rate: 1e-2,
-                activation_mode: NetworkActivationMode::Sigmoid,
-            },
-        );
-
-        training::write_results_to_disk(&embedding, &vocab, "convo-midlen");
-    }
 
     #[test]
     #[ignore = "takes too long"]
@@ -728,9 +596,9 @@ mod tests {
 
         let testing_phrases = phrases.clone();
 
-        let embedding = training::setup_and_train_embeddings_v2(
+        let embedding = training::setup_and_train_embeddings(
             (vocab.clone(), phrases, testing_phrases),
-            TestEmbeddingConfigV2 {
+            TestEmbeddingConfig {
                 embedding_size: 2,
                 hidden_layer_nodes: 30,
                 input_stride_width: 3,
@@ -740,8 +608,6 @@ mod tests {
                 activation_mode: NetworkActivationMode::Tanh,
             },
         );
-
-        training::write_results_to_disk(&embedding, &vocab, "counter-lang");
 
         assert_eq!("one", embedding.predict_from("zero").unwrap().as_str());
         assert_eq!(
@@ -782,9 +648,9 @@ mod tests {
 
         let testing_phrases = phrases.clone();
 
-        let embedding = training::setup_and_train_embeddings_v2(
+        let embedding = training::setup_and_train_embeddings(
             (vocab, phrases, testing_phrases),
-            TestEmbeddingConfigV2 {
+            TestEmbeddingConfig {
                 embedding_size: 6,
                 hidden_layer_nodes: 100,
                 input_stride_width: 3,
@@ -798,55 +664,6 @@ mod tests {
 
         assert_eq!("violin", embedding.predict_from("piano").unwrap().as_str());
         assert_eq!("pasta", embedding.predict_from("pizza").unwrap().as_str());
-        // assert_eq!("violin", embedding.predict_next(&vec!["piano"]).unwrap().as_str());
-        // assert_eq!("pasta", embedding.predict_next(&vec!["pizza"]).unwrap().as_str());
-    }
-
-    #[test]
-    #[ignore = "takes too long"]
-    fn embeddings_work_real_prediction_v2() {
-        let phrases = training::parse_phrases();
-
-        let phrases: Vec<Vec<String>> = phrases
-            .into_iter()
-            .filter(|phrase| phrase.len() > 6)
-            .take(1000)
-            .collect();
-
-        let vocab: HashSet<String> = phrases
-            .iter()
-            .flat_map(|phrase| phrase.iter())
-            .cloned()
-            .collect();
-
-        dbg!((phrases.len(), vocab.len()));
-
-        let testing_phrases = phrases.clone();
-
-        let embedding = training::setup_and_train_embeddings_v2(
-            (vocab.clone(), phrases, testing_phrases),
-            TestEmbeddingConfigV2 {
-                embedding_size: 5,
-                hidden_layer_nodes: 125,
-                input_stride_width: 3,
-                batch_size: 16,
-                training_rounds: 1000,
-                train_rate: 1e-4,
-                activation_mode: NetworkActivationMode::Tanh,
-                // activation_mode: NetworkActivationMode::Sigmoid,
-            },
-        );
-
-        training::write_results_to_disk(&embedding, &vocab, "convo-big");
-
-        let seed_word = "first";
-        info!(
-            "Lets see what we can generate starting with the word '{seed_word}'\n\t{}",
-            embedding
-                .predict_iter(seed_word)
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
     }
 
     #[test]
@@ -854,15 +671,13 @@ mod tests {
     fn embeddings_work_simple_prediction() {
         let phrases = [
             "bottle wine bottle wine bottle wine bottle wine",
-            // "piano violin piano violin piano violin piano violin",
-            // "piano violin piano violin piano violin piano violin",
             "piano violin piano violin piano violin piano violin",
             "pizza pasta pizza pasta pizza pasta pizza pasta",
             "coffee soda coffee soda coffee soda coffee soda",
             "tin can tin can tin can tin can",
         ];
 
-        let phrases: Vec<Vec<String>> = phrases
+        let mut phrases: Vec<Vec<String>> = phrases
             .into_iter()
             .cycle()
             .take(50)
@@ -880,16 +695,18 @@ mod tests {
             .cloned()
             .collect();
 
+        let testing_phrases = training::split_training_and_testing(&mut phrases, 500, 10.0);
+
         let embedding = training::setup_and_train_embeddings(
-            (vocab, phrases),
+            (vocab, phrases, testing_phrases),
             TestEmbeddingConfig {
                 embedding_size: 5,
                 hidden_layer_nodes: 4,
                 training_rounds: 2500,
-                max_phrases_count: 500,
-                word_locality_factor: 2,
+                input_stride_width: 2,
                 train_rate: 1e-1,
-                test_phrases_pct: 10.0,
+                batch_size: 1,
+                activation_mode: NetworkActivationMode::Tanh,
             },
         );
 
@@ -931,13 +748,13 @@ mod tests {
             embedding_size: 8,
             hidden_layer_nodes: 10,
             training_rounds: 0,
-            max_phrases_count: 500,
-            word_locality_factor: 2,
+            input_stride_width: 2,
             train_rate: 1e-3,
-            test_phrases_pct: 0.0,
+            batch_size: 1,
+            activation_mode: NetworkActivationMode::Sigmoid,
         };
         let mut embedding = training::setup_and_train_embeddings(
-            (vocab, phrases.clone()),
+            (vocab, phrases.clone(), phrases.clone()),
             test_embedding_config.clone(),
         );
 
@@ -948,7 +765,7 @@ mod tests {
             .train(
                 &phrases,
                 test_embedding_config.train_rate,
-                test_embedding_config.word_locality_factor,
+                test_embedding_config.batch_size,
             )
             .unwrap();
 
@@ -967,91 +784,15 @@ mod tests {
         assert_ne!(init_nearest.unwrap(), current_nearest.unwrap());
     }
 
-    #[test]
-    #[ignore = "takes too long"]
-    fn embeddings_work1() {
-        let (vocab, phrases) = training::parse_vocab_and_phrases();
-        training::setup_and_train_embeddings(
-            (vocab, phrases),
-            TestEmbeddingConfig {
-                embedding_size: 80,
-                hidden_layer_nodes: 100,
-                training_rounds: 50,
-                max_phrases_count: 250,
-                word_locality_factor: 2,
-                train_rate: 1e-2,
-                test_phrases_pct: 10.0,
-            },
-        );
-        todo!("finish test case")
-    }
-
     mod training {
         use std::time::{Duration, Instant};
 
-        use serde_json::Value;
-
-        use crate::ml::{JsRng, ShuffleRng};
+        use crate::ml::JsRng;
 
         use super::*;
 
         #[derive(Clone)]
         pub struct TestEmbeddingConfig {
-            pub embedding_size: usize,
-            pub hidden_layer_nodes: usize,
-            pub training_rounds: usize,
-            pub max_phrases_count: usize,
-            pub word_locality_factor: usize,
-            pub train_rate: NodeValue,
-            pub test_phrases_pct: NodeValue,
-        }
-
-        pub fn setup_and_train_embeddings(
-            (vocab, mut phrases): (HashSet<String>, Vec<Vec<String>>),
-            config: TestEmbeddingConfig,
-        ) -> Embedding {
-            let rng: Rc<dyn RNG> = Rc::new(JsRng::default());
-            let mut embedding = Embedding::new(
-                vocab,
-                config.embedding_size,
-                1,
-                vec![config.hidden_layer_nodes],
-                rng.clone(),
-            );
-            rng.shuffle_vec(&mut phrases);
-
-            let testing_phrases = split_training_and_testing(
-                &mut phrases,
-                config.max_phrases_count,
-                config.test_phrases_pct,
-            );
-
-            let mut seen_pairs = HashSet::new();
-
-            for round in 0..config.training_rounds {
-                let training_error = embedding
-                    .train(&phrases, config.train_rate, config.word_locality_factor)
-                    .unwrap();
-
-                let (validation_errors, predictions_pct) =
-                    validate_embeddings(&embedding, &testing_phrases, &mut seen_pairs, round);
-
-                if should_report_round(round, config.training_rounds) {
-                    report_training_round(
-                        round,
-                        training_error,
-                        validation_errors,
-                        predictions_pct,
-                        None,
-                    );
-                }
-            }
-
-            embedding
-        }
-
-        #[derive(Clone)]
-        pub struct TestEmbeddingConfigV2 {
             pub embedding_size: usize,
             pub hidden_layer_nodes: usize,
             pub training_rounds: usize,
@@ -1061,13 +802,13 @@ mod tests {
             pub activation_mode: NetworkActivationMode,
         }
 
-        pub fn setup_and_train_embeddings_v2(
+        pub fn setup_and_train_embeddings(
             (vocab, phrases, testing_phrases): (
                 HashSet<String>,
                 Vec<Vec<String>>,
                 Vec<Vec<String>>,
             ),
-            config: TestEmbeddingConfigV2,
+            config: TestEmbeddingConfig,
         ) -> Embedding {
             let rng: Rc<dyn RNG> = Rc::new(JsRng::default());
 
@@ -1083,7 +824,7 @@ mod tests {
 
             for round in 0..config.training_rounds {
                 let training_error = embedding
-                    .train_v2(&phrases, config.train_rate, config.batch_size)
+                    .train(&phrases, config.train_rate, config.batch_size)
                     .unwrap();
 
                 if should_report_round(round, config.training_rounds) {
@@ -1103,44 +844,6 @@ mod tests {
             }
 
             embedding
-        }
-
-        pub fn parse_vocab_and_phrases() -> (HashSet<String>, Vec<Vec<String>>) {
-            let vocab = parse_vocab();
-            let phrases = parse_phrases();
-
-            (vocab, phrases)
-        }
-
-        pub fn parse_vocab() -> HashSet<String> {
-            let vocab_json = include_str!("../../res/vocab_set.json");
-            let vocab_json: Value = serde_json::from_str(vocab_json).unwrap();
-            let vocab: HashSet<String> = vocab_json
-                .as_array()
-                .unwrap()
-                .into_iter()
-                .map(|value| value.as_str().unwrap().to_string())
-                .collect();
-            vocab
-        }
-
-        pub fn parse_phrases() -> Vec<Vec<String>> {
-            let phrase_json = include_str!("../../res/phrase_list.json");
-            let phrase_json: Value = serde_json::from_str(phrase_json).unwrap();
-            let phrases: Vec<Vec<String>> = phrase_json
-                .as_array()
-                .unwrap()
-                .into_iter()
-                .map(|value| {
-                    value
-                        .as_array()
-                        .unwrap()
-                        .into_iter()
-                        .map(|value| value.as_str().unwrap().to_owned())
-                        .collect()
-                })
-                .collect();
-            phrases
         }
 
         fn should_report_round(round: usize, training_rounds: usize) -> bool {
@@ -1245,7 +948,7 @@ mod tests {
             (validation_errors, predictions_pct)
         }
 
-        fn split_training_and_testing(
+        pub fn split_training_and_testing(
             phrases: &mut Vec<Vec<String>>,
             max_phrases_count: usize,
             test_phrases_pct: f64,

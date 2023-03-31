@@ -416,7 +416,7 @@ mod training {
 
         loop {
             let training_error = if !paused {
-                match embedding.train_v2(&phrases, learn_rate, config.batch_size) {
+                match embedding.train(&phrases, learn_rate, config.batch_size) {
                     Ok(error) => Some(error),
                     Err(e) => {
                         error!("Failed to train embedding model {e}");
