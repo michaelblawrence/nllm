@@ -5,6 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[bin]]
+name = "embed"
+required-features = ["cli", "thread"]
+
 [dependencies]
 anyhow = { version = "1.0.69", features = ["backtrace"] }
 clap = { version = "4.1.13", features = ["derive"], optional = true }
