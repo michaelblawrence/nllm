@@ -4,21 +4,21 @@ use anyhow::{Context, Result};
 
 use crate::ml::NodeValue;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "thread"))]
 #[derive(Default)]
 pub struct JsRng(std::cell::RefCell<rand::rngs::ThreadRng>);
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "thread")))]
 #[derive(Default)]
 pub struct JsRng;
 
 impl RNG for JsRng {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "thread"))]
     fn rand(&self) -> NodeValue {
         use rand::Rng;
         self.0.borrow_mut().gen()
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "thread")))]
     fn rand(&self) -> NodeValue {
         js_sys::Math::random() as NodeValue
     }

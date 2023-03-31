@@ -1,6 +1,3 @@
-mod components;
-mod ml;
-
 use std::rc::Rc;
 
 use tracing::{metadata::LevelFilter, Level};
@@ -10,7 +7,7 @@ use yew_hooks::use_local_storage;
 
 #[function_component]
 fn App() -> Html {
-    use crate::components::{trainer::TrainEmbeddingConfig, EmbeddingTrainer, JsonEditor};
+    use plane::components::{trainer::TrainEmbeddingConfig, EmbeddingTrainer, JsonEditor};
 
     let storage = use_local_storage::<TrainEmbeddingConfig>("embeddings_config".to_string());
     let json_is_valid = use_state(|| true);
@@ -46,8 +43,7 @@ fn App() -> Html {
                 storage.set(input_config.clone());
                 json_is_valid.set(true);
                 embedding_training_config.set(Rc::new(input_config));
-            }
-            else {
+            } else {
                 json_is_valid.set(false);
             }
         }
@@ -73,8 +69,8 @@ fn main() {
         .with_span_events(format::FmtSpan::ACTIVE)
         .with_filter(LevelFilter::from_level(Level::INFO));
 
-    let perf_layer = tracing_web::performance_layer()
-        .with_details_from_fields(format::Pretty::default());
+    let perf_layer =
+        tracing_web::performance_layer().with_details_from_fields(format::Pretty::default());
 
     tracing_subscriber::registry()
         .with(fmt_layer)

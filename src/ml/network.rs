@@ -1,11 +1,15 @@
 use std::{
     ops::{Deref, DerefMut},
     rc::Rc,
+    str::FromStr,
 };
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::ml::{ShuffleRng, RNG};
+
+use super::JsRng;
 
 #[cfg(not(short_floats))]
 pub type NodeValue = f64;
@@ -13,7 +17,7 @@ pub type NodeValue = f64;
 #[cfg(short_floats)]
 type NodeValue = f32;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkShape {
     inputs_count: usize,
     layers_shape: Vec<LayerShape>,
@@ -39,32 +43,15 @@ impl NetworkShape {
         }
     }
 
-    pub fn new_embedding(
-        token_count: usize,
-        embedding_size: usize,
-        embedding_stride: Option<usize>,
-        hidden_layer_shape: Vec<usize>,
-        hidden_layer_init_stratergy: LayerInitStrategy,
-        rng: Rc<dyn RNG>,
+    pub fn new_custom(
+        inputs_count: usize,
+        layers_shape: Vec<LayerShape>,
+        activation_mode: NetworkActivationMode,
     ) -> Self {
-        let embedding_layer_shape = LayerShape {
-            node_count: embedding_size,
-            strategy: LayerInitStrategy::NoBias(rng),
-            stride_count: embedding_stride,
-            activation_mode: Some(NetworkActivationMode::Linear),
-        };
-        let stratergy = hidden_layer_init_stratergy;
-        let final_layer: LayerShape = (token_count, stratergy.clone()).into();
-        let hidden_layer_shape = hidden_layer_shape.into_iter();
-
         Self {
-            inputs_count: token_count,
-            layers_shape: [embedding_layer_shape]
-                .into_iter()
-                .chain(hidden_layer_shape.map(|n| (n, stratergy.clone()).into()))
-                .chain([final_layer.with_activation_mode(NetworkActivationMode::SoftMax)])
-                .collect(),
-            activation_mode: Default::default(),
+            inputs_count,
+            layers_shape,
+            activation_mode,
         }
     }
 
@@ -91,7 +78,7 @@ impl NetworkShape {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerShape {
     node_count: usize,
     strategy: LayerInitStrategy,
@@ -100,7 +87,21 @@ pub struct LayerShape {
 }
 
 impl LayerShape {
-    fn with_activation_mode(self, mode: NetworkActivationMode) -> Self {
+    pub fn new(
+        node_count: usize,
+        strategy: LayerInitStrategy,
+        stride_count: Option<usize>,
+        activation_mode: Option<NetworkActivationMode>,
+    ) -> Self {
+        Self {
+            node_count,
+            strategy,
+            stride_count,
+            activation_mode,
+        }
+    }
+
+    pub fn with_activation_mode(self, mode: NetworkActivationMode) -> Self {
         Self {
             activation_mode: Some(mode),
             ..self
@@ -109,6 +110,10 @@ impl LayerShape {
 
     pub fn mode_override(&self) -> Option<NetworkActivationMode> {
         self.activation_mode
+    }
+
+    pub fn stride_count(&self) -> usize {
+        self.stride_count.unwrap_or(1)
     }
 }
 
@@ -123,7 +128,7 @@ impl From<(usize, LayerInitStrategy)> for LayerShape {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Network {
     layers: Vec<Layer>,
     shape: NetworkShape,
@@ -131,6 +136,10 @@ pub struct Network {
 
 impl Network {
     pub fn new(shape: NetworkShape) -> Self {
+        Self::new_with_rng(shape, Rc::new(JsRng::default()))
+    }
+
+    pub fn new_with_rng(shape: NetworkShape, rng: Rc<dyn RNG>) -> Self {
         let mut layers = vec![];
 
         for (pair_idx, pair) in shape.iter().collect::<Vec<_>>().windows(2).enumerate() {
@@ -138,7 +147,12 @@ impl Network {
                 let layer_input_nodes = lhs.node_count * lhs.stride_count.unwrap_or(1);
 
                 let layer = if let Some(stride_count) = rhs.stride_count {
-                    let mut layer = Layer::new(rhs.node_count, layer_input_nodes, &rhs.strategy);
+                    let mut layer = Layer::new(
+                        rhs.node_count,
+                        layer_input_nodes,
+                        &rhs.strategy,
+                        rng.clone(),
+                    );
                     assert_eq!(
                         0, pair_idx,
                         "layer stride not yet supported for non-starting layers"
@@ -146,7 +160,12 @@ impl Network {
                     layer.set_stride_count(stride_count);
                     layer
                 } else {
-                    Layer::new(rhs.node_count, layer_input_nodes, &rhs.strategy)
+                    Layer::new(
+                        rhs.node_count,
+                        layer_input_nodes,
+                        &rhs.strategy,
+                        rng.clone(),
+                    )
                 };
 
                 layers.push(layer)
@@ -503,7 +522,7 @@ impl Network {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Layer {
     weights: Vec<NodeValue>,
     bias: Option<Vec<NodeValue>>,
@@ -513,12 +532,17 @@ pub struct Layer {
 }
 
 impl Layer {
-    pub fn new(size: usize, inputs_count: usize, init_stratergy: &LayerInitStrategy) -> Self {
+    pub fn new(
+        size: usize,
+        inputs_count: usize,
+        init_stratergy: &LayerInitStrategy,
+        rng: Rc<dyn RNG>,
+    ) -> Self {
         let weights_size = inputs_count * size;
         let mut layer = Self {
             weights: vec![0.0; weights_size],
             bias: match &init_stratergy {
-                LayerInitStrategy::NoBias(_) => None,
+                LayerInitStrategy::NoBias => None,
                 _ => Some(vec![0.0; size]),
             },
             inputs_count,
@@ -532,6 +556,7 @@ impl Layer {
                 .iter_mut()
                 .chain(layer.bias.iter_mut().flatten()),
             inputs_count,
+            rng.as_ref(),
         );
 
         layer
@@ -858,48 +883,41 @@ impl LayerValues {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LayerInitStrategy {
     Zero,
-    PositiveRandom(Rc<dyn RNG>),
-    ScaledFullRandom(Rc<dyn RNG>),
-    FullRandom(Rc<dyn RNG>),
-    NoBias(Rc<dyn RNG>),
-}
-
-impl std::fmt::Debug for LayerInitStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Zero => write!(f, "Zero"),
-            Self::PositiveRandom(_) => f.debug_tuple("PositiveRandom").finish(),
-            Self::ScaledFullRandom(_) => f.debug_tuple("ScaledFullRandom").finish(),
-            Self::FullRandom(_) => f.debug_tuple("FullRandom").finish(),
-            Self::NoBias(_) => f.debug_tuple("NoBias").finish(),
-        }
-    }
+    PositiveRandom,
+    ScaledFullRandom,
+    FullRandom,
+    NoBias,
 }
 
 impl LayerInitStrategy {
-    pub fn apply<'a>(&self, values: impl Iterator<Item = &'a mut NodeValue>, inputs_count: usize) {
+    pub fn apply<'a>(
+        &self,
+        values: impl Iterator<Item = &'a mut NodeValue>,
+        inputs_count: usize,
+        rng: &dyn RNG,
+    ) {
         use LayerInitStrategy::*;
 
         match self {
             Zero => {}
-            PositiveRandom(rng) => {
+            PositiveRandom => {
                 let scale_factor = (inputs_count as NodeValue).powf(-0.5);
                 for value in values {
                     *value = rng.rand() * scale_factor;
                 }
             }
-            ScaledFullRandom(rng) | NoBias(rng) => {
+            ScaledFullRandom | NoBias => {
                 let scale_factor = (inputs_count as NodeValue).powf(-0.5) * 2.0;
                 for value in values {
-                    *value = Self::full_rand(rng.as_ref()) * scale_factor;
+                    *value = Self::full_rand(rng) * scale_factor;
                 }
             }
-            FullRandom(rng) => {
+            FullRandom => {
                 for value in values {
-                    *value = Self::full_rand(rng.as_ref());
+                    *value = Self::full_rand(rng);
                 }
             }
         }
@@ -945,13 +963,39 @@ pub enum BatchSamplingStrategy {
     Shuffle(Rc<dyn RNG>),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum NetworkActivationMode {
     Linear,
     SoftMax,
     Sigmoid,
     Tanh,
     RelU,
+}
+
+impl std::fmt::Display for NetworkActivationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let json = serde_json::to_string(&self).map_err(|_| std::fmt::Error::default())?;
+        let json = json.trim_matches('"');
+        write!(f, "{}", json)
+    }
+}
+
+impl FromStr for NetworkActivationMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        use NetworkActivationMode::*;
+        let mut s = s.to_uppercase();
+        s.retain(char::is_alphabetic);
+        match s.as_str() {
+            "LINEAR" => Ok(Linear),
+            "SOFTMAX" => Ok(SoftMax),
+            "SIGMOID" => Ok(Sigmoid),
+            "TANH" => Ok(Tanh),
+            "RELU" => Ok(RelU),
+            _ => Err(anyhow!("Could not match activation mode type")),
+        }
+    }
 }
 
 impl NetworkActivationMode {
@@ -1074,12 +1118,7 @@ mod tests {
 
     #[test]
     fn can_compute_hidden_layer_network_rands() {
-        let mut shape = NetworkShape::new(
-            2,
-            2,
-            vec![8],
-            LayerInitStrategy::PositiveRandom(Rc::new(JsRng::default())),
-        );
+        let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::PositiveRandom);
         shape.set_activation_mode(NetworkActivationMode::SoftMax);
         let network = Network::new(shape);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
@@ -1091,12 +1130,7 @@ mod tests {
     #[test]
     fn can_network_learn_randomly() {
         let rng = Rc::new(JsRng::default());
-        let mut shape = NetworkShape::new(
-            2,
-            2,
-            vec![8],
-            LayerInitStrategy::PositiveRandom(rng.clone()),
-        );
+        let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::PositiveRandom);
         shape.set_activation_mode(NetworkActivationMode::SoftMax);
         let mut network = Network::new(shape);
 
@@ -1119,12 +1153,7 @@ mod tests {
     fn can_network_learn_grad_descent_linear_simple_orthoganal_inputs() {
         let training_pairs = [([0.0, 1.0], [0.0, 1.0]), ([1.0, 0.0], [1.0, 0.0])];
         let mut network = multi_sample::create_network(
-            NetworkShape::new(
-                2,
-                2,
-                vec![],
-                LayerInitStrategy::ScaledFullRandom(Rc::new(JsRng::default())),
-            ),
+            NetworkShape::new(2, 2, vec![], LayerInitStrategy::ScaledFullRandom),
             NetworkActivationMode::Linear,
         );
         let learn_rate = 1e-1;
@@ -1152,12 +1181,7 @@ mod tests {
     fn can_network_learn_grad_descent_sigmoid_simple_orthoganal_inputs() {
         let training_pairs = [([0.0, 1.0], [0.1, 0.9]), ([1.0, 0.0], [0.9, 0.1])];
         let mut network = multi_sample::create_network(
-            NetworkShape::new(
-                2,
-                2,
-                vec![],
-                LayerInitStrategy::ScaledFullRandom(Rc::new(JsRng::default())),
-            ),
+            NetworkShape::new(2, 2, vec![], LayerInitStrategy::ScaledFullRandom),
             NetworkActivationMode::Sigmoid,
         );
         let learn_rate = 1e-0;
@@ -1185,12 +1209,7 @@ mod tests {
     fn can_network_learn_grad_descent_tanh_simple_orthoganal_inputs() {
         let training_pairs = [([0.0, 1.0], [0.1, 0.9]), ([1.0, 0.0], [0.9, 0.1])];
         let mut network = multi_sample::create_network(
-            NetworkShape::new(
-                2,
-                2,
-                vec![],
-                LayerInitStrategy::ScaledFullRandom(Rc::new(JsRng::default())),
-            ),
+            NetworkShape::new(2, 2, vec![], LayerInitStrategy::ScaledFullRandom),
             NetworkActivationMode::Tanh,
         );
         let learn_rate = 1e-1;
@@ -1222,12 +1241,7 @@ mod tests {
             ([0.0, 0.0, 0.1], [0.3, 0.5, 0.2]),
         ];
         let mut network = multi_sample::create_network(
-            NetworkShape::new(
-                3,
-                3,
-                vec![],
-                LayerInitStrategy::ScaledFullRandom(Rc::new(JsRng::default())),
-            ),
+            NetworkShape::new(3, 3, vec![], LayerInitStrategy::ScaledFullRandom),
             NetworkActivationMode::Sigmoid,
         );
         let learn_rate = 1e-0;
@@ -1259,12 +1273,7 @@ mod tests {
             ([0.3, 0.1, 1.0], [0.3, 0.5, 0.2]),
         ];
         let mut network = multi_sample::create_network(
-            NetworkShape::new(
-                3,
-                3,
-                vec![],
-                LayerInitStrategy::ScaledFullRandom(Rc::new(JsRng::default())),
-            ),
+            NetworkShape::new(3, 3, vec![], LayerInitStrategy::ScaledFullRandom),
             NetworkActivationMode::Sigmoid,
         );
         let learn_rate = 1e-0;
@@ -1292,12 +1301,7 @@ mod tests {
     fn can_network_learn_grad_descent_linear() {
         let training_pairs = [([0.1, 0.9], [0.25, 0.75])];
         let mut network = multi_sample::create_network(
-            NetworkShape::new(
-                2,
-                2,
-                vec![6, 6],
-                LayerInitStrategy::ScaledFullRandom(Rc::new(JsRng::default())),
-            ),
+            NetworkShape::new(2, 2, vec![6, 6], LayerInitStrategy::ScaledFullRandom),
             NetworkActivationMode::Linear,
         );
         let learn_rate = 1e-2;
@@ -1325,12 +1329,7 @@ mod tests {
     fn can_network_learn_grad_descent_sigmoid() {
         let training_pairs = [([0.1, 0.9], [0.25, 0.75])];
         let mut network = multi_sample::create_network(
-            NetworkShape::new(
-                2,
-                2,
-                vec![6, 6],
-                LayerInitStrategy::ScaledFullRandom(Rc::new(JsRng::default())),
-            ),
+            NetworkShape::new(2, 2, vec![6, 6], LayerInitStrategy::ScaledFullRandom),
             NetworkActivationMode::Sigmoid,
         );
         let learn_rate = 1e-1;
@@ -1363,12 +1362,7 @@ mod tests {
             ([1.0, 1.0, -1.0], [1.0]),
         ];
         let mut network = multi_sample::create_network(
-            NetworkShape::new(
-                3,
-                1,
-                vec![4, 4],
-                LayerInitStrategy::ScaledFullRandom(Rc::new(JsRng::default())),
-            ),
+            NetworkShape::new(3, 1, vec![4, 4], LayerInitStrategy::ScaledFullRandom),
             NetworkActivationMode::Tanh,
         );
 
@@ -1402,12 +1396,7 @@ mod tests {
             ([0.2, 1.0], [0.5, 0.0]),
         ];
         let mut network = multi_sample::create_network(
-            NetworkShape::new(
-                2,
-                2,
-                vec![4, 4, 4],
-                LayerInitStrategy::ScaledFullRandom(Rc::new(JsRng::default())),
-            ),
+            NetworkShape::new(2, 2, vec![4, 4, 4], LayerInitStrategy::ScaledFullRandom),
             NetworkActivationMode::Sigmoid,
         );
         let learn_rate = 5e-1;
@@ -1435,12 +1424,7 @@ mod tests {
     fn can_network_learn_every_layers_batch_grad_descent_sigmoid() {
         let training_pairs = [([0.1, 0.9], [0.25, 0.75])];
         let mut network = multi_sample::create_network(
-            NetworkShape::new(
-                2,
-                2,
-                vec![6, 6],
-                LayerInitStrategy::ScaledFullRandom(Rc::new(JsRng::default())),
-            ),
+            NetworkShape::new(2, 2, vec![6, 6], LayerInitStrategy::ScaledFullRandom),
             NetworkActivationMode::Sigmoid,
         );
         let learn_rate = 1e-1;

@@ -6,18 +6,19 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use serde::{ser::SerializeStruct, Serialize};
+use serde_json::Value;
 use tracing::debug;
 
 use super::{
-    BatchSamplingStrategy, JsRng, LayerInitStrategy, LayerValues, Network, NetworkActivationMode,
-    NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, RNG,
+    BatchSamplingStrategy, JsRng, LayerInitStrategy, LayerShape, LayerValues, Network,
+    NetworkActivationMode, NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, RNG,
 };
 
 pub struct Embedding {
     network: Network,
     vocab: HashMap<String, usize>,
     rng: Rc<dyn RNG>,
-    input_stride_width: usize,
 }
 
 const CONTROL_VOCAB: &str = &"<CTRL>";
@@ -30,41 +31,44 @@ impl Embedding {
         hidden_layer_shape: Vec<usize>,
         rng: Rc<dyn RNG>,
     ) -> Self {
-        let mut ordered_vocab = vocab.into_iter().collect::<Vec<_>>();
-        ordered_vocab.sort();
-
-        let vocab: HashMap<_, _> = [CONTROL_VOCAB.to_string()]
-            .into_iter()
-            .chain(ordered_vocab.into_iter())
-            .enumerate()
-            .map(|(i, word)| (word, i))
-            .collect();
-
-        let hidden_layer_init_stratergy = LayerInitStrategy::ScaledFullRandom(rng.clone());
-        let mut network_shape = NetworkShape::new_embedding(
-            vocab.len(),
-            embedding_dimensions,
-            Some(input_stride_width),
-            hidden_layer_shape,
-            hidden_layer_init_stratergy,
-            rng.clone(),
-        );
-
-        network_shape.set_activation_mode(super::NetworkActivationMode::Tanh);
-
-        let network = Network::new(network_shape);
-
-        Self {
-            network,
-            vocab,
-            input_stride_width,
-            rng,
-        }
+        EmbeddingBuilder::new(vocab, rng)
+            .with_embedding_dimensions(embedding_dimensions)
+            .with_input_stride_width(input_stride_width)
+            .with_hidden_layer_custom_shape(hidden_layer_shape)
+            .build()
     }
 
-    // pub fn set_activation_mode(&mut self, activation_mode: NetworkActivationMode) {
-    //     self.network.set_activation_mode(activation_mode);
-    // }
+    pub fn new_builder(vocab: HashSet<String>, rng: Rc<dyn RNG>) -> EmbeddingBuilder {
+        EmbeddingBuilder::new(vocab, rng)
+    }
+
+    pub fn from_snapshot(json: &str, rng: Rc<dyn RNG>) -> Result<Self> {
+        let value: Value = serde_json::from_str(json)?;
+
+        let network = value
+            .get("network")
+            .context("provided json should contain network field")?;
+        let network = serde_json::from_value(network.clone())?;
+
+        let vocab = value
+            .get("vocab")
+            .context("provided json should contain vocab field")?;
+        let vocab = serde_json::from_value(vocab.clone())?;
+
+        Ok(Self {
+            network,
+            vocab,
+            rng,
+        })
+    }
+
+    pub fn snapshot(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    pub fn snapshot_pretty(&self) -> Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
 
     pub fn train_v2(
         &mut self,
@@ -76,7 +80,7 @@ impl Embedding {
             .vocab
             .get(&CONTROL_VOCAB.to_string())
             .expect("CONTROL_VOCAB should be present in vocab");
-        let word_locality_factor = self.input_stride_width;
+        let word_locality_factor = self.input_stride_width();
 
         // TODO: validate this in a better place
         if word_locality_factor < 1 {
@@ -213,7 +217,7 @@ impl Embedding {
 
     pub fn predict_from(&self, last_word: &str) -> Result<String> {
         let last_words: Vec<_> = iter::repeat(CONTROL_VOCAB)
-            .take(self.input_stride_width - 1)
+            .take(self.input_stride_width() - 1)
             .chain([last_word].into_iter())
             .collect();
         let network_input = self.get_padded_network_input(&last_words[..])?;
@@ -323,7 +327,8 @@ impl Embedding {
                             .collect::<Vec<_>>()[..],
                     )
                     .ok()?;
-                while recent_generated_words.len() > self.input_stride_width {
+                let input_stride_width = self.input_stride_width();
+                while recent_generated_words.len() > input_stride_width {
                     recent_generated_words.pop_front();
                 }
 
@@ -333,10 +338,11 @@ impl Embedding {
     }
 
     fn get_padded_network_input(&self, last_words: &[&str]) -> Result<LayerValues> {
+        let input_stride_width = self.input_stride_width();
         let vocab_idxs = iter::repeat(&CONTROL_VOCAB)
-            .take(self.input_stride_width.saturating_sub(last_words.len()))
+            .take(input_stride_width.saturating_sub(last_words.len()))
             .chain(last_words.iter())
-            .skip(last_words.len().saturating_sub(self.input_stride_width))
+            .skip(last_words.len().saturating_sub(input_stride_width))
             .map(|vocab_word| {
                 self.vocab
                     .get(&vocab_word.to_string())
@@ -385,7 +391,7 @@ impl Embedding {
 
         let mut errors = vec![];
 
-        for word_vectors in vectored_phrase.chunks_exact(self.input_stride_width + 1) {
+        for word_vectors in vectored_phrase.chunks_exact(self.input_stride_width() + 1) {
             let (last_word_vector, context_word_vectors) = word_vectors
                 .split_last()
                 .context("should have last element")?;
@@ -410,8 +416,8 @@ impl Embedding {
 
         Ok(self
             .network
-            .node_weights(0, *vocab_index)?
-            // .expect("should have valid layer strcture")
+            .node_weights(0, *vocab_index)
+            .context("should have valid layer strcture")?
             .into())
     }
 
@@ -445,6 +451,15 @@ impl Embedding {
         let vocab_len = self.vocab.len();
         (0..vocab_len).map(move |i| if i == idx { 1.0 } else { 0.0 })
     }
+
+    pub fn input_stride_width(&self) -> usize {
+        let layer_shape = self.network.shape().iter().nth(1).unwrap();
+        layer_shape.stride_count()
+    }
+
+    pub fn vocab(&self) -> &HashMap<String, usize> {
+        &self.vocab
+    }
 }
 
 impl Default for Embedding {
@@ -456,6 +471,147 @@ impl Default for Embedding {
         let input_stride_width = 1;
 
         Embedding::new(vocab, size, input_stride_width, hidden_layer_shape, rng)
+    }
+}
+
+impl Serialize for Embedding {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let mut embedding = serializer.serialize_struct("Embedding", 2)?;
+        embedding.serialize_field("network", &self.network)?;
+        embedding.serialize_field("vocab", &self.vocab)?;
+        embedding.end()
+    }
+}
+
+#[derive(Clone)]
+pub struct EmbeddingBuilder {
+    vocab: HashSet<String>,
+    activation_mode: NetworkActivationMode,
+    embedding_dimensions: usize,
+    input_stride_width: usize,
+    hidden_layer_shape: Vec<usize>,
+    hidden_layer_init_stratergy: LayerInitStrategy,
+    rng: Rc<dyn RNG>,
+}
+
+impl Default for EmbeddingBuilder {
+    fn default() -> Self {
+        let rng = Rc::new(JsRng::default());
+        Self {
+            vocab: Default::default(),
+            activation_mode: NetworkActivationMode::Tanh,
+            embedding_dimensions: 2,
+            input_stride_width: 1,
+            hidden_layer_shape: vec![10],
+            hidden_layer_init_stratergy: LayerInitStrategy::ScaledFullRandom,
+            rng,
+        }
+    }
+}
+
+impl EmbeddingBuilder {
+    pub fn new(vocab: HashSet<String>, rng: Rc<dyn RNG>) -> Self {
+        Self {
+            vocab,
+            rng,
+            ..Default::default()
+        }
+    }
+
+    pub fn build(self) -> Embedding {
+        let mut ordered_vocab = self.vocab.into_iter().collect::<Vec<_>>();
+        ordered_vocab.sort();
+
+        let vocab: HashMap<_, _> = [CONTROL_VOCAB.to_string()]
+            .into_iter()
+            .chain(ordered_vocab.into_iter())
+            .enumerate()
+            .map(|(i, word)| (word, i))
+            .collect();
+
+        let embedding_layer_shape =
+            Self::build_embedding_layer_shape(self.embedding_dimensions, self.input_stride_width);
+
+        let network_shape = Self::build_shape(
+            vocab.len(),
+            embedding_layer_shape,
+            self.hidden_layer_shape,
+            self.hidden_layer_init_stratergy,
+            self.activation_mode,
+        );
+
+        let network = Network::new(network_shape);
+
+        Embedding {
+            network,
+            vocab,
+            rng: self.rng,
+        }
+    }
+
+    fn build_shape(
+        token_count: usize,
+        embedding_layer_shape: LayerShape,
+        hidden_layer_shape: Vec<usize>,
+        hidden_layer_init_strategy: LayerInitStrategy,
+        activation_mode: NetworkActivationMode,
+    ) -> NetworkShape {
+        let strategy = hidden_layer_init_strategy;
+        let final_layer: LayerShape = (token_count, strategy.clone()).into();
+        let hidden_layer_shape = hidden_layer_shape.into_iter();
+
+        let layers_shape = [embedding_layer_shape]
+            .into_iter()
+            .chain(hidden_layer_shape.map(|n| (n, strategy.clone()).into()))
+            .chain([final_layer.with_activation_mode(NetworkActivationMode::SoftMax)])
+            .collect();
+
+        NetworkShape::new_custom(token_count, layers_shape, activation_mode)
+    }
+
+    fn build_embedding_layer_shape(embedding_size: usize, embedding_stride: usize) -> LayerShape {
+        LayerShape::new(
+            embedding_size,
+            LayerInitStrategy::NoBias,
+            Some(embedding_stride),
+            Some(NetworkActivationMode::Linear),
+        )
+    }
+
+    pub fn with_activation_mode(mut self, activation_mode: NetworkActivationMode) -> Self {
+        self.activation_mode = activation_mode;
+        self
+    }
+
+    pub fn with_embedding_dimensions(mut self, embedding_dimensions: usize) -> Self {
+        self.embedding_dimensions = embedding_dimensions;
+        self
+    }
+
+    pub fn with_input_stride_width(mut self, input_stride_width: usize) -> Self {
+        self.input_stride_width = input_stride_width;
+        self
+    }
+
+    pub fn with_hidden_layer_custom_shape(mut self, hidden_layer_shape: Vec<usize>) -> Self {
+        self.hidden_layer_shape = hidden_layer_shape;
+        self
+    }
+
+    pub fn with_hidden_layer_size(mut self, hidden_layer_size: usize) -> Self {
+        self.hidden_layer_shape = vec![hidden_layer_size];
+        self
+    }
+
+    pub fn with_hidden_layer_init_stratergy(
+        mut self,
+        hidden_layer_init_stratergy: LayerInitStrategy,
+    ) -> Self {
+        self.hidden_layer_init_stratergy = hidden_layer_init_stratergy;
+        self
     }
 }
 
@@ -473,7 +629,7 @@ mod tests {
     #[test]
     #[ignore = "takes too long"]
     fn embeddings_work_medium_len_phrases_prediction_v2() {
-        let (_, phrases) = training::parse_vocab_and_phrases();
+        let phrases = training::parse_phrases();
         let rng: &dyn RNG = &JsRng::default();
 
         let mut phrases: Vec<Vec<String>> = phrases
@@ -535,6 +691,7 @@ mod tests {
                 batch_size: 8,
                 training_rounds: 25_000,
                 train_rate: 1e-2,
+                activation_mode: NetworkActivationMode::Sigmoid,
             },
         );
 
@@ -580,6 +737,7 @@ mod tests {
                 batch_size: 3,
                 training_rounds: 100_000,
                 train_rate: 1e-2,
+                activation_mode: NetworkActivationMode::Tanh,
             },
         );
 
@@ -633,7 +791,7 @@ mod tests {
                 batch_size: 1,
                 training_rounds: 100000,
                 train_rate: 1e-4,
-                // activation_mode: NetworkActivationMode::Tanh,
+                activation_mode: NetworkActivationMode::Tanh,
                 // activation_mode: NetworkActivationMode::Sigmoid,
             },
         );
@@ -647,7 +805,7 @@ mod tests {
     #[test]
     #[ignore = "takes too long"]
     fn embeddings_work_real_prediction_v2() {
-        let (_, phrases) = training::parse_vocab_and_phrases();
+        let phrases = training::parse_phrases();
 
         let phrases: Vec<Vec<String>> = phrases
             .into_iter()
@@ -674,7 +832,7 @@ mod tests {
                 batch_size: 16,
                 training_rounds: 1000,
                 train_rate: 1e-4,
-                // activation_mode: NetworkActivationMode::Tanh,
+                activation_mode: NetworkActivationMode::Tanh,
                 // activation_mode: NetworkActivationMode::Sigmoid,
             },
         );
@@ -884,7 +1042,7 @@ mod tests {
                         training_error,
                         validation_errors,
                         predictions_pct,
-                        None
+                        None,
                     );
                 }
             }
@@ -900,7 +1058,7 @@ mod tests {
             pub input_stride_width: usize,
             pub batch_size: usize,
             pub train_rate: NodeValue,
-            // pub activation_mode: NetworkActivationMode,
+            pub activation_mode: NetworkActivationMode,
         }
 
         pub fn setup_and_train_embeddings_v2(
@@ -912,34 +1070,18 @@ mod tests {
             config: TestEmbeddingConfigV2,
         ) -> Embedding {
             let rng: Rc<dyn RNG> = Rc::new(JsRng::default());
-            let mut embedding = Embedding::new(
-                vocab,
-                config.embedding_size,
-                config.input_stride_width,
-                vec![config.hidden_layer_nodes],
-                rng.clone(),
-            );
-            // TODO: enable setting this with builder pattern
-            // embedding.set_activation_mode(config.activation_mode);
+
+            let mut embedding = Embedding::new_builder(vocab, rng.clone())
+                .with_embedding_dimensions(config.embedding_size)
+                .with_hidden_layer_size(config.hidden_layer_nodes)
+                .with_input_stride_width(config.input_stride_width)
+                .with_activation_mode(config.activation_mode)
+                .build();
 
             let mut seen_pairs = HashSet::new();
             let mut last_report_time: Option<(Instant, usize)> = None;
 
             for round in 0..config.training_rounds {
-                // let phrases = {
-                //     let batch_size = config.batch_size * config.batch_size;
-                //     let max_len = phrases.len() - batch_size;
-                //     let max_len = max_len.max(batch_size);
-                //     let n = rng.rand_range(0, max_len);
-                //     let mut phrases = phrases
-                //         .iter()
-                //         .skip(n)
-                //         .take(batch_size)
-                //         .cloned()
-                //         .collect::<Vec<_>>();
-                //     rng.shuffle_vec(&mut phrases);
-                //     phrases
-                // };
                 let training_error = embedding
                     .train_v2(&phrases, config.train_rate, config.batch_size)
                     .unwrap();
@@ -964,6 +1106,13 @@ mod tests {
         }
 
         pub fn parse_vocab_and_phrases() -> (HashSet<String>, Vec<Vec<String>>) {
+            let vocab = parse_vocab();
+            let phrases = parse_phrases();
+
+            (vocab, phrases)
+        }
+
+        pub fn parse_vocab() -> HashSet<String> {
             let vocab_json = include_str!("../../res/vocab_set.json");
             let vocab_json: Value = serde_json::from_str(vocab_json).unwrap();
             let vocab: HashSet<String> = vocab_json
@@ -972,7 +1121,10 @@ mod tests {
                 .into_iter()
                 .map(|value| value.as_str().unwrap().to_string())
                 .collect();
+            vocab
+        }
 
+        pub fn parse_phrases() -> Vec<Vec<String>> {
             let phrase_json = include_str!("../../res/phrase_list.json");
             let phrase_json: Value = serde_json::from_str(phrase_json).unwrap();
             let phrases: Vec<Vec<String>> = phrase_json
@@ -988,7 +1140,7 @@ mod tests {
                         .collect()
                 })
                 .collect();
-            (vocab, phrases)
+            phrases
         }
 
         fn should_report_round(round: usize, training_rounds: usize) -> bool {
@@ -1020,8 +1172,11 @@ mod tests {
                         )
                     });
 
-            let ms_per_round = last_report_time.map(|(duration, last_round)| duration.as_millis() / (round - last_round) as u128);
-            let ms_per_round = ms_per_round.map(|ms_per_round| format!("(ms/round={ms_per_round:<4.1})")).unwrap_or_default();
+            let ms_per_round = last_report_time
+                .map(|(duration, last_round)| duration.as_millis() / (round - last_round) as u128);
+            let ms_per_round = ms_per_round
+                .map(|ms_per_round| format!("(ms/round={ms_per_round:<4.1})"))
+                .unwrap_or_default();
 
             info!(
                     "round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<6.3} {ms_per_round}",
@@ -1041,7 +1196,7 @@ mod tests {
 
             for testing_phrase in testing_phrases.iter() {
                 for testing_phrase_window in
-                    testing_phrase.windows(embedding.input_stride_width + 1)
+                    testing_phrase.windows(embedding.input_stride_width() + 1)
                 {
                     let (last_word_vector, context_word_vectors) =
                         testing_phrase_window.split_last().unwrap();
