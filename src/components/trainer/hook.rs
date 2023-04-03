@@ -107,8 +107,7 @@ where
         {
             let embedding_handle = embedding_handle.clone();
             let config = config.clone();
-            let train_remaining_iters = train_remaining_iters.clone();
-
+            
             move |vocab_and_phrases: &Rc<VocabAndPhrases>| {
                 let (vocab, ..) = &**vocab_and_phrases;
 
