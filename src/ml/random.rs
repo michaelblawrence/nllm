@@ -33,6 +33,7 @@ pub trait RNG {
 
 pub trait ShuffleRng {
     fn shuffle_vec<T>(&self, vec: &mut Vec<T>);
+    fn take_rand<'a, E>(&self, vec: &'a [E], take: usize) -> Vec<&'a E>;
 }
 
 pub trait SamplingRng {
@@ -47,6 +48,21 @@ impl<T: Deref<Target = dyn RNG>> ShuffleRng for T {
             let j = self.rand_range(i, len);
             vec.swap(i, j);
         }
+    }
+
+    fn take_rand<'a, E>(&self, vec: &'a [E], take: usize) -> Vec<&'a E> {
+        let len = vec.len();
+        let mut v = vec![];
+        let mut idx = 0;
+
+        for i in 0..take {
+            let j = self.rand_range(0, len - i);
+            idx += j;
+            idx %= len;
+            v.push(&vec[idx]);
+        }
+
+        v
     }
 }
 
