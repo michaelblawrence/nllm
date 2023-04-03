@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     iter,
+    ops::Deref,
     rc::Rc,
 };
 
@@ -12,7 +13,8 @@ use tracing::debug;
 
 use super::{
     BatchSamplingStrategy, JsRng, LayerInitStrategy, LayerShape, LayerValues, Network,
-    NetworkActivationMode, NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, RNG,
+    NetworkActivationMode, NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, ShuffleRng,
+    RNG,
 };
 
 pub struct Embedding {
@@ -43,6 +45,11 @@ impl Embedding {
     }
 
     pub fn from_snapshot(json: &str, rng: Rc<dyn RNG>) -> Result<Self> {
+        let embedding = EmbeddingBuilder::from_snapshot(json, rng)?.build();
+        Ok(embedding)
+    }
+
+    pub fn embedding_from_snapshot(json: &str, rng: Rc<dyn RNG>) -> Result<Self> {
         let value: Value = serde_json::from_str(json)?;
 
         let network = value
@@ -70,11 +77,11 @@ impl Embedding {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    pub fn train(
+    pub fn train<B: Into<TrainBatchConfig>>(
         &mut self,
         phrases: &Vec<Vec<String>>,
         learn_rate: NodeValue,
-        batch_size: usize,
+        batch_size: B,
     ) -> Result<NodeValue> {
         let control_vocab_idx = self
             .vocab
@@ -87,8 +94,19 @@ impl Embedding {
             dbg!(word_locality_factor);
             return Err(anyhow!("need at least one sample"));
         }
+        let batch_size: TrainBatchConfig = batch_size.into();
 
-        let indexed_phrases = phrases.iter().flat_map(|phrase| {
+        // reduce phrase count for processing on small batches
+        let phrases: Box<dyn Iterator<Item = &Vec<String>>> = match &batch_size {
+            TrainBatchConfig::SingleBatch(batch_size) => {
+                Box::new(self.rng.take_rand(phrases, *batch_size).into_iter())
+            }
+            _ => {
+                Box::new(phrases.iter())
+            }
+        };
+
+        let indexed_phrases = phrases.flat_map(|phrase| {
             phrase
                 .iter()
                 .flat_map(|word| self.vocab.get(&word.to_string()))
@@ -119,21 +137,40 @@ impl Embedding {
 
         let mut costs = vec![];
 
-        for training_pairs in training_pairs.chunks(batch_size.pow(2)) {
-            let cost = self
-                .network
-                .learn(NetworkLearnStrategy::BatchGradientDecent {
-                    training_pairs: training_pairs.into_iter().cloned().collect::<Vec<_>>(),
-                    batch_size,
-                    learn_rate,
-                    batch_sampling: BatchSamplingStrategy::Shuffle(self.rng.clone()),
-                })?;
-            costs.push(cost);
-            debug!(
-                " -- net train iter cost {} (N = {})",
-                cost.clone().unwrap_or_default(),
-                training_pairs.len()
-            );
+        match batch_size {
+            TrainBatchConfig::Batches(batch_size) => {
+                for training_pairs in training_pairs.chunks(batch_size.pow(2)) {
+                    let cost = self
+                        .network
+                        .learn(NetworkLearnStrategy::BatchGradientDecent {
+                            training_pairs: training_pairs.into_iter().cloned().collect::<Vec<_>>(),
+                            batch_size,
+                            learn_rate,
+                            batch_sampling: BatchSamplingStrategy::Shuffle(self.rng.clone()),
+                        })?;
+                    costs.push(cost);
+                    debug!(
+                        " -- net train iter cost {} (N = {})",
+                        cost.clone().unwrap_or_default(),
+                        training_pairs.len()
+                    );
+                }
+            }
+            TrainBatchConfig::SingleBatch(batch_size) => {
+                let mut training_pairs = training_pairs;
+                self.rng.shuffle_vec(&mut training_pairs);
+                training_pairs.truncate(batch_size);
+
+                let cost = self
+                    .network
+                    .learn(NetworkLearnStrategy::BatchGradientDecent {
+                        training_pairs,
+                        batch_size,
+                        learn_rate,
+                        batch_sampling: BatchSamplingStrategy::Shuffle(self.rng.clone()),
+                    })?;
+                costs.push(cost);
+            }
         }
 
         let cost = costs.iter().flatten().sum::<NodeValue>() / costs.len() as NodeValue;
@@ -358,6 +395,19 @@ impl Embedding {
             .network
             .node_weights(0, *vocab_index)
             .context("should have valid layer strcture")?
+            .into_iter()
+            .into())
+    }
+
+    pub fn flatten_embeddings(&self) -> Result<LayerValues> {
+        Self::flatten_embeddings_from_network(&self.network)
+    }
+
+    pub fn flatten_embeddings_from_network(network: &Network) -> Result<LayerValues> {
+        Ok(network
+            .layer_weights(0)
+            .context("should have valid layer strcture")?
+            .into_iter()
             .into())
     }
 
@@ -400,6 +450,10 @@ impl Embedding {
     pub fn vocab(&self) -> &HashMap<String, usize> {
         &self.vocab
     }
+
+    pub fn shape(&self) -> &NetworkShape {
+        self.network.shape()
+    }
 }
 
 impl Default for Embedding {
@@ -426,9 +480,35 @@ impl Serialize for Embedding {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum TrainBatchConfig {
+    Batches(usize),
+    SingleBatch(usize),
+}
+
+impl From<usize> for TrainBatchConfig {
+    fn from(v: usize) -> Self {
+        Self::Batches(v)
+    }
+}
+
+impl Deref for TrainBatchConfig {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            TrainBatchConfig::Batches(x) => x,
+            TrainBatchConfig::SingleBatch(x) => x,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EmbeddingBuilder {
     vocab: HashSet<String>,
+    override_vocab: Option<HashMap<String, usize>>,
+    override_network: Option<Network>,
+    override_embeddings_layer: Option<LayerValues>,
     activation_mode: NetworkActivationMode,
     embedding_dimensions: usize,
     input_stride_width: usize,
@@ -442,6 +522,9 @@ impl Default for EmbeddingBuilder {
         let rng = Rc::new(JsRng::default());
         Self {
             vocab: Default::default(),
+            override_vocab: None,
+            override_network: None,
+            override_embeddings_layer: None,
             activation_mode: NetworkActivationMode::Tanh,
             embedding_dimensions: 2,
             input_stride_width: 1,
@@ -461,29 +544,118 @@ impl EmbeddingBuilder {
         }
     }
 
+    pub fn from_snapshot(json: &str, rng: Rc<dyn RNG>) -> Result<Self> {
+        let value: Value = serde_json::from_str(json)?;
+
+        let network = value
+            .get("network")
+            .context("provided json should contain network field")?;
+        let network = serde_json::from_value(network.clone())?;
+
+        let vocab = value
+            .get("vocab")
+            .context("provided json should contain vocab field")?;
+        let vocab = serde_json::from_value(vocab.clone())?;
+
+        let input_stride_width = Self::input_stride_width(&network);
+        let hidden_layer_shape = Self::hidden_layer_shape_from_network(&network);
+        let hidden_layer_shape = hidden_layer_shape.map(|shape| shape.node_count()).collect();
+
+        let default_builder = Self::default();
+        let embedding_dimensions = Self::embedding_dimensions(&network);
+        let embedding_dimensions =
+            embedding_dimensions.unwrap_or(default_builder.embedding_dimensions);
+
+        Ok(Self {
+            override_vocab: Some(vocab),
+            override_network: Some(network),
+            input_stride_width: input_stride_width.unwrap_or(1),
+            embedding_dimensions,
+            hidden_layer_shape,
+            rng,
+            ..default_builder
+        })
+    }
+
+    pub fn from_existing(embedding: &Embedding) -> Result<Self> {
+        let vocab = embedding.vocab.clone();
+        let embeddings_layer = embedding.flatten_embeddings()?;
+        let input_stride_width = Self::input_stride_width(&embedding.network);
+        let hidden_layer_shape = Self::hidden_layer_shape_from_network(&embedding.network);
+        let hidden_layer_shape = hidden_layer_shape.map(|shape| shape.node_count()).collect();
+        let rng = embedding.rng.clone();
+
+        let default_builder = Self::default();
+        let embedding_dimensions = Self::embedding_dimensions(&embedding.network);
+        let embedding_dimensions =
+            embedding_dimensions.unwrap_or(default_builder.embedding_dimensions);
+
+        Ok(Self {
+            override_vocab: Some(vocab),
+            override_embeddings_layer: Some(embeddings_layer),
+            input_stride_width: input_stride_width.unwrap_or(1),
+            embedding_dimensions,
+            hidden_layer_shape,
+            rng,
+            ..default_builder
+        })
+    }
+
     pub fn build(self) -> Embedding {
-        let mut ordered_vocab = self.vocab.into_iter().collect::<Vec<_>>();
-        ordered_vocab.sort();
+        let vocab: HashMap<_, _> = match self.override_vocab {
+            Some(vocab) => vocab,
+            None => {
+                let ordered_vocab = {
+                    let mut v = self.vocab.into_iter().collect::<Vec<_>>();
+                    v.sort();
+                    v
+                };
 
-        let vocab: HashMap<_, _> = [CONTROL_VOCAB.to_string()]
-            .into_iter()
-            .chain(ordered_vocab.into_iter())
-            .enumerate()
-            .map(|(i, word)| (word, i))
-            .collect();
+                [CONTROL_VOCAB.to_string()]
+                    .into_iter()
+                    .chain(ordered_vocab.into_iter())
+                    .enumerate()
+                    .map(|(i, word)| (word, i))
+                    .collect()
+            }
+        };
 
-        let embedding_layer_shape =
-            Self::build_embedding_layer_shape(self.embedding_dimensions, self.input_stride_width);
+        let (override_network, override_embeddings_layer) = match self.override_network {
+            Some(network)
+                if Self::is_distinct_layer_shape(
+                    &self.hidden_layer_shape,
+                    self.input_stride_width,
+                    &network,
+                ) =>
+            {
+                let embeddings_layer = Embedding::flatten_embeddings_from_network(&network);
+                let embeddings_layer = embeddings_layer.expect("should get embedding layer");
 
-        let network_shape = Self::build_shape(
-            vocab.len(),
-            embedding_layer_shape,
-            self.hidden_layer_shape,
-            self.hidden_layer_init_stratergy,
-            self.activation_mode,
-        );
+                (None, Some(embeddings_layer))
+            }
+            Some(network) => (Some(network), None),
+            None => (None, self.override_embeddings_layer),
+        };
 
-        let network = Network::new(network_shape);
+        let network = match override_network {
+            Some(network) => network,
+            None => {
+                let embedding_layer_shape = Self::build_embedding_layer_shape(
+                    self.embedding_dimensions,
+                    self.input_stride_width,
+                    override_embeddings_layer,
+                );
+
+                let network_shape = Self::build_shape(
+                    vocab.len(),
+                    embedding_layer_shape,
+                    self.hidden_layer_shape,
+                    self.hidden_layer_init_stratergy,
+                    self.activation_mode,
+                );
+                Network::new(network_shape)
+            }
+        };
 
         Embedding {
             network,
@@ -512,10 +684,19 @@ impl EmbeddingBuilder {
         NetworkShape::new_custom(token_count, layers_shape, activation_mode)
     }
 
-    fn build_embedding_layer_shape(embedding_size: usize, embedding_stride: usize) -> LayerShape {
+    fn build_embedding_layer_shape(
+        embedding_size: usize,
+        embedding_stride: usize,
+        embedding_layer_weights: Option<LayerValues>,
+    ) -> LayerShape {
+        let init_strategy = match embedding_layer_weights {
+            Some(weights) => LayerInitStrategy::NoBiasCopied(weights),
+            None => LayerInitStrategy::NoBias,
+        };
+
         LayerShape::new(
             embedding_size,
-            LayerInitStrategy::NoBias,
+            init_strategy,
             Some(embedding_stride),
             Some(NetworkActivationMode::Linear),
         )
@@ -552,6 +733,40 @@ impl EmbeddingBuilder {
     ) -> Self {
         self.hidden_layer_init_stratergy = hidden_layer_init_stratergy;
         self
+    }
+
+    fn is_distinct_layer_shape(
+        self_hidden_layer_shape: &Vec<usize>,
+        input_stride_width: usize,
+        network: &Network,
+    ) -> bool {
+        match Self::input_stride_width(&network) {
+            Some(stride_count) if stride_count != input_stride_width => true,
+            _ => {
+                let ref_hidden_layer_shape = Self::hidden_layer_shape_from_network(network);
+                let ref_hidden_layer_shape =
+                    ref_hidden_layer_shape.take(self_hidden_layer_shape.len());
+                let ref_hidden_layer_shape = ref_hidden_layer_shape.map(|shape| shape.node_count());
+
+                !ref_hidden_layer_shape.eq(self_hidden_layer_shape.iter().cloned())
+            }
+        }
+    }
+
+    fn input_stride_width(network: &Network) -> Option<usize> {
+        network.shape().iter().nth(1).map(|x| x.stride_count())
+    }
+
+    fn embedding_dimensions(network: &Network) -> Option<usize> {
+        network.shape().iter().nth(1).map(|x| x.node_count())
+    }
+
+    fn hidden_layer_shape_from_network<'a>(
+        network: &'a Network,
+    ) -> impl Iterator<Item = LayerShape> + 'a {
+        let shape = &network.shape();
+        let hidden_layer_len = shape.len() - 1;
+        shape.iter().skip(2).take(hidden_layer_len)
     }
 }
 
