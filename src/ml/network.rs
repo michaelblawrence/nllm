@@ -706,12 +706,16 @@ impl Layer {
             NetworkActivationMode::SoftMax => expected_outputs
                 .iter()
                 .zip(outputs.iter())
-                .map(|(expected, actual)| match *expected {
-                    1.0 => Ok(-actual.ln()),
-                    0.0 => Ok(0.0),
-                    _ => Err(anyhow!(
-                        "target outputs should be one-hot encoded: {expected_outputs:?}"
-                    )),
+                .map(|(expected, actual)| {
+                    if *expected == 1.0 {
+                        Ok(-actual.ln())
+                    } else if *expected == 0.0 {
+                        Ok(0.0)
+                    } else {
+                        Err(anyhow!(
+                            "target outputs should be one-hot encoded: {expected_outputs:?}"
+                        ))
+                    }
                 })
                 .collect(),
             _ => self.calculate_msd_error(outputs, expected_outputs),

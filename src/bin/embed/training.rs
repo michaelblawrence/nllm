@@ -302,25 +302,6 @@ fn characterize_phrases(phrases: Vec<Vec<String>>) -> Vec<Vec<String>> {
         .collect_vec()
 }
 
-pub fn parse_vocab_and_phrases() -> (HashSet<String>, Vec<Vec<String>>) {
-    let vocab = parse_vocab();
-    let phrases = parse_phrases();
-
-    (vocab, phrases)
-}
-
-pub fn parse_vocab() -> HashSet<String> {
-    let vocab_json = include_str!("../../../res/vocab_set.json");
-    let vocab_json: Value = serde_json::from_str(vocab_json).unwrap();
-    let vocab: HashSet<String> = vocab_json
-        .as_array()
-        .unwrap()
-        .into_iter()
-        .map(|value| value.as_str().unwrap().to_string())
-        .collect();
-    vocab
-}
-
 pub fn parse_phrases() -> Vec<Vec<String>> {
     let phrase_json = include_str!("../../../res/phrase_list.json");
     let phrase_json: Value = serde_json::from_str(phrase_json).unwrap();

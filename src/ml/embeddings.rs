@@ -101,9 +101,7 @@ impl Embedding {
             TrainBatchConfig::SingleBatch(batch_size) => {
                 Box::new(self.rng.take_rand(phrases, *batch_size).into_iter())
             }
-            _ => {
-                Box::new(phrases.iter())
-            }
+            _ => Box::new(phrases.iter()),
         };
 
         let indexed_phrases = phrases.flat_map(|phrase| {
@@ -772,8 +770,6 @@ impl EmbeddingBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use test_log::test;
     use tracing::info;
 
@@ -1175,70 +1171,6 @@ mod tests {
                         as usize,
             );
             testing_phrases
-        }
-
-        pub fn write_results_to_disk(embedding: &Embedding, vocab: &HashSet<String>, label: &str) {
-            use itertools::Itertools;
-
-            let systime = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-
-            std::fs::File::create(format!("out/out-{label}-{systime}_nearest.json"))
-                .unwrap()
-                .write_all(
-                    serde_json::to_string_pretty(&{
-                        let mut map = HashMap::new();
-
-                        for v in vocab.iter() {
-                            let nearest = embedding
-                                .nearest(&v)
-                                .map(|(x, _)| x)
-                                .unwrap_or_else(|_| "<none>".to_string());
-                            map.insert(v, nearest);
-                        }
-                        map
-                    })
-                    .unwrap()
-                    .as_bytes(),
-                )
-                .unwrap();
-
-            std::fs::File::create(format!("out/out-{label}-{systime}_predictions.json"))
-                .unwrap()
-                .write_all(
-                    serde_json::to_string_pretty(&{
-                        let mut map = HashMap::new();
-
-                        for v in vocab.iter() {
-                            let predict = embedding
-                                .predict_from(&v)
-                                .unwrap_or_else(|_| "<none>".to_string());
-                            map.insert(v, predict);
-                        }
-                        map
-                    })
-                    .unwrap()
-                    .as_bytes(),
-                )
-                .unwrap();
-
-            std::fs::File::create(format!("out/out-{label}-{systime}_embeddings.csv"))
-                .unwrap()
-                .write_fmt(format_args!(
-                    "{}",
-                    vocab
-                        .iter()
-                        .map(|word| {
-                            format!(
-                                "{word},{}",
-                                embedding.embeddings(&word).unwrap().iter().join(",")
-                            )
-                        })
-                        .join("\n")
-                ))
-                .unwrap();
         }
     }
 }
