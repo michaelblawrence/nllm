@@ -1,23 +1,12 @@
-use std::{
-    collections::{HashMap, HashSet},
-    io::stdin,
-    ops::ControlFlow,
-    rc::Rc,
-    sync::{mpsc, Arc},
-    thread,
-};
+use std::{sync::mpsc, thread};
 
-use anyhow::{anyhow, Context, Result};
-use clap::{Args, Parser};
+use anyhow::{anyhow, Result};
+use clap::{Args, FromArgMatches};
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
-use itertools::Itertools;
-use serde::{Deserialize, Serialize};
-use tracing::{info, metadata::LevelFilter};
+use tracing::metadata::LevelFilter;
 
 use config::TrainEmbeddingConfig;
-use messages::{TrainerHandleActions, TrainerMessage};
-
-use plane::ml::{embeddings::Embedding, JsRng, NetworkActivationMode, NodeValue, RNG};
+use messages::TrainerMessage;
 
 mod config;
 mod messages;
@@ -28,19 +17,18 @@ fn main() -> Result<()> {
     let (config, resumed_state) = parse_cli_args()?;
 
     let config_clone = config.clone();
-    let (tx, handle) = messages::TrainerHandle::new(move |embedding, msg| {
-        handle_trainer_message(msg, embedding, &config_clone)
+    let (tx, handle) = messages::TrainerHandle::new(move |embedding, msg: TrainerMessage| {
+        let handle_action = msg.apply(embedding, &config_clone);
+        handle_action
     });
 
     let config_clone = config.clone();
     let thread = thread::spawn(move || {
-        let embedding = training::setup_and_train_embeddings_v2(config_clone, handle);
-
-        training::write_results_to_disk(&embedding, "bin-convo-midlen");
+        let _embedding = training::setup_and_train_embeddings_v2(config_clone, handle);
     });
 
     if let Some((snapshot, state)) = resumed_state {
-        tx.send(TrainerMessage::ReplaceEmbeddingState(snapshot, state));
+        tx.send(TrainerMessage::ReplaceEmbeddingState(snapshot, state))?;
     }
 
     let config_clone = config.clone();
@@ -73,6 +61,7 @@ fn parse_repl_char(
 ) -> Result<()> {
     match c {
         'r' => tx.send(TrainerMessage::PrintStatus)?,
+        'R' => tx.send(TrainerMessage::SuppressAutoPrintStatus)?,
         'a' => tx.send(TrainerMessage::TogglePrintAllStatus)?,
         'x' => tx.send(TrainerMessage::ReloadFromSnapshot)?,
         'z' => tx.send(TrainerMessage::ForceSnapshot)?,
@@ -92,6 +81,7 @@ fn parse_repl_char(
             println!(
                 r"Trainer help: 
                         'r' => report status
+                        'R' => supress auto-report status
                         'n' => print new random phrase
                         'x' => reload from auto-save snapshot
                         'z' => force snapshot
@@ -112,62 +102,6 @@ fn parse_repl_char(
     Ok(())
 }
 
-fn handle_trainer_message(
-    msg: TrainerMessage,
-    embedding: &Embedding,
-    config: &TrainEmbeddingConfig,
-) -> TrainerHandleActions {
-    match msg {
-        TrainerMessage::PrintStatus => TrainerHandleActions::PrintStatus,
-        TrainerMessage::Halt => TrainerHandleActions::Halt,
-        TrainerMessage::TogglePause => TrainerHandleActions::TogglePause,
-        TrainerMessage::TogglePrintAllStatus => TrainerHandleActions::TogglePrintAllStatus,
-        TrainerMessage::ReloadFromSnapshot => TrainerHandleActions::ReloadFromSnapshot,
-        TrainerMessage::ForceSnapshot => TrainerHandleActions::ForceSnapshot,
-        TrainerMessage::IncreaseMaxRounds(x) => TrainerHandleActions::IncreaseMaxRounds(x),
-        TrainerMessage::MultiplyLearnRateBy(x) => TrainerHandleActions::LearnRateMulMut(x),
-        TrainerMessage::ReplaceEmbeddingState(embedding, state) => {
-            TrainerHandleActions::ReplaceEmbeddingState(embedding, state)
-        }
-        TrainerMessage::WriteModelToDisk => {
-            TrainerHandleActions::DispatchWithMetadata(Arc::new(|x| {
-                TrainerMessage::WriteModelAndMetadataToDisk(x)
-            }))
-        }
-        TrainerMessage::WriteModelAndMetadataToDisk(metadata) => {
-            training::write_model_to_disk(
-                &embedding,
-                &config,
-                &metadata,
-                "embed",
-                &config.output_dir,
-                &config.output_label,
-            );
-            TrainerHandleActions::Nothing
-        }
-        TrainerMessage::WriteStatsToDisk => {
-            training::write_results_to_disk(&embedding, "embed");
-            TrainerHandleActions::Nothing
-        }
-        TrainerMessage::WriteEmbeddingTsvToDisk => {
-            training::write_embedding_tsv_to_disk(
-                &embedding,
-                "embed",
-                &config.output_dir,
-                &config.output_label,
-            );
-            TrainerHandleActions::Nothing
-        }
-        TrainerMessage::PredictRandomPhrase => {
-            let vocab_idx = JsRng::default().rand_range(0, embedding.vocab().len());
-            let seed_word = embedding.vocab().keys().nth(vocab_idx).unwrap();
-            let predicted_phrase = embedding.predict_iter(seed_word).join(" ");
-            info!("Predicted a new random phrase:  {}", predicted_phrase);
-            TrainerHandleActions::Nothing
-        }
-    }
-}
-
 fn configure_logging() {
     let subscriber = tracing_subscriber::fmt()
         .compact()
@@ -182,7 +116,17 @@ fn parse_cli_args() -> Result<(
     TrainEmbeddingConfig,
     Option<(String, messages::TrainerStateMetadata)>,
 )> {
-    let cli = config::Cli::parse();
+    let cli = clap::Command::new("embed").disable_help_flag(true).arg(
+        clap::Arg::new("help")
+            .long("help")
+            .action(clap::ArgAction::Help),
+    );
+    let cli = config::Cli::augment_args(cli);
+    let matches = cli.get_matches();
+    let cli = config::Cli::from_arg_matches(&matches)
+        .map_err(|err| err.exit())
+        .unwrap();
+    // let cli = config::Cli::parse();
     let (config, resumed_state) = match cli.command() {
         config::Command::TrainEmbedding(config) => (config, None),
         config::Command::LoadEmbedding(config) => load_embedding(config)?,
@@ -191,15 +135,23 @@ fn parse_cli_args() -> Result<(
 }
 
 fn load_embedding(
-    config: config::LoadEmbeddingConfig,
+    load_config: config::LoadEmbeddingConfig,
 ) -> Result<(
     TrainEmbeddingConfig,
     Option<(String, messages::TrainerStateMetadata)>,
 )> {
-    let rng = Rc::new(JsRng::default());
-    let file_path = &config.file_path;
-    let (snapshot, mut config, state) = training::read_model_from_disk(file_path, rng)?;
+    let file_path = &load_config.file_path;
+    let (snapshot, mut config, state) = training::read_model_from_disk(file_path)?;
 
     config.pause_on_start = true;
+    if let Some(hidden_layer_nodes) = load_config.hidden_layer_nodes {
+        config.hidden_layer_nodes = hidden_layer_nodes;
+    }
+    if let Some(hidden_deep_layer_nodes) = load_config.hidden_deep_layer_nodes {
+        config.hidden_deep_layer_nodes = Some(hidden_deep_layer_nodes);
+    }
+    if let Some(input_stride_width) = load_config.input_stride_width {
+        config.input_stride_width = input_stride_width;
+    }
     Ok((config, Some((snapshot, state))))
 }

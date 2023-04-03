@@ -1,65 +1,177 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{DirBuilder, File},
-    io::{BufReader, Read, Write},
-    path,
+    fs::File,
+    io::{BufReader, Write},
     rc::Rc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use plane::ml::{embeddings::Embedding, JsRng, NetworkActivationMode, NodeValue, RNG};
-use serde::{Deserialize, Serialize};
+use itertools::Itertools;
+use plane::ml::{
+    embeddings::{Embedding, TrainBatchConfig},
+    JsRng, NodeValue, RNG,
+};
+
 use serde_json::Value;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 use crate::{
     config::TrainEmbeddingConfig,
-    messages::{TrainerHandle, TrainerHandleActions, TrainerMessage, TrainerStateMetadata, TrainerReport},
+    messages::{
+        TrainerHandle, TrainerHandleActions, TrainerMessage, TrainerReport, TrainerStateMetadata,
+    },
 };
 
-pub fn setup_and_train_embeddings_v2<F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions>(
+pub struct TrainerState {
+    pub embedding: Embedding,
+    pub batch_size: TrainBatchConfig,
+    pub learn_rate: f64,
+    pub training_rounds: usize,
+    pub supress_auto_report: bool,
+    pub force_report: bool,
+    pub force_report_all: bool,
+    pub snapshot: (Option<String>, Instant),
+    pub last_report: Option<(Instant, TrainerReport)>,
+    pub paused: bool,
+    pub halt: bool,
+    pub round: usize,
+    pub rng: Rc<dyn RNG>,
+    inital_config: TrainEmbeddingConfig,
+}
+
+impl TrainerState {
+    fn new(embedding: Embedding, config: &TrainEmbeddingConfig, rng: Rc<dyn RNG>) -> Self {
+        let batch_size = match config.single_batch_iterations {
+            true => TrainBatchConfig::SingleBatch(config.batch_size),
+            false => config.batch_size.into(),
+        };
+        Self {
+            inital_config: config.clone(),
+            embedding,
+            batch_size,
+            learn_rate: config.train_rate,
+            training_rounds: config.training_rounds,
+            paused: config.pause_on_start,
+            snapshot: (None, Instant::now()),
+            supress_auto_report: false,
+            force_report: false,
+            force_report_all: false,
+            last_report: None,
+            halt: false,
+            rng,
+            round: 0,
+        }
+    }
+
+    fn complete_round(&mut self) {
+        if !self.paused {
+            self.round += 1;
+        }
+        self.force_report = false;
+    }
+
+    fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    fn perform_snapshot(&mut self) {
+        let json = self.embedding.snapshot().unwrap();
+        self.snapshot = (Some(json), Instant::now());
+    }
+
+    fn should_perform_autosave(&self) -> bool {
+        !self.paused
+            && self.snapshot.1.elapsed().as_secs() > self.inital_config.snapshot_interval_secs
+    }
+
+    fn should_report_round(&self) -> bool {
+        if self.force_report_all || self.force_report {
+            return true;
+        }
+
+        !self.paused
+            && !self.supress_auto_report
+            && should_report_round(self.round, self.training_rounds)
+    }
+
+    pub fn metadata(&self) -> TrainerStateMetadata {
+        TrainerStateMetadata {
+            learn_rate: self.learn_rate,
+            training_rounds: self.training_rounds,
+            current_round: self.round,
+            training_report: self.last_report.as_ref().map(|(_, report)| report.clone()),
+        }
+    }
+
+    pub fn input_stride_width(&self) -> usize {
+        self.inital_config.input_stride_width
+    }
+
+    pub fn hidden_layer_shape(&self) -> Vec<usize> {
+        Self::build_hidden_layer_shape(&self.inital_config)
+    }
+
+    pub fn build_hidden_layer_shape(config: &TrainEmbeddingConfig) -> Vec<usize> {
+        let layer_node_counts = [
+            Some(config.hidden_layer_nodes),
+            config.hidden_deep_layer_nodes.filter(|x| *x > 0),
+        ];
+
+        layer_node_counts.iter().cloned().flatten().collect()
+    }
+}
+
+pub fn setup_and_train_embeddings_v2<F>(
     config: TrainEmbeddingConfig,
     handle: TrainerHandle<TrainerMessage, F>,
-) -> Embedding {
+) -> Embedding
+where
+    F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions,
+{
     let rng: Rc<dyn RNG> = Rc::new(JsRng::default());
-
-    let (mut phrases, vocab) = init_phrases_and_vocab(&config, rng.clone());
-    let testing_phrases = match config.phrase_test_set_split_pct.filter(|x| *x > 0.0) {
+    let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, rng.clone());
+    let mut testing_phrases = match config.phrase_test_set_split_pct.filter(|x| *x > 0.0) {
         Some(pct) => split_training_and_testing(&mut phrases, pct),
         None => phrases.clone(),
     };
 
-    let layer_node_counts = [
-        Some(config.hidden_layer_nodes),
-        Some(config.hidden_deep_layer_nodes).filter(|x| *x > 0),
-    ];
+    if config.use_character_tokens {
+        phrases = characterize_phrases(phrases);
+        testing_phrases = characterize_phrases(testing_phrases);
+        vocab = compute_vocab(&phrases);
+    }
 
-    let mut embedding = Embedding::new_builder(vocab, rng.clone())
+    dbg!((phrases.len(), vocab.len())); // TODO: replace with tracing logging
+    let hidden_layer_shape = TrainerState::build_hidden_layer_shape(&config);
+
+    let embedding = Embedding::new_builder(vocab, rng.clone())
         .with_embedding_dimensions(config.embedding_size)
-        .with_hidden_layer_custom_shape(layer_node_counts.into_iter().flatten().collect())
+        .with_hidden_layer_custom_shape(hidden_layer_shape)
         .with_input_stride_width(config.input_stride_width)
         .with_activation_mode(config.activation_mode)
         .build();
 
-    let mut last_report: Option<(Instant, TrainerReport)> = None;
-    let mut learn_rate = config.train_rate;
-    let mut training_rounds = config.training_rounds;
-    let mut force_report_all = false;
-    let mut snapshot: (Option<String>, Instant) = (None, Instant::now());
-    let mut paused = config.pause_on_start;
-    let mut round = 0;
+    let mut state = TrainerState::new(embedding, &config, rng);
 
     loop {
-        let training_error = if !paused {
-            match embedding.train(&phrases, learn_rate, config.batch_size) {
-                Ok(error) => Some(error),
+        let training_error = if !state.paused {
+            match state
+                .embedding
+                .train(&phrases, state.learn_rate, state.batch_size)
+            {
+                Ok(error) => {
+                    if state.should_perform_autosave() {
+                        state.perform_snapshot();
+                    }
+                    Some(error)
+                }
                 Err(e) => {
                     error!("Failed to train embedding model {e}");
-                    if let (Some(_), when) = snapshot {
+                    if let (Some(_), when) = state.snapshot {
                         info!("Snapshot available from {when:?}. See help menu ('h') to restore... pausing")
                     }
-                    paused = true;
+                    state.pause();
                     None
                 }
             }
@@ -67,134 +179,56 @@ pub fn setup_and_train_embeddings_v2<F: Fn(&Embedding, TrainerMessage) -> Traine
             None
         };
 
-        if !paused
-            && training_error.is_some()
-            && snapshot.1.elapsed().as_secs() > config.snapshot_interval_secs
-        {
-            let json = embedding.snapshot().unwrap();
-            snapshot = (Some(json), Instant::now());
+        let recv_timeout = state.paused.then_some(Duration::from_secs(5));
+
+        while let Ok(msg) = handle.try_recv(recv_timeout) {
+            let handler = &handle.handler;
+            let action = handler(&state.embedding, msg);
+            action.apply(&mut state, &handle);
         }
 
-        let mut force_report = false;
-        let mut halt = false;
-
-        while let Ok(msg) = if !paused {
-            handle.rx.try_recv().map_err(|_| ())
-        } else {
-            handle
-                .rx
-                .recv_timeout(Duration::from_secs(5))
-                .map_err(|_| ())
-        } {
-            let action = (handle.handler)(&embedding, msg);
-            match action {
-                TrainerHandleActions::Nothing => (),
-                TrainerHandleActions::LearnRateMulMut(factor) => {
-                    let old_learn_rate = learn_rate;
-                    learn_rate *= factor;
-                    info!("Changed learn rate from {old_learn_rate} to {learn_rate}");
-                }
-                TrainerHandleActions::TogglePrintAllStatus => force_report_all = !force_report_all,
-                TrainerHandleActions::TogglePause => {
-                    paused = !paused;
-                    if paused {
-                        info!("Pausing rounds run, pausing...");
-                    } else {
-                        info!("Resuming rounds run, starting...");
-                    }
-                }
-                TrainerHandleActions::IncreaseMaxRounds(rounds) => {
-                    let old_training_rounds = training_rounds;
-                    training_rounds += rounds;
-                    info!("Changed max training rounds from {old_training_rounds} to {training_rounds}");
-                    if paused {
-                        info!("Resuming rounds run, starting...");
-                        paused = false;
-                    }
-                }
-                TrainerHandleActions::ReloadFromSnapshot => {
-                    if let Some(snapshot) = &snapshot.0 {
-                        info!("Recovering state from snapshot, pausing...");
-                        embedding = Embedding::from_snapshot(&snapshot, rng.clone()).unwrap();
-                        paused = true;
-                    } else {
-                        info!("No snapshot found to recover state from, continuing...");
-                    }
-                }
-                TrainerHandleActions::ForceSnapshot => {
-                    let json = embedding.snapshot().unwrap();
-                    snapshot = (Some(json), Instant::now());
-                    info!("Forced snapshot save to memory");
-                }
-                TrainerHandleActions::PrintStatus => force_report = true,
-                TrainerHandleActions::Halt => {
-                    force_report = true;
-                    halt = true;
-                }
-                TrainerHandleActions::DispatchWithMetadata(factory_fn) => {
-                    let factory_fn = factory_fn.as_ref();
-                    let state = TrainerStateMetadata {
-                        learn_rate,
-                        training_rounds,
-                        current_round: round,
-                        training_report: last_report.as_ref().map(|(_, report)| report.clone()),
-                    };
-                    let message = factory_fn(state);
-                    handle.send(message).unwrap();
-                }
-                TrainerHandleActions::ReplaceEmbeddingState(snapshot, new_state) => {
-                    embedding = Embedding::from_snapshot(&snapshot, rng.clone()).unwrap();
-                    round = new_state.current_round;
-                    training_rounds = new_state.training_rounds;
-                    learn_rate = new_state.learn_rate;
-
-                    last_report = None;
-                    paused = true;
-                    info!("Restored loaded model and state, pausing...");
-                }
-            }
-        }
-
-        if force_report_all || force_report || should_report_round(round, config.training_rounds) {
-            match validate_embeddings(&embedding, &testing_phrases, round) {
+        if state.should_report_round() {
+            match validate_embeddings(&state.embedding, &testing_phrases) {
                 Ok((validation_errors, predictions_pct)) => {
                     let report = generate_training_report(
-                        round,
+                        state.round,
                         training_error.unwrap_or(0.0),
                         validation_errors,
                         predictions_pct,
-                        last_report
+                        state
+                            .last_report
                             .as_ref()
                             .map(|(last_dt, report)| (last_dt.elapsed(), report.round)),
                     );
 
                     log_training_round(&report);
 
-                    last_report = Some((std::time::Instant::now(), report));
+                    state.last_report = Some((std::time::Instant::now(), report));
                 }
                 Err(e) => {
-                    error!("Failed to validate testing round {e}.. pausing");
-                    paused = true;
+                    error!(
+                        "Failed to validate testing round {}: '{e}'.. pausing",
+                        state.round + 1
+                    );
+                    state.pause();
                 }
             }
         }
 
-        if halt {
+        if state.halt {
             info!("Stopping rounds run...");
             break;
         }
 
-        if !paused {
-            round += 1;
-        }
+        state.complete_round();
 
-        if round == training_rounds && !paused {
+        if state.round == state.training_rounds && !state.paused {
             info!("Completed rounds run, pausing...");
-            paused = true;
+            state.pause();
         }
     }
 
-    embedding
+    state.embedding
 }
 
 pub fn init_phrases_and_vocab(
@@ -225,7 +259,6 @@ pub fn init_phrases_and_vocab(
             .map(|word| vocab_counts[word].pow(2))
             .sum::<i32>()
     });
-    use itertools::Itertools;
 
     phrases.truncate(config.phrase_train_set_size);
     info!(
@@ -243,16 +276,30 @@ pub fn init_phrases_and_vocab(
             .collect::<Vec<_>>()
     );
 
-    let vocab: HashSet<String> = phrases
-        .iter()
-        .flat_map(|phrase| phrase.iter())
-        .cloned()
-        .collect();
-
-    dbg!((phrases.len(), vocab.len()));
+    let vocab = compute_vocab(&phrases);
 
     plane::ml::ShuffleRng::shuffle_vec(&rng, &mut phrases);
     (phrases, vocab)
+}
+
+fn compute_vocab(phrases: &Vec<Vec<String>>) -> HashSet<String> {
+    phrases
+        .iter()
+        .flat_map(|phrase| phrase.iter())
+        .cloned()
+        .collect()
+}
+
+fn characterize_phrases(phrases: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    phrases
+        .into_iter()
+        .map(|phrase| {
+            phrase
+                .into_iter()
+                .flat_map(|word| word.chars().map(|c| c.to_string()).collect_vec())
+                .collect_vec()
+        })
+        .collect_vec()
 }
 
 pub fn parse_vocab_and_phrases() -> (HashSet<String>, Vec<Vec<String>>) {
@@ -350,7 +397,6 @@ fn log_training_round(report: &TrainerReport) {
 fn validate_embeddings(
     embedding: &Embedding,
     testing_phrases: &Vec<Vec<String>>,
-    round: usize,
 ) -> Result<(Vec<(f64, f64)>, f64)> {
     let mut validation_errors = vec![];
     let mut correct_first_word_predictions = 0;
@@ -382,7 +428,8 @@ fn validate_embeddings(
     }
 
     let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
-        / total_first_word_predictions as NodeValue;
+        / total_first_word_predictions.max(1) as NodeValue;
+
     Ok((validation_errors, predictions_pct))
 }
 
@@ -399,7 +446,6 @@ pub fn split_training_and_testing(
 
 pub fn read_model_from_disk(
     file_path: &str,
-    rng: Rc<dyn RNG>,
 ) -> Result<(String, TrainEmbeddingConfig, TrainerStateMetadata)> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
@@ -424,8 +470,6 @@ pub fn write_model_to_disk(
     output_dir: &Option<String>,
     output_label: &Option<String>,
 ) {
-    use itertools::Itertools;
-
     let snapshot = embedding.snapshot().unwrap();
     let mut snapshot: Value = serde_json::from_str(&snapshot).unwrap();
 
@@ -453,8 +497,6 @@ pub fn write_embedding_tsv_to_disk(
     output_dir: &Option<String>,
     output_label: &Option<String>,
 ) {
-    use itertools::Itertools;
-
     let vocab = embedding.vocab().keys().cloned().collect::<Vec<_>>();
 
     let fpath_vectors = output::create_output_fpath(
@@ -490,8 +532,6 @@ pub fn write_embedding_tsv_to_disk(
 }
 
 pub fn write_results_to_disk(embedding: &Embedding, label: &str) {
-    use itertools::Itertools;
-
     let vocab = embedding.vocab().keys().cloned().collect::<HashSet<_>>();
 
     let fpath_nearest =

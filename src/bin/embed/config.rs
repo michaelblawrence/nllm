@@ -11,8 +11,8 @@ pub struct TrainEmbeddingConfig {
     #[arg(short = 'h', long, default_value_t = 75)]
     pub hidden_layer_nodes: usize,
 
-    #[arg(short = 'H', long, default_value_t = 0)]
-    pub hidden_deep_layer_nodes: usize,
+    #[arg(short = 'H', long, default_value = None)]
+    pub hidden_deep_layer_nodes: Option<usize>,
 
     #[arg(short = 'c', long, default_value_t = 1000)]
     pub training_rounds: usize,
@@ -22,6 +22,14 @@ pub struct TrainEmbeddingConfig {
 
     #[arg(short = 'b', long, default_value_t = 16)]
     pub batch_size: usize,
+
+    #[arg(short = 'i', long, default_value_t = false)]
+    #[serde(default)]
+    pub single_batch_iterations: bool,
+
+    #[arg(short = 'C', long = "char", default_value_t = false)]
+    #[serde(default)]
+    pub use_character_tokens: bool,
 
     #[arg(short = 'r', long, default_value_t = 1e-3)]
     pub train_rate: NodeValue,
@@ -57,6 +65,15 @@ pub struct TrainEmbeddingConfig {
 #[derive(Args, Debug, Clone)]
 pub struct LoadEmbeddingConfig {
     pub file_path: String,
+
+    #[arg(short = 'h', long, default_value = None)]
+    pub hidden_layer_nodes: Option<usize>,
+
+    #[arg(short = 'H', long, default_value = None)]
+    pub hidden_deep_layer_nodes: Option<usize>,
+
+    #[arg(short = 'w', long, default_value = None)]
+    pub input_stride_width: Option<usize>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -91,9 +108,9 @@ where
     T: std::str::FromStr,
     T::Err: std::error::Error + Send + Sync + 'static,
 {
-    let pos = s
-        .find("..")
-        .ok_or_else(|| format!("invalid KEY=value: no `..=` found in `{s}`"))?;
+    let pos = s.find("..");
+    let pos = pos.ok_or_else(|| format!("invalid KEY=value: no `..` found in `{s}`"))?;
+
     let range = (s[..pos].parse()?, s[pos + 2..].parse()?);
     Ok(range)
 }

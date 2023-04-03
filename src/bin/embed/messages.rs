@@ -1,12 +1,22 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
-use std::sync::{
-    mpsc::{self, Receiver, Sender},
-    Arc,
+use std::{
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
-use plane::ml::{embeddings::Embedding, NodeValue};
+use plane::ml::{
+    embeddings::{Embedding, EmbeddingBuilder},
+    NodeValue, JsRng, RNG,
+};
+
+use crate::training;
 
 pub enum TrainerMessage {
     PrintStatus,
@@ -23,6 +33,69 @@ pub enum TrainerMessage {
     TogglePause,
     Halt,
     ReplaceEmbeddingState(String, TrainerStateMetadata),
+    SuppressAutoPrintStatus,
+}
+
+impl TrainerMessage {
+    pub fn apply(
+        self,
+        embedding: &Embedding,
+        config: &crate::config::TrainEmbeddingConfig,
+    ) -> TrainerHandleActions {
+        match self {
+            TrainerMessage::PrintStatus => TrainerHandleActions::PrintStatus,
+            TrainerMessage::Halt => TrainerHandleActions::Halt,
+            TrainerMessage::TogglePause => TrainerHandleActions::TogglePause,
+            TrainerMessage::TogglePrintAllStatus => TrainerHandleActions::TogglePrintAllStatus,
+            TrainerMessage::ReloadFromSnapshot => TrainerHandleActions::ReloadFromSnapshot,
+            TrainerMessage::ForceSnapshot => TrainerHandleActions::ForceSnapshot,
+            TrainerMessage::SuppressAutoPrintStatus => {
+                TrainerHandleActions::SuppressAutoPrintStatus
+            }
+            TrainerMessage::IncreaseMaxRounds(x) => TrainerHandleActions::IncreaseMaxRounds(x),
+            TrainerMessage::MultiplyLearnRateBy(x) => TrainerHandleActions::LearnRateMulMut(x),
+            TrainerMessage::ReplaceEmbeddingState(embedding, state) => {
+                TrainerHandleActions::ReplaceEmbeddingState(embedding, state)
+            }
+            TrainerMessage::WriteModelToDisk => {
+                TrainerHandleActions::DispatchWithMetadata(Arc::new(|x| {
+                    TrainerMessage::WriteModelAndMetadataToDisk(x)
+                }))
+            }
+            TrainerMessage::WriteModelAndMetadataToDisk(metadata) => {
+                training::write_model_to_disk(
+                    &embedding,
+                    &config,
+                    &metadata,
+                    "embed",
+                    &config.output_dir,
+                    &config.output_label,
+                );
+                TrainerHandleActions::Nothing
+            }
+            TrainerMessage::WriteStatsToDisk => {
+                training::write_results_to_disk(&embedding, "embed");
+                TrainerHandleActions::Nothing
+            }
+            TrainerMessage::WriteEmbeddingTsvToDisk => {
+                training::write_embedding_tsv_to_disk(
+                    &embedding,
+                    "embed",
+                    &config.output_dir,
+                    &config.output_label,
+                );
+                TrainerHandleActions::Nothing
+            }
+            TrainerMessage::PredictRandomPhrase => {
+                let vocab_idx = JsRng::default().rand_range(0, embedding.vocab().len());
+                let seed_word = embedding.vocab().keys().nth(vocab_idx).unwrap();
+                let sep = if config.use_character_tokens { "" } else { " " };
+                let predicted_phrase = embedding.predict_iter(seed_word).join(sep);
+                info!("Predicted a new random phrase:  {}", predicted_phrase);
+                TrainerHandleActions::Nothing
+            }
+        }
+    }
 }
 
 pub enum TrainerHandleActions {
@@ -37,6 +110,102 @@ pub enum TrainerHandleActions {
     PrintStatus,
     Halt,
     ReplaceEmbeddingState(String, TrainerStateMetadata),
+    SuppressAutoPrintStatus,
+}
+
+impl TrainerHandleActions {
+    pub fn apply<F>(
+        self,
+        state: &mut crate::training::TrainerState,
+        handle: &TrainerHandle<TrainerMessage, F>,
+    ) where
+        F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions,
+    {
+        match self {
+            TrainerHandleActions::Nothing => (),
+            TrainerHandleActions::LearnRateMulMut(factor) => {
+                let old_learn_rate = state.learn_rate;
+                state.learn_rate *= factor;
+                let learn_rate = state.learn_rate;
+                info!("Changed learn rate from {old_learn_rate} to {learn_rate}");
+            }
+            TrainerHandleActions::TogglePrintAllStatus => {
+                state.force_report_all = !state.force_report_all
+            }
+            TrainerHandleActions::TogglePause => {
+                state.paused = !state.paused;
+                if state.paused {
+                    info!("Pausing rounds run, pausing...");
+                } else {
+                    info!("Resuming rounds run, starting...");
+                }
+            }
+            TrainerHandleActions::IncreaseMaxRounds(rounds) => {
+                let old_training_rounds = state.training_rounds;
+                state.training_rounds += rounds;
+                let training_rounds = state.training_rounds;
+                info!(
+                    "Changed max training rounds from {old_training_rounds} to {training_rounds}"
+                );
+                if state.paused {
+                    info!("Resuming rounds run, starting...");
+                    state.paused = false;
+                }
+            }
+            TrainerHandleActions::ReloadFromSnapshot => {
+                if let Some(snapshot) = &state.snapshot.0 {
+                    info!("Recovering state from snapshot, pausing...");
+                    let rng = state.rng.clone();
+                    state.embedding = Embedding::from_snapshot(&snapshot, rng).unwrap();
+                    state.paused = true;
+                } else {
+                    info!("No snapshot found to recover state from, continuing...");
+                }
+            }
+            TrainerHandleActions::ForceSnapshot => {
+                let json = state.embedding.snapshot().unwrap();
+                state.snapshot = (Some(json), Instant::now());
+                info!("Forced snapshot save to memory");
+            }
+            TrainerHandleActions::PrintStatus => state.force_report = true,
+            TrainerHandleActions::SuppressAutoPrintStatus => {
+                state.supress_auto_report = !state.supress_auto_report
+            }
+            TrainerHandleActions::Halt => {
+                state.force_report = true;
+                state.halt = true;
+            }
+            TrainerHandleActions::DispatchWithMetadata(factory_fn) => {
+                let factory_fn = factory_fn.as_ref();
+                let metadata = state.metadata();
+                let message = factory_fn(metadata);
+                handle.send(message).unwrap();
+            }
+            TrainerHandleActions::ReplaceEmbeddingState(snapshot, new_state) => {
+                let rng = state.rng.clone();
+                let new_embedding = EmbeddingBuilder::from_snapshot(&snapshot, rng)
+                    .unwrap()
+                    .with_hidden_layer_custom_shape(state.hidden_layer_shape())
+                    .with_input_stride_width(state.input_stride_width())
+                    .build();
+
+                if new_embedding.shape() != state.embedding.shape() {
+                    let mut new_shape = new_embedding.shape().iter().map(|x| x.node_count());
+                    let new_shape = new_shape.join(" -> ");
+                    info!("Built new hidden model from restored snapshot embedding data with shape = ({})", new_shape);
+                }
+
+                state.embedding = new_embedding;
+                state.round = new_state.current_round;
+                state.training_rounds = new_state.training_rounds;
+                state.learn_rate = new_state.learn_rate;
+
+                state.last_report = None;
+                state.paused = true;
+                info!("Restored loaded model and state, pausing...");
+            }
+        }
+    }
 }
 
 pub struct TrainerHandle<Message: Send, F> {
@@ -58,6 +227,16 @@ where
 
     pub fn send(&self, t: Message) -> Result<(), mpsc::SendError<Message>> {
         self.tx.send(t)
+    }
+
+    pub fn try_recv(&self, timeout: Option<Duration>) -> Result<Message> {
+        match timeout {
+            Some(timeout) => self
+                .rx
+                .recv_timeout(timeout)
+                .context("failed to recv message"),
+            None => self.rx.try_recv().context("failed to recv message"),
+        }
     }
 }
 
