@@ -12,13 +12,14 @@ use std::{
 };
 
 use plane::ml::{
-    embeddings::{Embedding, EmbeddingBuilder},
-    NodeValue, JsRng, RNG,
+    embeddings::{builder::EmbeddingBuilder, Embedding},
+    JsRng, NodeValue, RNG,
 };
 
 use crate::training;
 
 pub enum TrainerMessage {
+    PrintTrainingStatus,
     PrintStatus,
     TogglePrintAllStatus,
     ReloadFromSnapshot,
@@ -43,6 +44,7 @@ impl TrainerMessage {
         config: &crate::config::TrainEmbeddingConfig,
     ) -> TrainerHandleActions {
         match self {
+            TrainerMessage::PrintTrainingStatus => TrainerHandleActions::PrintTrainingStatus,
             TrainerMessage::PrintStatus => TrainerHandleActions::PrintStatus,
             TrainerMessage::Halt => TrainerHandleActions::Halt,
             TrainerMessage::TogglePause => TrainerHandleActions::TogglePause,
@@ -63,7 +65,7 @@ impl TrainerMessage {
                 }))
             }
             TrainerMessage::WriteModelAndMetadataToDisk(metadata) => {
-                training::write_model_to_disk(
+                training::writer::write_model_to_disk(
                     &embedding,
                     &config,
                     &metadata,
@@ -74,11 +76,11 @@ impl TrainerMessage {
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::WriteStatsToDisk => {
-                training::write_results_to_disk(&embedding, "embed");
+                training::writer::write_results_to_disk(&embedding, "embed");
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::WriteEmbeddingTsvToDisk => {
-                training::write_embedding_tsv_to_disk(
+                training::writer::write_embedding_tsv_to_disk(
                     &embedding,
                     "embed",
                     &config.output_dir,
@@ -107,6 +109,7 @@ pub enum TrainerHandleActions {
     TogglePrintAllStatus,
     ReloadFromSnapshot,
     ForceSnapshot,
+    PrintTrainingStatus,
     PrintStatus,
     Halt,
     ReplaceEmbeddingState(String, TrainerStateMetadata),
@@ -116,7 +119,7 @@ pub enum TrainerHandleActions {
 impl TrainerHandleActions {
     pub fn apply<F>(
         self,
-        state: &mut crate::training::TrainerState,
+        state: &mut training::TrainerState,
         handle: &TrainerHandle<TrainerMessage, F>,
     ) where
         F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions,
@@ -156,8 +159,11 @@ impl TrainerHandleActions {
                 if let Some(snapshot) = &state.snapshot.0 {
                     info!("Recovering state from snapshot, pausing...");
                     let rng = state.rng.clone();
-                    state.embedding = Embedding::from_snapshot(&snapshot, rng).unwrap();
                     state.paused = true;
+                    state.embedding = EmbeddingBuilder::from_snapshot(&snapshot, rng)
+                        .unwrap()
+                        .build()
+                        .unwrap();
                 } else {
                     info!("No snapshot found to recover state from, continuing...");
                 }
@@ -167,13 +173,14 @@ impl TrainerHandleActions {
                 state.snapshot = (Some(json), Instant::now());
                 info!("Forced snapshot save to memory");
             }
-            TrainerHandleActions::PrintStatus => state.force_report = true,
+            TrainerHandleActions::PrintTrainingStatus => state.trigger_round_report_train_set(),
+            TrainerHandleActions::PrintStatus => state.trigger_round_report_test_set(),
             TrainerHandleActions::SuppressAutoPrintStatus => {
                 state.supress_auto_report = !state.supress_auto_report
             }
             TrainerHandleActions::Halt => {
-                state.force_report = true;
-                state.halt = true;
+                state.trigger_round_report_test_set();
+                state.halt();
             }
             TrainerHandleActions::DispatchWithMetadata(factory_fn) => {
                 let factory_fn = factory_fn.as_ref();
@@ -183,24 +190,22 @@ impl TrainerHandleActions {
             }
             TrainerHandleActions::ReplaceEmbeddingState(snapshot, new_state) => {
                 let rng = state.rng.clone();
-                let new_embedding = EmbeddingBuilder::from_snapshot(&snapshot, rng)
+                let (new_embedding, build_ctx) = EmbeddingBuilder::from_snapshot(&snapshot, rng)
                     .unwrap()
                     .with_hidden_layer_custom_shape(state.hidden_layer_shape())
                     .with_input_stride_width(state.input_stride_width())
-                    .build();
+                    .build_advanced()
+                    .unwrap();
 
-                if new_embedding.shape() != state.embedding.shape() {
-                    let mut new_shape = new_embedding.shape().iter().map(|x| x.node_count());
-                    let new_shape = new_shape.join(" -> ");
-                    info!("Built new hidden model from restored snapshot embedding data with shape = ({})", new_shape);
+                if build_ctx.rebuilt_network {
+                    let old_shape = state.embedding.shape().desc_pretty();
+                    let new_shape = new_embedding.shape().desc_pretty();
+                    info!("Built new hidden model from restored snapshot embedding data with shape = [{}] (previously [{}])",
+                        new_shape, old_shape
+                    );
                 }
 
-                state.embedding = new_embedding;
-                state.round = new_state.current_round;
-                state.training_rounds = new_state.training_rounds;
-                state.learn_rate = new_state.learn_rate;
-
-                state.last_report = None;
+                state.set_embedding(new_embedding, &new_state);
                 state.paused = true;
                 info!("Restored loaded model and state, pausing...");
             }

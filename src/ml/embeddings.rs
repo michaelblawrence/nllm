@@ -12,9 +12,8 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::{
-    BatchSamplingStrategy, JsRng, LayerInitStrategy, LayerShape, LayerValues, Network,
-    NetworkActivationMode, NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, ShuffleRng,
-    RNG,
+    BatchSamplingStrategy, JsRng, LayerValues, Network, NetworkActivationMode,
+    NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, ShuffleRng, RNG,
 };
 
 pub struct Embedding {
@@ -33,20 +32,16 @@ impl Embedding {
         hidden_layer_shape: Vec<usize>,
         rng: Rc<dyn RNG>,
     ) -> Self {
-        EmbeddingBuilder::new(vocab, rng)
+        builder::EmbeddingBuilder::new(vocab, rng)
             .with_embedding_dimensions(embedding_dimensions)
             .with_input_stride_width(input_stride_width)
             .with_hidden_layer_custom_shape(hidden_layer_shape)
             .build()
+            .unwrap()
     }
 
-    pub fn new_builder(vocab: HashSet<String>, rng: Rc<dyn RNG>) -> EmbeddingBuilder {
-        EmbeddingBuilder::new(vocab, rng)
-    }
-
-    pub fn from_snapshot(json: &str, rng: Rc<dyn RNG>) -> Result<Self> {
-        let embedding = EmbeddingBuilder::from_snapshot(json, rng)?.build();
-        Ok(embedding)
+    pub fn new_builder(vocab: HashSet<String>, rng: Rc<dyn RNG>) -> builder::EmbeddingBuilder {
+        builder::EmbeddingBuilder::new(vocab, rng)
     }
 
     pub fn embedding_from_snapshot(json: &str, rng: Rc<dyn RNG>) -> Result<Self> {
@@ -501,270 +496,313 @@ impl Deref for TrainBatchConfig {
     }
 }
 
-#[derive(Clone)]
-pub struct EmbeddingBuilder {
-    vocab: HashSet<String>,
-    override_vocab: Option<HashMap<String, usize>>,
-    override_network: Option<Network>,
-    override_embeddings_layer: Option<LayerValues>,
-    activation_mode: NetworkActivationMode,
-    embedding_dimensions: usize,
-    input_stride_width: usize,
-    hidden_layer_shape: Vec<usize>,
-    hidden_layer_init_stratergy: LayerInitStrategy,
-    rng: Rc<dyn RNG>,
-}
+pub mod builder {
+    use std::{
+        collections::{HashMap, HashSet},
+        rc::Rc,
+    };
 
-impl Default for EmbeddingBuilder {
-    fn default() -> Self {
-        let rng = Rc::new(JsRng::default());
-        Self {
-            vocab: Default::default(),
-            override_vocab: None,
-            override_network: None,
-            override_embeddings_layer: None,
-            activation_mode: NetworkActivationMode::Tanh,
-            embedding_dimensions: 2,
-            input_stride_width: 1,
-            hidden_layer_shape: vec![10],
-            hidden_layer_init_stratergy: LayerInitStrategy::ScaledFullRandom,
-            rng,
-        }
-    }
-}
+    use anyhow::{Context, Result};
+    use serde_json::Value;
 
-impl EmbeddingBuilder {
-    pub fn new(vocab: HashSet<String>, rng: Rc<dyn RNG>) -> Self {
-        Self {
-            vocab,
-            rng,
-            ..Default::default()
-        }
-    }
+    use crate::ml::{
+        JsRng, LayerInitStrategy, LayerShape, LayerValues, Network, NetworkActivationMode,
+        NetworkShape, RNG,
+    };
 
-    pub fn from_snapshot(json: &str, rng: Rc<dyn RNG>) -> Result<Self> {
-        let value: Value = serde_json::from_str(json)?;
+    use super::{Embedding, CONTROL_VOCAB};
 
-        let network = value
-            .get("network")
-            .context("provided json should contain network field")?;
-        let network = serde_json::from_value(network.clone())?;
-
-        let vocab = value
-            .get("vocab")
-            .context("provided json should contain vocab field")?;
-        let vocab = serde_json::from_value(vocab.clone())?;
-
-        let input_stride_width = Self::input_stride_width(&network);
-        let hidden_layer_shape = Self::hidden_layer_shape_from_network(&network);
-        let hidden_layer_shape = hidden_layer_shape.map(|shape| shape.node_count()).collect();
-
-        let default_builder = Self::default();
-        let embedding_dimensions = Self::embedding_dimensions(&network);
-        let embedding_dimensions =
-            embedding_dimensions.unwrap_or(default_builder.embedding_dimensions);
-
-        Ok(Self {
-            override_vocab: Some(vocab),
-            override_network: Some(network),
-            input_stride_width: input_stride_width.unwrap_or(1),
-            embedding_dimensions,
-            hidden_layer_shape,
-            rng,
-            ..default_builder
-        })
-    }
-
-    pub fn from_existing(embedding: &Embedding) -> Result<Self> {
-        let vocab = embedding.vocab.clone();
-        let embeddings_layer = embedding.flatten_embeddings()?;
-        let input_stride_width = Self::input_stride_width(&embedding.network);
-        let hidden_layer_shape = Self::hidden_layer_shape_from_network(&embedding.network);
-        let hidden_layer_shape = hidden_layer_shape.map(|shape| shape.node_count()).collect();
-        let rng = embedding.rng.clone();
-
-        let default_builder = Self::default();
-        let embedding_dimensions = Self::embedding_dimensions(&embedding.network);
-        let embedding_dimensions =
-            embedding_dimensions.unwrap_or(default_builder.embedding_dimensions);
-
-        Ok(Self {
-            override_vocab: Some(vocab),
-            override_embeddings_layer: Some(embeddings_layer),
-            input_stride_width: input_stride_width.unwrap_or(1),
-            embedding_dimensions,
-            hidden_layer_shape,
-            rng,
-            ..default_builder
-        })
-    }
-
-    pub fn build(self) -> Embedding {
-        let vocab: HashMap<_, _> = match self.override_vocab {
-            Some(vocab) => vocab,
-            None => {
-                let ordered_vocab = {
-                    let mut v = self.vocab.into_iter().collect::<Vec<_>>();
-                    v.sort();
-                    v
-                };
-
-                [CONTROL_VOCAB.to_string()]
-                    .into_iter()
-                    .chain(ordered_vocab.into_iter())
-                    .enumerate()
-                    .map(|(i, word)| (word, i))
-                    .collect()
-            }
-        };
-
-        let (override_network, override_embeddings_layer) = match self.override_network {
-            Some(network)
-                if Self::is_distinct_layer_shape(
-                    &self.hidden_layer_shape,
-                    self.input_stride_width,
-                    &network,
-                ) =>
-            {
-                let embeddings_layer = Embedding::flatten_embeddings_from_network(&network);
-                let embeddings_layer = embeddings_layer.expect("should get embedding layer");
-
-                (None, Some(embeddings_layer))
-            }
-            Some(network) => (Some(network), None),
-            None => (None, self.override_embeddings_layer),
-        };
-
-        let network = match override_network {
-            Some(network) => network,
-            None => {
-                let embedding_layer_shape = Self::build_embedding_layer_shape(
-                    self.embedding_dimensions,
-                    self.input_stride_width,
-                    override_embeddings_layer,
-                );
-
-                let network_shape = Self::build_shape(
-                    vocab.len(),
-                    embedding_layer_shape,
-                    self.hidden_layer_shape,
-                    self.hidden_layer_init_stratergy,
-                    self.activation_mode,
-                );
-                Network::new(network_shape)
-            }
-        };
-
-        Embedding {
-            network,
-            vocab,
-            rng: self.rng,
-        }
-    }
-
-    fn build_shape(
-        token_count: usize,
-        embedding_layer_shape: LayerShape,
-        hidden_layer_shape: Vec<usize>,
-        hidden_layer_init_strategy: LayerInitStrategy,
+    #[derive(Clone)]
+    pub struct EmbeddingBuilder {
+        vocab: HashSet<String>,
+        override_vocab: Option<HashMap<String, usize>>,
+        override_network: Option<Network>,
+        override_embeddings_layer: Option<LayerValues>,
         activation_mode: NetworkActivationMode,
-    ) -> NetworkShape {
-        let strategy = hidden_layer_init_strategy;
-        let final_layer: LayerShape = (token_count, strategy.clone()).into();
-        let hidden_layer_shape = hidden_layer_shape.into_iter();
-
-        let layers_shape = [embedding_layer_shape]
-            .into_iter()
-            .chain(hidden_layer_shape.map(|n| (n, strategy.clone()).into()))
-            .chain([final_layer.with_activation_mode(NetworkActivationMode::SoftMax)])
-            .collect();
-
-        NetworkShape::new_custom(token_count, layers_shape, activation_mode)
-    }
-
-    fn build_embedding_layer_shape(
-        embedding_size: usize,
-        embedding_stride: usize,
-        embedding_layer_weights: Option<LayerValues>,
-    ) -> LayerShape {
-        let init_strategy = match embedding_layer_weights {
-            Some(weights) => LayerInitStrategy::NoBiasCopied(weights),
-            None => LayerInitStrategy::NoBias,
-        };
-
-        LayerShape::new(
-            embedding_size,
-            init_strategy,
-            Some(embedding_stride),
-            Some(NetworkActivationMode::Linear),
-        )
-    }
-
-    pub fn with_activation_mode(mut self, activation_mode: NetworkActivationMode) -> Self {
-        self.activation_mode = activation_mode;
-        self
-    }
-
-    pub fn with_embedding_dimensions(mut self, embedding_dimensions: usize) -> Self {
-        self.embedding_dimensions = embedding_dimensions;
-        self
-    }
-
-    pub fn with_input_stride_width(mut self, input_stride_width: usize) -> Self {
-        self.input_stride_width = input_stride_width;
-        self
-    }
-
-    pub fn with_hidden_layer_custom_shape(mut self, hidden_layer_shape: Vec<usize>) -> Self {
-        self.hidden_layer_shape = hidden_layer_shape;
-        self
-    }
-
-    pub fn with_hidden_layer_size(mut self, hidden_layer_size: usize) -> Self {
-        self.hidden_layer_shape = vec![hidden_layer_size];
-        self
-    }
-
-    pub fn with_hidden_layer_init_stratergy(
-        mut self,
-        hidden_layer_init_stratergy: LayerInitStrategy,
-    ) -> Self {
-        self.hidden_layer_init_stratergy = hidden_layer_init_stratergy;
-        self
-    }
-
-    fn is_distinct_layer_shape(
-        self_hidden_layer_shape: &Vec<usize>,
+        embedding_dimensions: usize,
         input_stride_width: usize,
-        network: &Network,
-    ) -> bool {
-        match Self::input_stride_width(&network) {
-            Some(stride_count) if stride_count != input_stride_width => true,
-            _ => {
-                let ref_hidden_layer_shape = Self::hidden_layer_shape_from_network(network);
-                let ref_hidden_layer_shape =
-                    ref_hidden_layer_shape.take(self_hidden_layer_shape.len());
-                let ref_hidden_layer_shape = ref_hidden_layer_shape.map(|shape| shape.node_count());
+        hidden_layer_shape: Vec<usize>,
+        hidden_layer_init_stratergy: LayerInitStrategy,
+        rng: Rc<dyn RNG>,
+    }
 
-                !ref_hidden_layer_shape.eq(self_hidden_layer_shape.iter().cloned())
+    impl Default for EmbeddingBuilder {
+        fn default() -> Self {
+            let rng = Rc::new(JsRng::default());
+            Self {
+                vocab: Default::default(),
+                override_vocab: None,
+                override_network: None,
+                override_embeddings_layer: None,
+                activation_mode: NetworkActivationMode::Tanh,
+                embedding_dimensions: 2,
+                input_stride_width: 1,
+                hidden_layer_shape: vec![10],
+                hidden_layer_init_stratergy: LayerInitStrategy::ScaledFullRandom,
+                rng,
             }
         }
     }
 
-    fn input_stride_width(network: &Network) -> Option<usize> {
-        network.shape().iter().nth(1).map(|x| x.stride_count())
+    impl EmbeddingBuilder {
+        pub fn new(vocab: HashSet<String>, rng: Rc<dyn RNG>) -> Self {
+            Self {
+                vocab,
+                rng,
+                ..Default::default()
+            }
+        }
+
+        pub fn from_snapshot(json: &str, rng: Rc<dyn RNG>) -> Result<Self> {
+            let value: Value = serde_json::from_str(json)?;
+
+            let network = value
+                .get("network")
+                .context("provided json should contain network field")?;
+            let network = serde_json::from_value(network.clone())?;
+
+            let vocab = value
+                .get("vocab")
+                .context("provided json should contain vocab field")?;
+            let vocab = serde_json::from_value(vocab.clone())?;
+
+            let input_stride_width = Self::input_stride_width(&network);
+            let hidden_layer_shape = Self::hidden_layer_shape_from_network(&network);
+            let hidden_layer_shape = hidden_layer_shape.map(|shape| shape.node_count()).collect();
+
+            let default_builder = Self::default();
+            let embedding_dimensions = Self::embedding_dimensions(&network);
+            let embedding_dimensions =
+                embedding_dimensions.unwrap_or(default_builder.embedding_dimensions);
+
+            Ok(Self {
+                override_vocab: Some(vocab),
+                override_network: Some(network),
+                input_stride_width: input_stride_width.unwrap_or(1),
+                embedding_dimensions,
+                hidden_layer_shape,
+                rng,
+                ..default_builder
+            })
+        }
+
+        pub fn from_existing(embedding: &Embedding) -> Result<Self> {
+            let vocab = embedding.vocab.clone();
+            let embeddings_layer = embedding.flatten_embeddings()?;
+            let input_stride_width = Self::input_stride_width(&embedding.network);
+            let hidden_layer_shape = Self::hidden_layer_shape_from_network(&embedding.network);
+            let hidden_layer_shape = hidden_layer_shape.map(|shape| shape.node_count()).collect();
+            let rng = embedding.rng.clone();
+
+            let default_builder = Self::default();
+            let embedding_dimensions = Self::embedding_dimensions(&embedding.network);
+            let embedding_dimensions =
+                embedding_dimensions.unwrap_or(default_builder.embedding_dimensions);
+
+            Ok(Self {
+                override_vocab: Some(vocab),
+                override_embeddings_layer: Some(embeddings_layer),
+                input_stride_width: input_stride_width.unwrap_or(1),
+                embedding_dimensions,
+                hidden_layer_shape,
+                rng,
+                ..default_builder
+            })
+        }
+
+        pub fn build(self) -> Result<Embedding> {
+            let (embedding, _) = self.build_advanced()?;
+            Ok(embedding)
+        }
+
+        pub fn build_advanced(self) -> Result<(Embedding, BuilderContext)> {
+            let mut context = BuilderContext::default();
+
+            let vocab: HashMap<_, _> = match self.override_vocab {
+                Some(vocab) => {
+                    context.restored_exact_vocab = true;
+                    vocab
+                }
+                None => {
+                    let ordered_vocab = {
+                        let mut v = self.vocab.into_iter().collect::<Vec<_>>();
+                        v.sort();
+                        v
+                    };
+
+                    [CONTROL_VOCAB.to_string()]
+                        .into_iter()
+                        .chain(ordered_vocab.into_iter())
+                        .enumerate()
+                        .map(|(i, word)| (word, i))
+                        .collect()
+                }
+            };
+
+            let (override_network, override_embeddings_layer) = match self.override_network {
+                Some(network)
+                    if Self::is_distinct_layer_shape(
+                        &self.hidden_layer_shape,
+                        self.input_stride_width,
+                        &network,
+                    ) =>
+                {
+                    let embeddings_layer = Embedding::flatten_embeddings_from_network(&network);
+                    let embeddings_layer =
+                        embeddings_layer.context("should get embedding layer")?;
+                    context.rebuilt_network = true;
+
+                    (None, Some(embeddings_layer))
+                }
+                Some(network) => (Some(network), None),
+                None => (None, self.override_embeddings_layer),
+            };
+
+            let network = match override_network {
+                Some(network) => {
+                    context.restored_exact_network = true;
+                    network
+                }
+                None => {
+                    let embedding_layer_shape = Self::build_embedding_layer_shape(
+                        self.embedding_dimensions,
+                        self.input_stride_width,
+                        override_embeddings_layer,
+                    );
+
+                    let network_shape = Self::build_shape(
+                        vocab.len(),
+                        embedding_layer_shape,
+                        self.hidden_layer_shape,
+                        self.hidden_layer_init_stratergy,
+                        self.activation_mode,
+                    );
+                    Network::new(network_shape)
+                }
+            };
+
+            let embedding = Embedding {
+                network,
+                vocab,
+                rng: self.rng,
+            };
+
+            Ok((embedding, context))
+        }
+
+        fn build_shape(
+            token_count: usize,
+            embedding_layer_shape: LayerShape,
+            hidden_layer_shape: Vec<usize>,
+            hidden_layer_init_strategy: LayerInitStrategy,
+            activation_mode: NetworkActivationMode,
+        ) -> NetworkShape {
+            let strategy = hidden_layer_init_strategy;
+            let final_layer_strategy = LayerInitStrategy::ScaledFullRandomZeroBias;
+            let final_layer: LayerShape = (token_count, final_layer_strategy).into();
+            let hidden_layer_shape = hidden_layer_shape.into_iter();
+
+            let layers_shape = [embedding_layer_shape]
+                .into_iter()
+                .chain(hidden_layer_shape.map(|n| (n, strategy.clone()).into()))
+                .chain([final_layer.with_activation_mode(NetworkActivationMode::SoftMax)])
+                .collect();
+
+            NetworkShape::new_custom(token_count, layers_shape, activation_mode)
+        }
+
+        fn build_embedding_layer_shape(
+            embedding_size: usize,
+            embedding_stride: usize,
+            embedding_layer_weights: Option<LayerValues>,
+        ) -> LayerShape {
+            let init_strategy = match embedding_layer_weights {
+                Some(weights) => LayerInitStrategy::NoBiasCopied(weights),
+                None => LayerInitStrategy::NoBias,
+            };
+
+            LayerShape::new(
+                embedding_size,
+                init_strategy,
+                Some(embedding_stride),
+                Some(NetworkActivationMode::Linear),
+            )
+        }
+
+        pub fn with_activation_mode(mut self, activation_mode: NetworkActivationMode) -> Self {
+            self.activation_mode = activation_mode;
+            self
+        }
+
+        pub fn with_embedding_dimensions(mut self, embedding_dimensions: usize) -> Self {
+            self.embedding_dimensions = embedding_dimensions;
+            self
+        }
+
+        pub fn with_input_stride_width(mut self, input_stride_width: usize) -> Self {
+            self.input_stride_width = input_stride_width;
+            self
+        }
+
+        pub fn with_hidden_layer_custom_shape(mut self, hidden_layer_shape: Vec<usize>) -> Self {
+            self.hidden_layer_shape = hidden_layer_shape;
+            self
+        }
+
+        pub fn with_hidden_layer_size(mut self, hidden_layer_size: usize) -> Self {
+            self.hidden_layer_shape = vec![hidden_layer_size];
+            self
+        }
+
+        pub fn with_hidden_layer_init_stratergy(
+            mut self,
+            hidden_layer_init_stratergy: LayerInitStrategy,
+        ) -> Self {
+            self.hidden_layer_init_stratergy = hidden_layer_init_stratergy;
+            self
+        }
+
+        fn is_distinct_layer_shape(
+            self_hidden_layer_shape: &Vec<usize>,
+            input_stride_width: usize,
+            network: &Network,
+        ) -> bool {
+            match Self::input_stride_width(&network) {
+                Some(stride_count) if stride_count != input_stride_width => true,
+                _ => {
+                    let ref_hidden_layer_shape = Self::hidden_layer_shape_from_network(network);
+                    let ref_hidden_layer_shape =
+                        ref_hidden_layer_shape.take(self_hidden_layer_shape.len());
+                    let ref_hidden_layer_shape =
+                        ref_hidden_layer_shape.map(|shape| shape.node_count());
+
+                    !ref_hidden_layer_shape.eq(self_hidden_layer_shape.iter().cloned())
+                }
+            }
+        }
+
+        fn input_stride_width(network: &Network) -> Option<usize> {
+            network.shape().iter().nth(1).map(|x| x.stride_count())
+        }
+
+        fn embedding_dimensions(network: &Network) -> Option<usize> {
+            network.shape().iter().nth(1).map(|x| x.node_count())
+        }
+
+        fn hidden_layer_shape_from_network<'a>(
+            network: &'a Network,
+        ) -> impl Iterator<Item = LayerShape> + 'a {
+            let shape = &network.shape();
+            let hidden_layer_len = shape.len() - 1;
+            shape.iter().skip(2).take(hidden_layer_len)
+        }
     }
 
-    fn embedding_dimensions(network: &Network) -> Option<usize> {
-        network.shape().iter().nth(1).map(|x| x.node_count())
-    }
-
-    fn hidden_layer_shape_from_network<'a>(
-        network: &'a Network,
-    ) -> impl Iterator<Item = LayerShape> + 'a {
-        let shape = &network.shape();
-        let hidden_layer_len = shape.len() - 1;
-        shape.iter().skip(2).take(hidden_layer_len)
+    #[derive(Clone, Default)]
+    pub struct BuilderContext {
+        pub rebuilt_network: bool,
+        pub restored_exact_network: bool,
+        pub restored_exact_vocab: bool,
     }
 }
 
@@ -1028,7 +1066,8 @@ mod tests {
                 .with_hidden_layer_size(config.hidden_layer_nodes)
                 .with_input_stride_width(config.input_stride_width)
                 .with_activation_mode(config.activation_mode)
-                .build();
+                .build()
+                .unwrap();
 
             let mut seen_pairs = HashSet::new();
             let mut last_report_time: Option<(Instant, usize)> = None;

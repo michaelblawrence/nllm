@@ -1,12 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{BufReader, Write},
     rc::Rc,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
 use itertools::Itertools;
 use plane::ml::{
     embeddings::{Embedding, TrainBatchConfig},
@@ -25,37 +23,33 @@ use crate::{
 
 pub struct TrainerState {
     pub embedding: Embedding,
-    pub batch_size: TrainBatchConfig,
     pub learn_rate: f64,
     pub training_rounds: usize,
     pub supress_auto_report: bool,
-    pub force_report: bool,
     pub force_report_all: bool,
     pub snapshot: (Option<String>, Instant),
     pub last_report: Option<(Instant, TrainerReport)>,
     pub paused: bool,
-    pub halt: bool,
     pub round: usize,
     pub rng: Rc<dyn RNG>,
+    halt: bool,
+    force_report_test_set: bool,
+    force_report_train_set: bool,
     inital_config: TrainEmbeddingConfig,
 }
 
 impl TrainerState {
     fn new(embedding: Embedding, config: &TrainEmbeddingConfig, rng: Rc<dyn RNG>) -> Self {
-        let batch_size = match config.single_batch_iterations {
-            true => TrainBatchConfig::SingleBatch(config.batch_size),
-            false => config.batch_size.into(),
-        };
         Self {
             inital_config: config.clone(),
             embedding,
-            batch_size,
             learn_rate: config.train_rate,
             training_rounds: config.training_rounds,
             paused: config.pause_on_start,
             snapshot: (None, Instant::now()),
             supress_auto_report: false,
-            force_report: false,
+            force_report_test_set: false,
+            force_report_train_set: false,
             force_report_all: false,
             last_report: None,
             halt: false,
@@ -68,7 +62,14 @@ impl TrainerState {
         if !self.paused {
             self.round += 1;
         }
-        self.force_report = false;
+
+        self.force_report_test_set = false;
+        self.force_report_train_set = false;
+
+        if self.round == self.training_rounds && !self.paused {
+            info!("Completed rounds run, pausing...");
+            self.pause();
+        }
     }
 
     fn pause(&mut self) {
@@ -86,13 +87,17 @@ impl TrainerState {
     }
 
     fn should_report_round(&self) -> bool {
-        if self.force_report_all || self.force_report {
+        if self.force_report_all || self.force_report_test_set {
             return true;
         }
 
         !self.paused
             && !self.supress_auto_report
-            && should_report_round(self.round, self.training_rounds)
+            && validate::should_report_round(self.round, self.training_rounds)
+    }
+
+    fn should_report_test_set_round(&self) -> bool {
+        self.force_report_train_set
     }
 
     pub fn metadata(&self) -> TrainerStateMetadata {
@@ -108,6 +113,13 @@ impl TrainerState {
         self.inital_config.input_stride_width
     }
 
+    pub fn batch_size(&self) -> TrainBatchConfig {
+        match self.inital_config.single_batch_iterations {
+            true => TrainBatchConfig::SingleBatch(self.inital_config.batch_size),
+            false => self.inital_config.batch_size.into(),
+        }
+    }
+
     pub fn hidden_layer_shape(&self) -> Vec<usize> {
         Self::build_hidden_layer_shape(&self.inital_config)
     }
@@ -119,6 +131,27 @@ impl TrainerState {
         ];
 
         layer_node_counts.iter().cloned().flatten().collect()
+    }
+
+    pub fn set_embedding(&mut self, embedding: Embedding, metadata: &TrainerStateMetadata) {
+        self.embedding = embedding;
+        self.round = metadata.current_round;
+        self.training_rounds = metadata.training_rounds;
+        self.learn_rate = metadata.learn_rate;
+
+        self.last_report = None;
+    }
+
+    pub fn trigger_round_report_test_set(&mut self) {
+        self.force_report_test_set = true;
+    }
+
+    pub fn trigger_round_report_train_set(&mut self) {
+        self.force_report_train_set = true;
+    }
+
+    pub fn halt(&mut self) {
+        self.halt = true;
     }
 }
 
@@ -137,8 +170,8 @@ where
     };
 
     if config.use_character_tokens {
-        phrases = characterize_phrases(phrases);
-        testing_phrases = characterize_phrases(testing_phrases);
+        phrases = characterize_phrases(phrases, Some(config.input_stride_width));
+        testing_phrases = characterize_phrases(testing_phrases, Some(config.input_stride_width));
         vocab = compute_vocab(&phrases);
     }
 
@@ -150,35 +183,14 @@ where
         .with_hidden_layer_custom_shape(hidden_layer_shape)
         .with_input_stride_width(config.input_stride_width)
         .with_activation_mode(config.activation_mode)
-        .build();
+        .build()
+        .unwrap();
 
     let mut state = TrainerState::new(embedding, &config, rng);
+    let batch_size = state.batch_size();
 
     loop {
-        let training_error = if !state.paused {
-            match state
-                .embedding
-                .train(&phrases, state.learn_rate, state.batch_size)
-            {
-                Ok(error) => {
-                    if state.should_perform_autosave() {
-                        state.perform_snapshot();
-                    }
-                    Some(error)
-                }
-                Err(e) => {
-                    error!("Failed to train embedding model {e}");
-                    if let (Some(_), when) = state.snapshot {
-                        info!("Snapshot available from {when:?}. See help menu ('h') to restore... pausing")
-                    }
-                    state.pause();
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
+        let training_error = train_embedding(&mut state, &phrases, batch_size);
         let recv_timeout = state.paused.then_some(Duration::from_secs(5));
 
         while let Ok(msg) = handle.try_recv(recv_timeout) {
@@ -188,31 +200,12 @@ where
         }
 
         if state.should_report_round() {
-            match validate_embeddings(&state.embedding, &testing_phrases) {
-                Ok((validation_errors, predictions_pct)) => {
-                    let report = generate_training_report(
-                        state.round,
-                        training_error.unwrap_or(0.0),
-                        validation_errors,
-                        predictions_pct,
-                        state
-                            .last_report
-                            .as_ref()
-                            .map(|(last_dt, report)| (last_dt.elapsed(), report.round)),
-                    );
+            report_round(&mut state, &testing_phrases, training_error);
+        }
 
-                    log_training_round(&report);
-
-                    state.last_report = Some((std::time::Instant::now(), report));
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to validate testing round {}: '{e}'.. pausing",
-                        state.round + 1
-                    );
-                    state.pause();
-                }
-            }
+        if state.should_report_test_set_round() {
+            info!("Generating report on testing set...");
+            report_round(&mut state, &phrases, training_error);
         }
 
         if state.halt {
@@ -221,21 +214,77 @@ where
         }
 
         state.complete_round();
-
-        if state.round == state.training_rounds && !state.paused {
-            info!("Completed rounds run, pausing...");
-            state.pause();
-        }
     }
 
     state.embedding
+}
+
+fn train_embedding(
+    state: &mut TrainerState,
+    phrases: &Vec<Vec<String>>,
+    batch_size: TrainBatchConfig,
+) -> Option<f64> {
+    if state.paused {
+        return None;
+    }
+
+    let train_error = state.embedding.train(phrases, state.learn_rate, batch_size);
+
+    match train_error {
+        Ok(error) => {
+            if state.should_perform_autosave() {
+                state.perform_snapshot();
+            }
+            Some(error)
+        }
+        Err(e) => {
+            error!("Failed to train embedding model {e}");
+            if let (Some(_), when) = state.snapshot {
+                info!("Snapshot available from {when:?}. See help menu ('h') to restore... pausing")
+            }
+            state.pause();
+            None
+        }
+    }
+}
+
+fn report_round(
+    state: &mut TrainerState,
+    testing_phrases: &Vec<Vec<String>>,
+    training_error: Option<f64>,
+) {
+    match validate::validate_embeddings(&state.embedding, testing_phrases) {
+        Ok((validation_errors, predictions_pct)) => {
+            let report = validate::generate_training_report(
+                state.round,
+                training_error.unwrap_or(0.0),
+                validation_errors,
+                predictions_pct,
+                state
+                    .last_report
+                    .as_ref()
+                    .map(|(last_dt, report)| (last_dt.elapsed(), report.round)),
+            );
+
+            validate::log_training_round(&report);
+
+            state.last_report = Some((std::time::Instant::now(), report));
+        }
+        Err(e) => {
+            error!(
+                "Failed to validate testing round {}: '{e}'.. pausing",
+                state.round + 1
+            );
+            state.pause();
+        }
+    }
 }
 
 pub fn init_phrases_and_vocab(
     config: &TrainEmbeddingConfig,
     rng: Rc<dyn RNG>,
 ) -> (Vec<Vec<String>>, HashSet<String>) {
-    let phrases = parse_phrases();
+    let phrases = parse_phrases(&config);
 
     let (min_len, max_len) = config.phrase_word_length_bounds;
 
@@ -279,6 +328,13 @@ pub fn init_phrases_and_vocab(
     let vocab = compute_vocab(&phrases);
 
     plane::ml::ShuffleRng::shuffle_vec(&rng, &mut phrases);
+
+    // TODO: cleanup
+    Some(&phrases)
+        .filter(|x| x.is_empty())
+        .ok_or(())
+        .expect_err("phrases is empty");
+
     (phrases, vocab)
 }
 
@@ -290,128 +346,65 @@ fn compute_vocab(phrases: &Vec<Vec<String>>) -> HashSet<String> {
         .collect()
 }
 
-fn characterize_phrases(phrases: Vec<Vec<String>>) -> Vec<Vec<String>> {
+fn characterize_phrases(
+    phrases: Vec<Vec<String>>,
+    min_word_len: Option<usize>,
+) -> Vec<Vec<String>> {
     phrases
         .into_iter()
-        .map(|phrase| {
-            phrase
-                .into_iter()
-                .flat_map(|word| word.chars().map(|c| c.to_string()).collect_vec())
-                .collect_vec()
+        .filter_map(|phrase| match min_word_len {
+            Some(min_word_len) if phrase.iter().any(|word| word.len() < min_word_len) => None,
+            _ => Some(
+                phrase
+                    .into_iter()
+                    .flat_map(|word| word.chars().map(|c| c.to_string()).collect_vec())
+                    .collect_vec(),
+            ),
         })
         .collect_vec()
 }
 
-pub fn parse_phrases() -> Vec<Vec<String>> {
-    let phrase_json = include_str!("../../../res/phrase_list.json");
-    let phrase_json: Value = serde_json::from_str(phrase_json).unwrap();
-    let phrases: Vec<Vec<String>> = phrase_json
-        .as_array()
-        .unwrap()
-        .into_iter()
-        .map(|value| {
-            value
+pub fn parse_phrases(config: &TrainEmbeddingConfig) -> Vec<Vec<String>> {
+    match &config.input_txt_path {
+        Some(path) => read_plaintext_phrases(&path),
+        None => {
+            let phrase_json = include_str!("../../../res/phrase_list.json");
+            let phrase_json: Value = serde_json::from_str(phrase_json).unwrap();
+
+            phrase_json
                 .as_array()
                 .unwrap()
                 .into_iter()
-                .map(|value| value.as_str().unwrap().to_owned())
+                .map(|value| {
+                    value
+                        .as_array()
+                        .unwrap()
+                        .into_iter()
+                        .map(|value| value.as_str().unwrap().to_owned())
+                        .collect()
+                })
+                .collect()
+        }
+    }
+}
+
+pub fn read_plaintext_phrases(file_path: &str) -> Vec<Vec<String>> {
+    use std::io::Read;
+
+    let mut file = File::open(file_path).unwrap(); // TODO: error handling
+    let mut buffer = String::new();
+    file.read_to_string(&mut buffer).unwrap();
+
+    let phrases: Vec<Vec<String>> = buffer
+        .lines()
+        .map(|line| {
+            line.split_ascii_whitespace()
+                .into_iter()
+                .map(|value| value.to_owned())
                 .collect()
         })
         .collect();
     phrases
-}
-
-fn should_report_round(round: usize, training_rounds: usize) -> bool {
-    let round_1based = round + 1;
-
-    round_1based <= 50
-        || (round_1based <= 1000 && round_1based % 100 == 0)
-        || (round_1based <= 10000 && round_1based % 1000 == 0)
-        || (round_1based <= 100000 && round_1based % 10000 == 0)
-        || (round_1based <= 1000000 && round_1based % 100000 == 0)
-        || round_1based == training_rounds
-}
-
-fn generate_training_report(
-    round: usize,
-    training_error: f64,
-    validation_errors: Vec<(f64, f64)>,
-    predictions_pct: f64,
-    last_report_time: Option<(Duration, usize)>,
-) -> TrainerReport {
-    let val_count = validation_errors.len() as NodeValue;
-    let (validation_error, nll) =
-        validation_errors
-            .iter()
-            .fold((0.0, 0.0), |sum, (validation_error, nll)| {
-                (
-                    sum.0 + (validation_error / val_count),
-                    sum.1 + (nll / val_count),
-                )
-            });
-
-    let ms_per_round = last_report_time
-        .map(|(duration, last_round)| duration.as_millis() / (round - last_round).max(1) as u128);
-
-    TrainerReport {
-        round,
-        training_error,
-        ms_per_round,
-        predictions_pct,
-        validation_error,
-        nll,
-    }
-}
-
-fn log_training_round(report: &TrainerReport) {
-    let ms_per_round = report
-        .ms_per_round
-        .map(|ms_per_round| format!("(ms/round={ms_per_round:<4.1})"))
-        .unwrap_or_default();
-
-    info!(
-            "round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<6.3} {ms_per_round}",
-            report.round + 1, report.training_error, report.predictions_pct, report.validation_error, report.nll
-    );
-}
-
-fn validate_embeddings(
-    embedding: &Embedding,
-    testing_phrases: &Vec<Vec<String>>,
-) -> Result<(Vec<(f64, f64)>, f64)> {
-    let mut validation_errors = vec![];
-    let mut correct_first_word_predictions = 0;
-    let mut total_first_word_predictions = 0;
-
-    for testing_phrase in testing_phrases.iter() {
-        for testing_phrase_window in testing_phrase.windows(embedding.input_stride_width() + 1) {
-            let (last_word_vector, context_word_vectors) = testing_phrase_window
-                .split_last()
-                .context("should have last element")?;
-
-            let last_words = context_word_vectors
-                .into_iter()
-                .map(|x| x.as_str())
-                .collect::<Vec<_>>();
-
-            let predicted = embedding.predict_next(&last_words[..])?;
-            let actual = last_word_vector;
-
-            if &predicted == actual {
-                correct_first_word_predictions += 1;
-            }
-
-            let error = embedding.compute_error(testing_phrase)?;
-            let nll = embedding.nll(&last_words, &actual)?;
-            validation_errors.push((error, nll));
-            total_first_word_predictions += 1;
-        }
-    }
-
-    let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
-        / total_first_word_predictions.max(1) as NodeValue;
-
-    Ok((validation_errors, predictions_pct))
 }
 
 pub fn split_training_and_testing(
@@ -425,211 +418,337 @@ pub fn split_training_and_testing(
     testing_phrases
 }
 
-pub fn read_model_from_disk(
-    file_path: &str,
-) -> Result<(String, TrainEmbeddingConfig, TrainerStateMetadata)> {
-    let file = File::open(file_path)?;
-    let reader = BufReader::new(file);
+mod validate {
+    use std::time::Duration;
 
-    let mut snapshot: Value = serde_json::from_reader(reader)?;
+    use anyhow::{Context, Result};
+    use tracing::info;
 
-    let config: TrainEmbeddingConfig =
-        serde_json::from_value(snapshot["_trainer_config"].take())
-            .context("unable to extract trainer config from saved model")?;
-    let state: TrainerStateMetadata = serde_json::from_value(snapshot["_trainer_state"].take())
-        .context("unable to extract trainer metatdata from saved model")?;
-    let snapshot = serde_json::to_string(&snapshot)?;
+    use plane::ml::{embeddings::Embedding, NodeValue};
 
-    Ok((snapshot, config, state))
-}
+    use crate::messages::TrainerReport;
 
-pub fn write_model_to_disk(
-    embedding: &Embedding,
-    config: &TrainEmbeddingConfig,
-    state: &TrainerStateMetadata,
-    label: &str,
-    output_dir: &Option<String>,
-    output_label: &Option<String>,
-) {
-    let snapshot = embedding.snapshot().unwrap();
-    let mut snapshot: Value = serde_json::from_str(&snapshot).unwrap();
-
-    snapshot["_trainer_config"] = serde_json::to_value(&config).unwrap();
-    snapshot["_trainer_state"] = serde_json::to_value(&state).unwrap();
-
-    let snapshot_pretty = serde_json::to_string_pretty(&snapshot).unwrap();
-    let fpath = output::create_output_fpath(
-        ("model", ".json"),
-        output_dir.as_ref(),
-        output_label.as_ref(),
-        Some(state),
-        label,
-    );
-
-    File::create(fpath)
-        .unwrap()
-        .write_fmt(format_args!("{snapshot_pretty}"))
-        .unwrap();
-}
-
-pub fn write_embedding_tsv_to_disk(
-    embedding: &Embedding,
-    label: &str,
-    output_dir: &Option<String>,
-    output_label: &Option<String>,
-) {
-    let vocab = embedding.vocab().keys().cloned().collect::<Vec<_>>();
-
-    let fpath_vectors = output::create_output_fpath(
-        ("embedding", "_vectors.tsv"),
-        output_dir.as_ref(),
-        output_label.as_ref(),
-        None,
-        label,
-    );
-    let fpath_labels = output::create_output_fpath(
-        ("embedding", "_labels.tsv"),
-        output_dir.as_ref(),
-        output_label.as_ref(),
-        None,
-        label,
-    );
-
-    File::create(fpath_vectors)
-        .unwrap()
-        .write_fmt(format_args!(
-            "{}",
-            vocab
+    pub fn generate_training_report(
+        round: usize,
+        training_error: f64,
+        validation_errors: Vec<(f64, f64)>,
+        predictions_pct: f64,
+        last_report_time: Option<(Duration, usize)>,
+    ) -> TrainerReport {
+        let val_count = validation_errors.len() as NodeValue;
+        let (validation_error, nll) =
+            validation_errors
                 .iter()
-                .map(|word| embedding.embeddings(&word).unwrap().iter().join("\t"))
-                .join("\n")
-        ))
-        .unwrap();
-
-    File::create(fpath_labels)
-        .unwrap()
-        .write_fmt(format_args!("{}", vocab.iter().join("\n")))
-        .unwrap();
-}
-
-pub fn write_results_to_disk(embedding: &Embedding, label: &str) {
-    let vocab = embedding.vocab().keys().cloned().collect::<HashSet<_>>();
-
-    let fpath_nearest =
-        output::create_output_fpath(("embedding", "_nearest.json"), None, None, None, label);
-    let fpath_predictions =
-        output::create_output_fpath(("embedding", "_predictions.json"), None, None, None, label);
-    let fpath_embeddings =
-        output::create_output_fpath(("embedding", "_embeddings.csv"), None, None, None, label);
-
-    File::create(fpath_nearest)
-        .unwrap()
-        .write_all(
-            serde_json::to_string_pretty(&{
-                let mut map = HashMap::new();
-
-                for v in vocab.iter() {
-                    let nearest = embedding
-                        .nearest(&v)
-                        .map(|(x, _)| x)
-                        .unwrap_or_else(|_| "<none>".to_string());
-                    map.insert(v, nearest);
-                }
-                map
-            })
-            .unwrap()
-            .as_bytes(),
-        )
-        .unwrap();
-
-    File::create(fpath_predictions)
-        .unwrap()
-        .write_all(
-            serde_json::to_string_pretty(&{
-                let mut map = HashMap::new();
-
-                for v in vocab.iter() {
-                    let predict = embedding
-                        .predict_from(&v)
-                        .unwrap_or_else(|_| "<none>".to_string());
-                    map.insert(v, predict);
-                }
-                map
-            })
-            .unwrap()
-            .as_bytes(),
-        )
-        .unwrap();
-
-    File::create(fpath_embeddings)
-        .unwrap()
-        .write_fmt(format_args!(
-            "{}",
-            vocab
-                .iter()
-                .map(|word| {
-                    format!(
-                        "{word},{}",
-                        embedding.embeddings(&word).unwrap().iter().join(",")
+                .fold((0.0, 0.0), |sum, (validation_error, nll)| {
+                    (
+                        sum.0 + (validation_error / val_count),
+                        sum.1 + (nll / val_count),
                     )
-                })
-                .join("\n")
-        ))
-        .unwrap();
+                });
+
+        let ms_per_round = last_report_time.map(|(duration, last_round)| {
+            duration.as_millis() / (round - last_round).max(1) as u128
+        });
+
+        TrainerReport {
+            round,
+            training_error,
+            ms_per_round,
+            predictions_pct,
+            validation_error,
+            nll,
+        }
+    }
+
+    pub fn log_training_round(report: &TrainerReport) {
+        let ms_per_round = report
+            .ms_per_round
+            .map(|ms_per_round| format!("(ms/round={ms_per_round:<4.1})"))
+            .unwrap_or_default();
+
+        info!(
+                "round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<6.3} {ms_per_round}",
+                report.round + 1, report.training_error, report.predictions_pct, report.validation_error, report.nll
+        );
+    }
+
+    pub fn validate_embeddings(
+        embedding: &Embedding,
+        testing_phrases: &Vec<Vec<String>>,
+    ) -> Result<(Vec<(f64, f64)>, f64)> {
+        let mut validation_errors = vec![];
+        let mut correct_first_word_predictions = 0;
+        let mut total_first_word_predictions = 0;
+
+        for testing_phrase in testing_phrases.iter() {
+            for testing_phrase_window in testing_phrase.windows(embedding.input_stride_width() + 1)
+            {
+                let (actual, context_word_vectors) = testing_phrase_window
+                    .split_last()
+                    .context("should have last element")?;
+
+                let context_word_vectors = context_word_vectors
+                    .into_iter()
+                    .map(|x| x.as_str())
+                    .collect::<Vec<_>>();
+
+                let predicted = embedding.predict_next(&context_word_vectors[..])?;
+                if &predicted == actual {
+                    correct_first_word_predictions += 1;
+                }
+
+                let error = embedding.compute_error(testing_phrase)?;
+                let nll = embedding.nll(&context_word_vectors, &actual)?;
+                validation_errors.push((error, nll));
+                total_first_word_predictions += 1;
+            }
+        }
+
+        let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
+            / total_first_word_predictions.max(1) as NodeValue;
+
+        Ok((validation_errors, predictions_pct))
+    }
+
+    pub fn should_report_round(round: usize, training_rounds: usize) -> bool {
+        let round_1based = round + 1;
+
+        round_1based <= 50
+            || (round_1based <= 1000 && round_1based % 100 == 0)
+            || (round_1based <= 10000 && round_1based % 1000 == 0)
+            || (round_1based <= 100000 && round_1based % 10000 == 0)
+            || (round_1based <= 1000000 && round_1based % 100000 == 0)
+            || round_1based == training_rounds
+    }
 }
 
-mod output {
+pub mod writer {
     use std::{
-        fs::DirBuilder,
-        path::{Path, PathBuf},
+        collections::{HashMap, HashSet},
+        fs::File,
+        io::{BufReader, Write},
     };
 
-    use crate::messages::TrainerStateMetadata;
+    use anyhow::{Context, Result};
+    use itertools::Itertools;
+    use serde_json::Value;
 
-    pub fn create_output_fpath(
-        fname_prefix_ext: (&str, &str),
-        output_dir: Option<&String>,
-        output_label: Option<&String>,
-        state: Option<&TrainerStateMetadata>,
+    use plane::ml::embeddings::Embedding;
+
+    use crate::{config::TrainEmbeddingConfig, messages::TrainerStateMetadata};
+
+    pub fn read_model_from_disk(
+        file_path: &str,
+    ) -> Result<(String, TrainEmbeddingConfig, TrainerStateMetadata)> {
+        let file = File::open(file_path)?;
+        let reader = BufReader::new(file);
+
+        let mut snapshot: Value = serde_json::from_reader(reader)?;
+
+        let config: TrainEmbeddingConfig =
+            serde_json::from_value(snapshot["_trainer_config"].take())
+                .context("unable to extract trainer config from saved model")?;
+
+        let state: TrainerStateMetadata = serde_json::from_value(snapshot["_trainer_state"].take())
+            .context("unable to extract trainer metatdata from saved model")?;
+
+        let snapshot = serde_json::to_string(&snapshot)?;
+
+        Ok((snapshot, config, state))
+    }
+
+    pub fn write_model_to_disk(
+        embedding: &Embedding,
+        config: &TrainEmbeddingConfig,
+        state: &TrainerStateMetadata,
         label: &str,
-    ) -> PathBuf {
-        let dir_path = create_output_dir(output_dir, output_label.clone());
-        let fname_description = match (output_label, state) {
-            (Some(_), Some(state)) => metadata_fname_description(state),
-            _ => default_fname_description(label),
-        };
-        let (fname_prefix, fname_ext) = fname_prefix_ext;
-        let fpath = dir_path.join(format!("{fname_prefix}-{}{fname_ext}", fname_description));
-        fpath
-    }
+        output_dir: &Option<String>,
+        output_label: &Option<String>,
+    ) {
+        let snapshot = embedding.snapshot().unwrap();
+        let mut snapshot: Value = serde_json::from_str(&snapshot).unwrap();
 
-    fn metadata_fname_description(state: &TrainerStateMetadata) -> String {
-        let trainer_report = state.training_report.as_ref();
-        let predictions_pct = trainer_report.map(|report| report.predictions_pct.round());
-        let predictions_pct = predictions_pct.unwrap_or_default();
-        let round = state.current_round + 1;
-        format!("r{round}-{predictions_pct}pct")
-    }
+        snapshot["_trainer_config"] = serde_json::to_value(&config).unwrap();
+        snapshot["_trainer_state"] = serde_json::to_value(&state).unwrap();
 
-    fn default_fname_description(label: &str) -> String {
-        format!("{label}-{}.json", systime())
-    }
+        let snapshot_pretty = serde_json::to_string_pretty(&snapshot).unwrap();
+        let fpath = path::create_output_fpath(
+            ("model", ".json"),
+            output_dir.as_ref(),
+            output_label.as_ref(),
+            Some(state),
+            label,
+        );
 
-    fn systime() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        File::create(fpath)
             .unwrap()
-            .as_millis()
+            .write_fmt(format_args!("{snapshot_pretty}"))
+            .unwrap();
     }
 
-    fn create_output_dir(output_dir: Option<&String>, output_label: Option<&String>) -> PathBuf {
-        let output_dir = output_dir.cloned().unwrap_or("out".to_string());
-        let dir_path = Path::new(&output_dir);
-        let dir_path = match output_label {
-            Some(label) => dir_path.join(label),
-            None => dir_path.to_path_buf(),
+    pub fn write_embedding_tsv_to_disk(
+        embedding: &Embedding,
+        label: &str,
+        output_dir: &Option<String>,
+        output_label: &Option<String>,
+    ) {
+        let vocab = embedding.vocab().keys().cloned().collect::<Vec<_>>();
+
+        let fpath_vectors = path::create_output_fpath(
+            ("embedding", "_vectors.tsv"),
+            output_dir.as_ref(),
+            output_label.as_ref(),
+            None,
+            label,
+        );
+        let fpath_labels = path::create_output_fpath(
+            ("embedding", "_labels.tsv"),
+            output_dir.as_ref(),
+            output_label.as_ref(),
+            None,
+            label,
+        );
+
+        File::create(fpath_vectors)
+            .unwrap()
+            .write_fmt(format_args!(
+                "{}",
+                vocab
+                    .iter()
+                    .map(|word| embedding.embeddings(&word).unwrap().iter().join("\t"))
+                    .join("\n")
+            ))
+            .unwrap();
+
+        File::create(fpath_labels)
+            .unwrap()
+            .write_fmt(format_args!("{}", vocab.iter().join("\n")))
+            .unwrap();
+    }
+
+    pub fn write_results_to_disk(embedding: &Embedding, label: &str) {
+        let vocab = embedding.vocab().keys().cloned().collect::<HashSet<_>>();
+
+        let fpath_nearest =
+            path::create_output_fpath(("embedding", "_nearest.json"), None, None, None, label);
+        let fpath_predictions =
+            path::create_output_fpath(("embedding", "_predictions.json"), None, None, None, label);
+        let fpath_embeddings =
+            path::create_output_fpath(("embedding", "_embeddings.csv"), None, None, None, label);
+
+        File::create(fpath_nearest)
+            .unwrap()
+            .write_all(
+                serde_json::to_string_pretty(&{
+                    let mut map = HashMap::new();
+
+                    for v in vocab.iter() {
+                        let nearest = embedding
+                            .nearest(&v)
+                            .map(|(x, _)| x)
+                            .unwrap_or_else(|_| "<none>".to_string());
+                        map.insert(v, nearest);
+                    }
+                    map
+                })
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
+
+        File::create(fpath_predictions)
+            .unwrap()
+            .write_all(
+                serde_json::to_string_pretty(&{
+                    let mut map = HashMap::new();
+
+                    for v in vocab.iter() {
+                        let predict = embedding
+                            .predict_from(&v)
+                            .unwrap_or_else(|_| "<none>".to_string());
+                        map.insert(v, predict);
+                    }
+                    map
+                })
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
+
+        File::create(fpath_embeddings)
+            .unwrap()
+            .write_fmt(format_args!(
+                "{}",
+                vocab
+                    .iter()
+                    .map(|word| {
+                        format!(
+                            "{word},{}",
+                            embedding.embeddings(&word).unwrap().iter().join(",")
+                        )
+                    })
+                    .join("\n")
+            ))
+            .unwrap();
+    }
+
+    mod path {
+        use std::{
+            fs::DirBuilder,
+            path::{Path, PathBuf},
+            time::SystemTime,
         };
-        DirBuilder::new().recursive(true).create(&dir_path).unwrap();
-        dir_path
+
+        use crate::messages::TrainerStateMetadata;
+
+        pub fn create_output_fpath(
+            fname_prefix_ext: (&str, &str),
+            output_dir: Option<&String>,
+            output_label: Option<&String>,
+            state: Option<&TrainerStateMetadata>,
+            label: &str,
+        ) -> PathBuf {
+            let dir_path = create_output_dir(output_dir, output_label.clone());
+            let fname_description = match (output_label, state) {
+                (Some(_), Some(state)) => metadata_fname_description(state),
+                _ => default_fname_description(label),
+            };
+            let (fname_prefix, fname_ext) = fname_prefix_ext;
+            let fpath = dir_path.join(format!("{fname_prefix}-{}{fname_ext}", fname_description));
+            fpath
+        }
+
+        fn metadata_fname_description(state: &TrainerStateMetadata) -> String {
+            let trainer_report = state.training_report.as_ref();
+            let predictions_pct = trainer_report.map(|report| report.predictions_pct.round());
+            let predictions_pct = predictions_pct.unwrap_or_default();
+            let round = state.current_round + 1;
+            format!("r{round}-{predictions_pct}pct")
+        }
+
+        fn default_fname_description(label: &str) -> String {
+            format!("{label}-{}.json", systime())
+        }
+
+        fn systime() -> u128 {
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        }
+
+        fn create_output_dir(
+            output_dir: Option<&String>,
+            output_label: Option<&String>,
+        ) -> PathBuf {
+            let output_dir = output_dir.cloned().unwrap_or("out".to_string());
+            let dir_path = Path::new(&output_dir);
+            let dir_path = match output_label {
+                Some(label) => dir_path.join(label),
+                None => dir_path.to_path_buf(),
+            };
+            DirBuilder::new().recursive(true).create(&dir_path).unwrap();
+            dir_path
+        }
     }
 }

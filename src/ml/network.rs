@@ -80,6 +80,17 @@ impl NetworkShape {
     pub fn len(&self) -> usize {
         self.layers_shape.len()
     }
+
+    pub fn desc_pretty(&self) -> String {
+        let stride_count =
+            |x: &LayerShape| x.stride_count.filter(|x| *x > 1).map(|x| format!("x{}", x));
+
+        let mut node_counts = self
+            .iter()
+            .map(|x| format!("{}{}", x.node_count(), stride_count(&x).unwrap_or_default()));
+
+        itertools::Itertools::join(&mut node_counts, " -> ")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -225,10 +236,9 @@ impl Network {
                 &layer_output,
                 target_outputs,
                 &self.final_layer_activation()?,
-            )?
-            .ave();
+            )?;
 
-        Ok(output_layer_error)
+        Ok(output_layer_error.ave())
     }
 
     pub fn learn(&mut self, strategy: NetworkLearnStrategy) -> Result<Option<NodeValue>> {
@@ -316,7 +326,7 @@ impl Network {
                     self.apply_pending_layer_actions(learn_actions, learn_rate)?;
 
                     let batch_errors = LayerValues::new(batch_errors);
-                    network_errors.push(batch_errors.ave())
+                    network_errors.push(batch_errors.ave());
                 }
 
                 let network_errors = LayerValues::new(network_errors);
@@ -457,6 +467,12 @@ impl Network {
             let input_gradients = state.layer.compute_d(&activated_layer_d)?;
             let input_gradients = input_gradients.collect::<Vec<NodeValue>>();
             layer_d = Some(input_gradients);
+
+            // for x in activated_layer_d.iter() {
+            //     if x.is_nan() {
+            //         dbg!(&activated_layer_d, &layer_d, &error_d);
+            //     }
+            // }
 
             let strategy = LayerLearnStrategy::GradientDecent {
                 gradients: activated_layer_d,
@@ -635,21 +651,25 @@ impl Layer {
 
                 for (x, grad) in self.weights.iter_mut().zip(weights_gradients.iter()) {
                     let next_val = *x - (grad * learn_rate);
-                    if next_val.is_nan() {
+                    *x = if !next_val.is_nan() {
+                        next_val
+                    } else {
+                        // continue;
                         return Err(anyhow!(
                             "failed to apply gradient (value={grad}) to optimise weights"
                         ));
                     }
-                    *x = next_val
                 }
                 for (x, grad) in self.bias.iter_mut().flatten().zip(gradients.iter()) {
                     let next_val = *x - (grad * learn_rate);
-                    if next_val.is_nan() {
+                    *x = if !next_val.is_nan() {
+                        next_val
+                    } else {
+                        // continue;
                         return Err(anyhow!(
                             "failed to apply gradient (value={grad}) to optimise biases"
                         ));
                     }
-                    *x = next_val
                 }
             }
         }
@@ -710,7 +730,7 @@ impl Layer {
                     if *expected == 1.0 {
                         Ok(-actual.ln())
                     } else if *expected == 0.0 {
-                        Ok(0.0)
+                        Ok(-(1.0 - actual).ln())
                     } else {
                         Err(anyhow!(
                             "target outputs should be one-hot encoded: {expected_outputs:?}"
@@ -742,17 +762,19 @@ impl Layer {
         mode: &NetworkActivationMode,
     ) -> Result<LayerValues> {
         match mode {
-            // NetworkActivationMode::SoftMax => {
-            //     expected_outputs
-            //         .iter()
-            //         .zip(outputs.iter())
-            //         .map(|(expected, actual)| match *expected {
-            //             1.0 => Ok(-1.0 / actual),
-            //             0.0 => Ok(0.0),
-            //             _ => Err(anyhow!("target outputs should be one-hot encoded"))
-            //         })
-            //         .collect()
-            // },
+            // NetworkActivationMode::SoftMax => Ok(expected_outputs
+            //     .iter()
+            //     .zip(outputs.iter())
+            //     .map(|(expected, actual)| {
+            //         let not_expected = 1.0 - expected;
+            //         let not_actual = 1.0 - actual;
+            //         if *actual != 0.0 && not_actual != 0.0 {
+            //             (not_expected / not_actual) - (expected / actual)
+            //         } else {
+            //             0.0
+            //         }
+            //     })
+            //     .collect()),
             _ => self.calculate_msd_error_d(outputs, expected_outputs),
         }
     }
@@ -911,6 +933,7 @@ pub enum LayerInitStrategy {
     NoBiasCopied(LayerValues),
     PositiveRandom,
     ScaledFullRandom,
+    ScaledFullRandomZeroBias,
     FullRandom,
     NoBias,
 }
@@ -926,7 +949,11 @@ impl LayerInitStrategy {
         use LayerInitStrategy::*;
 
         match self {
-            Zero => {}
+            Zero => {
+                for value in weights.chain(bias) {
+                    *value = 0.0;
+                }
+            }
             NoBiasCopied(values) => {
                 for (value, copied) in weights.zip(values.iter()) {
                     *value = *copied;
@@ -942,6 +969,15 @@ impl LayerInitStrategy {
                 let scale_factor = (inputs_count as NodeValue).powf(-0.5) * 2.0;
                 for value in weights.chain(bias) {
                     *value = Self::full_rand(rng) * scale_factor;
+                }
+            }
+            ScaledFullRandomZeroBias => {
+                let scale_factor = (inputs_count as NodeValue).powf(-0.5) * 2.0;
+                for value in weights {
+                    *value = Self::full_rand(rng) * scale_factor;
+                }
+                for value in bias {
+                    *value = 0.0;
                 }
             }
             FullRandom => {
@@ -1032,7 +1068,13 @@ impl NetworkActivationMode {
         match self {
             NetworkActivationMode::Linear => output.clone(),
             NetworkActivationMode::SoftMax => {
-                let exp_iter = output.iter().map(|x| x.exp());
+                let max = output
+                    .iter()
+                    .copied()
+                    .max_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or_default();
+
+                let exp_iter = output.iter().map(|x| (x - max).exp());
                 let sum: NodeValue = exp_iter.clone().sum();
                 LayerValues(exp_iter.map(|x| x / sum).collect())
             }

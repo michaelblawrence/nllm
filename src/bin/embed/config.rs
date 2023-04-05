@@ -23,7 +23,7 @@ pub struct TrainEmbeddingConfig {
     #[arg(short = 'b', long, default_value_t = 16)]
     pub batch_size: usize,
 
-    #[arg(short = 'i', long, default_value_t = false)]
+    #[arg(short = 's', long, default_value_t = false)]
     #[serde(default)]
     pub single_batch_iterations: bool,
 
@@ -45,6 +45,10 @@ pub struct TrainEmbeddingConfig {
     #[arg(short = 'O', long, default_value = None)]
     #[serde(default)]
     pub output_label: Option<String>,
+
+    #[arg(short = 'i', long, default_value = None)]
+    #[serde(default)]
+    pub input_txt_path: Option<String>,
 
     #[arg(short = 'S', long, default_value_t = 120)]
     pub snapshot_interval_secs: u64,

@@ -61,6 +61,7 @@ fn parse_repl_char(
 ) -> Result<()> {
     match c {
         'r' => tx.send(TrainerMessage::PrintStatus)?,
+        'o' => tx.send(TrainerMessage::PrintTrainingStatus)?,
         'R' => tx.send(TrainerMessage::SuppressAutoPrintStatus)?,
         'a' => tx.send(TrainerMessage::TogglePrintAllStatus)?,
         'x' => tx.send(TrainerMessage::ReloadFromSnapshot)?,
@@ -80,7 +81,8 @@ fn parse_repl_char(
         'h' => {
             println!(
                 r"Trainer help: 
-                        'r' => report status
+                        'r' => report status (testing set)
+                        'o' => report status (training set)
                         'R' => supress auto-report status
                         'n' => print new random phrase
                         'x' => reload from auto-save snapshot
@@ -95,7 +97,7 @@ fn parse_repl_char(
                         'p' => toggle pause
                         'q' => quit
                         "
-            )
+            );
         }
         _ => (),
     }
@@ -126,7 +128,9 @@ fn parse_cli_args() -> Result<(
     let cli = config::Cli::from_arg_matches(&matches)
         .map_err(|err| err.exit())
         .unwrap();
+
     // let cli = config::Cli::parse();
+
     let (config, resumed_state) = match cli.command() {
         config::Command::TrainEmbedding(config) => (config, None),
         config::Command::LoadEmbedding(config) => load_embedding(config)?,
@@ -141,7 +145,7 @@ fn load_embedding(
     Option<(String, messages::TrainerStateMetadata)>,
 )> {
     let file_path = &load_config.file_path;
-    let (snapshot, mut config, state) = training::read_model_from_disk(file_path)?;
+    let (snapshot, mut config, state) = training::writer::read_model_from_disk(file_path)?;
 
     config.pause_on_start = true;
     if let Some(hidden_layer_nodes) = load_config.hidden_layer_nodes {
