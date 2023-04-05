@@ -506,8 +506,8 @@ pub mod builder {
     use serde_json::Value;
 
     use crate::ml::{
-        JsRng, LayerInitStrategy, LayerShape, LayerValues, Network, NetworkActivationMode,
-        NetworkShape, RNG,
+        JsRng, LayerShape, LayerValues, Network, NetworkActivationMode,
+        NetworkShape, RNG, layer::LayerInitStrategy,
     };
 
     use super::{Embedding, CONTROL_VOCAB};
