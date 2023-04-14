@@ -15,6 +15,7 @@ use serde_json::Value;
 use tracing::{error, info};
 
 use crate::{
+    bounded::BoundedValueLogger,
     config::TrainEmbeddingConfig,
     messages::{
         TrainerHandle, TrainerHandleActions, TrainerMessage, TrainerReport, TrainerStateMetadata,
@@ -25,6 +26,7 @@ pub struct TrainerState {
     pub embedding: Embedding,
     pub learn_rate: f64,
     pub training_rounds: usize,
+    pub print_round_number: bool,
     pub supress_auto_report: bool,
     pub force_report_all: bool,
     pub snapshot: (Option<String>, Instant),
@@ -32,9 +34,11 @@ pub struct TrainerState {
     pub paused: bool,
     pub round: usize,
     pub rng: Rc<dyn RNG>,
+    training_loss_logger: BoundedValueLogger<(usize, f64)>,
     halt: bool,
     force_report_test_set: bool,
     force_report_train_set: bool,
+    round_reported: bool,
     inital_config: TrainEmbeddingConfig,
 }
 
@@ -47,6 +51,9 @@ impl TrainerState {
             training_rounds: config.training_rounds,
             paused: config.pause_on_start,
             snapshot: (None, Instant::now()),
+            training_loss_logger: BoundedValueLogger::new(1000),
+            round_reported: false,
+            print_round_number: false,
             supress_auto_report: false,
             force_report_test_set: false,
             force_report_train_set: false,
@@ -58,6 +65,43 @@ impl TrainerState {
         }
     }
 
+    fn train(&mut self, phrases: &Vec<Vec<String>>, batch_size: TrainBatchConfig) -> Option<f64> {
+        if self.paused {
+            return None;
+        }
+
+        let train_error = self.embedding.train(phrases, self.learn_rate, batch_size);
+
+        match train_error {
+            Ok(error) if error.is_finite() => {
+                if self.should_perform_autosave() {
+                    self.perform_snapshot();
+                }
+                self.training_loss_logger.push((self.round, error));
+                Some(error)
+            }
+            Ok(non_finite_error) => {
+                error!(
+                    "Failed perform embedding model training iteration: training loss = {}",
+                    non_finite_error
+                );
+                if let (Some(_), when) = self.snapshot {
+                    info!("Snapshot available from {when:?}. See help menu ('h') to restore... pausing")
+                }
+                self.pause();
+                None
+            }
+            Err(e) => {
+                error!("Failed to train embedding model {e}");
+                if let (Some(_), when) = self.snapshot {
+                    info!("Snapshot available from {when:?}. See help menu ('h') to restore... pausing")
+                }
+                self.pause();
+                None
+            }
+        }
+    }
+
     fn complete_round(&mut self) {
         if !self.paused {
             self.round += 1;
@@ -65,6 +109,7 @@ impl TrainerState {
 
         self.force_report_test_set = false;
         self.force_report_train_set = false;
+        self.round_reported = false;
 
         if self.round == self.training_rounds && !self.paused {
             info!("Completed rounds run, pausing...");
@@ -86,18 +131,37 @@ impl TrainerState {
             && self.snapshot.1.elapsed().as_secs() > self.inital_config.snapshot_interval_secs
     }
 
-    fn should_report_round(&self) -> bool {
-        if self.force_report_all || self.force_report_test_set {
-            return true;
+    fn should_report_round(&mut self) -> bool {
+        let force_report_all = self.force_report_all && !self.paused;
+        let should_report = if force_report_all || self.force_report_test_set {
+            true
+        } else {
+            !self.paused
+                && !self.supress_auto_report
+                && validate::should_report_round(self.round, self.training_rounds)
+        };
+
+        if should_report {
+            self.round_reported = true;
         }
 
-        !self.paused
-            && !self.supress_auto_report
-            && validate::should_report_round(self.round, self.training_rounds)
+        should_report
     }
 
-    fn should_report_test_set_round(&self) -> bool {
-        self.force_report_train_set
+    fn should_report_test_set_round(&mut self) -> bool {
+        let should_report = self.force_report_train_set;
+        if should_report {
+            self.round_reported = true;
+        }
+        should_report
+    }
+
+    fn should_report_round_number_only(&mut self) -> bool {
+        let should_report = self.print_round_number && !self.paused && !self.round_reported;
+        if should_report {
+            self.round_reported = true;
+        }
+        should_report
     }
 
     pub fn metadata(&self) -> TrainerStateMetadata {
@@ -106,6 +170,7 @@ impl TrainerState {
             training_rounds: self.training_rounds,
             current_round: self.round,
             training_report: self.last_report.as_ref().map(|(_, report)| report.clone()),
+            training_error_history: self.training_loss_logger.iter().cloned().collect(),
         }
     }
 
@@ -125,19 +190,34 @@ impl TrainerState {
     }
 
     pub fn build_hidden_layer_shape(config: &TrainEmbeddingConfig) -> Vec<usize> {
-        let layer_node_counts = [
-            Some(config.hidden_layer_nodes),
-            config.hidden_deep_layer_nodes.filter(|x| *x > 0),
-        ];
+        let layer_node_counts = [config.hidden_layer_nodes];
+        let layer_node_counts = layer_node_counts.into_iter().chain(
+            config
+                .hidden_deep_layer_nodes
+                .iter()
+                .flat_map(|csv| csv.split(','))
+                .filter_map(|x| x.trim().parse::<usize>().ok()),
+        );
 
-        layer_node_counts.iter().cloned().flatten().collect()
+        layer_node_counts.collect()
     }
 
-    pub fn set_embedding(&mut self, embedding: Embedding, metadata: &TrainerStateMetadata) {
+    pub fn set_embedding(&mut self, embedding: Embedding, metadata: TrainerStateMetadata) {
         self.embedding = embedding;
         self.round = metadata.current_round;
         self.training_rounds = metadata.training_rounds;
         self.learn_rate = metadata.learn_rate;
+
+        self.training_loss_logger = {
+            let logger_capacity = self.training_loss_logger.capacity();
+            let mut logger: BoundedValueLogger<(usize, f64)> = metadata
+                .training_error_history
+                .into_iter()
+                .map(|(round, loss)| (round, (round, loss)))
+                .collect();
+            logger.set_capacity(logger_capacity);
+            logger
+        };
 
         self.last_report = None;
     }
@@ -165,13 +245,17 @@ where
     let rng: Rc<dyn RNG> = Rc::new(JsRng::default());
     let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, rng.clone());
     let mut testing_phrases = match config.phrase_test_set_split_pct.filter(|x| *x > 0.0) {
-        Some(pct) => split_training_and_testing(&mut phrases, pct),
+        Some(pct) => {
+            split_training_and_testing(&mut phrases, pct, config.phrase_test_set_max_tokens)
+        }
         None => phrases.clone(),
     };
 
     if config.use_character_tokens {
-        phrases = characterize_phrases(phrases, Some(config.input_stride_width));
-        testing_phrases = characterize_phrases(testing_phrases, Some(config.input_stride_width));
+        let word_mode = false; // TODO config?
+        phrases = characterize_phrases(phrases, Some(config.input_stride_width), word_mode);
+        testing_phrases =
+            characterize_phrases(testing_phrases, Some(config.input_stride_width), word_mode);
         vocab = compute_vocab(&phrases);
     }
 
@@ -190,7 +274,7 @@ where
     let batch_size = state.batch_size();
 
     loop {
-        let training_error = train_embedding(&mut state, &phrases, batch_size);
+        let training_error = state.train(&phrases, batch_size);
         let recv_timeout = state.paused.then_some(Duration::from_secs(5));
 
         while let Ok(msg) = handle.try_recv(recv_timeout) {
@@ -200,12 +284,19 @@ where
         }
 
         if state.should_report_round() {
-            report_round(&mut state, &testing_phrases, training_error);
+            report_round(&mut state, &testing_phrases, training_error, None);
         }
 
         if state.should_report_test_set_round() {
-            info!("Generating report on testing set...");
-            report_round(&mut state, &phrases, training_error);
+            report_round(&mut state, &phrases, training_error, Some("train"));
+        }
+
+        if state.should_report_round_number_only() {
+            let training_error = training_error
+                .map(|loss| format!("(train_loss {loss:<12.10})"))
+                .unwrap_or_default();
+
+            info!("Round {} completed {}", state.round + 1, training_error);
         }
 
         if state.halt {
@@ -219,39 +310,11 @@ where
     state.embedding
 }
 
-fn train_embedding(
-    state: &mut TrainerState,
-    phrases: &Vec<Vec<String>>,
-    batch_size: TrainBatchConfig,
-) -> Option<f64> {
-    if state.paused {
-        return None;
-    }
-
-    let train_error = state.embedding.train(phrases, state.learn_rate, batch_size);
-
-    match train_error {
-        Ok(error) => {
-            if state.should_perform_autosave() {
-                state.perform_snapshot();
-            }
-            Some(error)
-        }
-        Err(e) => {
-            error!("Failed to train embedding model {e}");
-            if let (Some(_), when) = state.snapshot {
-                info!("Snapshot available from {when:?}. See help menu ('h') to restore... pausing")
-            }
-            state.pause();
-            None
-        }
-    }
-}
-
 fn report_round(
     state: &mut TrainerState,
     testing_phrases: &Vec<Vec<String>>,
     training_error: Option<f64>,
+    label: Option<&str>,
 ) {
     match validate::validate_embeddings(&state.embedding, testing_phrases) {
         Ok((validation_errors, predictions_pct)) => {
@@ -264,6 +327,7 @@ fn report_round(
                     .last_report
                     .as_ref()
                     .map(|(last_dt, report)| (last_dt.elapsed(), report.round)),
+                label,
             );
 
             validate::log_training_round(&report);
@@ -290,7 +354,10 @@ pub fn init_phrases_and_vocab(
 
     let mut phrases: Vec<Vec<String>> = phrases
         .into_iter()
-        .filter(|phrase| phrase.len() > min_len && phrase.len() < max_len)
+        .filter(|phrase| {
+            min_len.map_or(true, |min_len| phrase.len() > min_len)
+                && max_len.map_or(true, |max_len| phrase.len() < max_len)
+        })
         .collect();
 
     let vocab_counts = phrases
@@ -309,7 +376,10 @@ pub fn init_phrases_and_vocab(
             .sum::<i32>()
     });
 
-    phrases.truncate(config.phrase_train_set_size);
+    if let Some(phrase_train_set_size) = config.phrase_train_set_size {
+        phrases.truncate(phrase_train_set_size);
+    }
+
     info!(
         "First 3 phrases: {:#?}",
         phrases
@@ -341,19 +411,29 @@ pub fn init_phrases_and_vocab(
 fn compute_vocab(phrases: &Vec<Vec<String>>) -> HashSet<String> {
     phrases
         .iter()
-        .flat_map(|phrase| phrase.iter())
-        .cloned()
+        .flat_map(|phrase| {
+            phrase
+                .join(" ")
+                .chars()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
 fn characterize_phrases(
     phrases: Vec<Vec<String>>,
     min_word_len: Option<usize>,
+    word_mode: bool,
 ) -> Vec<Vec<String>> {
     phrases
         .into_iter()
         .filter_map(|phrase| match min_word_len {
-            Some(min_word_len) if phrase.iter().any(|word| word.len() < min_word_len) => None,
+            Some(min_word_len)
+                if word_mode && phrase.iter().any(|word| word.len() < min_word_len) =>
+            {
+                None
+            }
             _ => Some(
                 phrase
                     .into_iter()
@@ -410,10 +490,30 @@ pub fn read_plaintext_phrases(file_path: &str) -> Vec<Vec<String>> {
 pub fn split_training_and_testing(
     phrases: &mut Vec<Vec<String>>,
     test_phrases_pct: f64,
+    test_set_max_tokens: Option<usize>,
 ) -> Vec<Vec<String>> {
-    let testing_ratio = test_phrases_pct as NodeValue / 100.0;
-    let testing_sample_count = phrases.len() as NodeValue * testing_ratio;
-    let offset = phrases.len() - testing_sample_count as usize;
+    let testing_sample_count = {
+        let testing_ratio = test_phrases_pct as NodeValue / 100.0;
+        (phrases.len() as NodeValue * testing_ratio) as usize
+    };
+    let testing_sample_count = match test_set_max_tokens {
+        Some(max_words) => {
+            let mut total_word_count = 0;
+            let phrases_within_limits = phrases
+                .iter()
+                .rev()
+                .take_while(|phrase| {
+                    let was_below_limit = total_word_count < max_words;
+                    total_word_count += phrase.len();
+                    was_below_limit
+                })
+                .count();
+
+            testing_sample_count.min(phrases_within_limits)
+        }
+        None => testing_sample_count,
+    };
+    let offset = phrases.len() - testing_sample_count;
     let testing_phrases = phrases.split_off(offset.clamp(0, phrases.len() - 1));
     testing_phrases
 }
@@ -434,7 +534,9 @@ mod validate {
         validation_errors: Vec<(f64, f64)>,
         predictions_pct: f64,
         last_report_time: Option<(Duration, usize)>,
+        label: Option<&str>,
     ) -> TrainerReport {
+        let label = label.map(|x| x.to_string());
         let val_count = validation_errors.len() as NodeValue;
         let (validation_error, nll) =
             validation_errors
@@ -449,6 +551,10 @@ mod validate {
         let ms_per_round = last_report_time.map(|(duration, last_round)| {
             duration.as_millis() / (round - last_round).max(1) as u128
         });
+        let generated_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
 
         TrainerReport {
             round,
@@ -457,6 +563,8 @@ mod validate {
             predictions_pct,
             validation_error,
             nll,
+            label,
+            generated_time,
         }
     }
 
@@ -466,8 +574,14 @@ mod validate {
             .map(|ms_per_round| format!("(ms/round={ms_per_round:<4.1})"))
             .unwrap_or_default();
 
+        let label = report
+            .label
+            .as_ref()
+            .map(|label| format!("[{label}] "))
+            .unwrap_or_default();
+
         info!(
-                "round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<6.3} {ms_per_round}",
+                "{label}round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<6.3} {ms_per_round}",
                 report.round + 1, report.training_error, report.predictions_pct, report.validation_error, report.nll
         );
     }
@@ -536,6 +650,42 @@ pub mod writer {
     use plane::ml::embeddings::Embedding;
 
     use crate::{config::TrainEmbeddingConfig, messages::TrainerStateMetadata};
+
+    pub fn plot_training_loss(
+        _embedding: &Embedding,
+        config: &&TrainEmbeddingConfig,
+        metadata: &TrainerStateMetadata,
+    ) {
+        use plotly::{Plot, Scatter};
+
+        let x_points = metadata
+            .training_error_history
+            .iter()
+            .map(|x| x.0 + 1)
+            .collect();
+
+        let y_points = metadata
+            .training_error_history
+            .iter()
+            .map(|x| x.1)
+            .collect();
+
+        let mut plot = Plot::new();
+
+        let trace = Scatter::new(x_points, y_points);
+        plot.add_trace(trace.name("train_loss"));
+
+        let title = "untitled";
+        let title = format!(
+            "Training Progess [{}]",
+            config.output_label.as_ref().unwrap_or(&title.to_string())
+        );
+        let title = plotly::common::Title::new(&title);
+        
+        plot.set_layout(plot.layout().clone().title(title));
+
+        plot.show();
+    }
 
     pub fn read_model_from_disk(
         file_path: &str,

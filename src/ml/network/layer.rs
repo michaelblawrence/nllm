@@ -98,17 +98,14 @@ impl Layer {
         Ok(iter)
     }
 
-    pub fn learn(
-        &mut self,
-        strategy: &LayerLearnStrategy,
-        learn_rate: NodeValue,
-    ) -> Result<()> {
+    pub fn learn(&mut self, strategy: &LayerLearnStrategy, learn_rate: NodeValue) -> Result<()> {
         match strategy {
             LayerLearnStrategy::MutateRng {
                 weight_factor,
                 bias_factor,
-                rng,
+                // rng,
             } => {
+                let rng = crate::ml::JsRng::default(); // TODO: remove rng lean? find better way of passing instance
                 for x in self.weights.iter_mut() {
                     let old = *x;
                     *x = old + (old * weight_factor * rng.rand())
@@ -122,8 +119,7 @@ impl Layer {
                 gradients,
                 layer_inputs,
             } => {
-                let weights_gradients =
-                    self.weights_gradients_iter(&gradients, &layer_inputs)?;
+                let weights_gradients = self.weights_gradients_iter(&gradients, &layer_inputs)?;
 
                 for (x, grad) in self.weights.iter_mut().zip(weights_gradients.iter()) {
                     let next_val = *x - (grad * learn_rate);
@@ -231,28 +227,26 @@ impl Layer {
         Ok(LayerValues(error))
     }
 
-    pub fn calculate_error_d(
+    pub fn calculate_cross_entropy_error_d(
         &self,
-        outputs: &LayerValues,
+        softmax_outputs: &LayerValues,
         expected_outputs: &LayerValues,
-        use_nll: bool,
     ) -> Result<LayerValues> {
-        match use_nll {
-            // true => Ok(expected_outputs
-            //     .iter()
-            //     .zip(outputs.iter())
-            //     .map(|(expected, actual)| {
-            //         let not_expected = 1.0 - expected;
-            //         let not_actual = 1.0 - actual;
-            //         if *actual != 0.0 && not_actual != 0.0 {
-            //             (not_expected / not_actual) - (expected / actual)
-            //         } else {
-            //             0.0
-            //         }
-            //     })
-            //     .collect()),
-            _ => self.calculate_msd_error_d(outputs, expected_outputs),
-        }
+        expected_outputs
+            .iter()
+            .zip(softmax_outputs.iter())
+            .map(|(&expected, &actual)| {
+                if expected == 0.0 {
+                    Ok(actual)
+                } else if expected == 1.0 {
+                    Ok(actual - 1.0)
+                } else {
+                    Err(anyhow!(
+                        "expected cross entropy outputs should be one-hot encoded"
+                    ))
+                }
+            })
+            .collect()
     }
 
     pub fn calculate_msd_error_d(
@@ -336,10 +330,7 @@ impl LayerValues {
             ));
         }
     }
-    pub fn multiply_iter<'a>(
-        &'a self,
-        rhs: &'a Self,
-    ) -> impl Iterator<Item = NodeValue> + 'a {
+    pub fn multiply_iter<'a>(&'a self, rhs: &'a Self) -> impl Iterator<Item = NodeValue> + 'a {
         assert_eq!(self.len(), rhs.len());
         self.multiply_by_iter(rhs.iter().copied())
     }
@@ -386,6 +377,8 @@ pub enum LayerInitStrategy {
     PositiveRandom,
     ScaledFullRandom,
     ScaledFullRandomZeroBias,
+    Kaiming,
+    KaimingZeroBias,
     FullRandom,
     NoBias,
 }
@@ -417,7 +410,7 @@ impl LayerInitStrategy {
                     *value = rng.rand() * scale_factor;
                 }
             }
-            ScaledFullRandom | NoBias => {
+            ScaledFullRandom => {
                 let scale_factor = (inputs_count as NodeValue).powf(-0.5) * 2.0;
                 for value in weights.chain(bias) {
                     *value = Self::full_rand(rng) * scale_factor;
@@ -432,6 +425,21 @@ impl LayerInitStrategy {
                     *value = 0.0;
                 }
             }
+            Kaiming | NoBias => {
+                let scale_factor = (inputs_count as NodeValue).powf(-0.5) * 5.0 / 3.0;
+                for value in weights.chain(bias) {
+                    *value = Self::rand_normal(0.0, 1.0, rng) * scale_factor;
+                }
+            }
+            KaimingZeroBias => {
+                let scale_factor = (inputs_count as NodeValue).powf(-0.5) * 5.0 / 3.0;
+                for value in weights {
+                    *value = Self::rand_normal(0.0, 1.0, rng) * scale_factor;
+                }
+                for value in bias {
+                    *value = 0.0;
+                }
+            }
             FullRandom => {
                 for value in weights.chain(bias) {
                     *value = Self::full_rand(rng);
@@ -440,7 +448,15 @@ impl LayerInitStrategy {
         }
     }
     fn full_rand(rng: &dyn RNG) -> NodeValue {
-        rng.rand() * 2.0 - 1.0
+        (rng.rand() * 2.0) - 1.0
+    }
+
+    fn rand_normal(mu: f64, sigma: f64, rng: &dyn RNG) -> f64 {
+        use std::f64::consts::PI;
+        let u1 = rng.rand();
+        let u2 = rng.rand();
+        let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
+        return mu + sigma * z0;
     }
 }
 
@@ -448,7 +464,10 @@ pub enum LayerLearnStrategy {
     MutateRng {
         weight_factor: NodeValue,
         bias_factor: NodeValue,
-        rng: Rc<dyn RNG>,
+        // #[cfg(feature = "threadpool")]
+        // rng: std::sync::Arc<dyn RNG>,
+        // #[cfg(not(feature = "threadpool"))]
+        // rng: Rc<dyn RNG>,
     },
     GradientDecent {
         gradients: LayerValues,

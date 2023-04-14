@@ -236,11 +236,13 @@ impl Network {
 
     pub fn learn(&mut self, strategy: NetworkLearnStrategy) -> Result<Option<NodeValue>> {
         let cost = match strategy {
-            NetworkLearnStrategy::MutateRng { rand_amount, rng } => {
+            NetworkLearnStrategy::MutateRng {
+                rand_amount, /*rng*/
+            } => {
                 let strategy = LayerLearnStrategy::MutateRng {
                     weight_factor: rand_amount,
                     bias_factor: rand_amount,
-                    rng,
+                    // rng,
                 };
                 for layer in self.layers.iter_mut() {
                     layer.learn(&strategy, 1.0)?;
@@ -248,26 +250,8 @@ impl Network {
 
                 None
             }
-            NetworkLearnStrategy::GradientDecent {
-                inputs,
-                target_outputs,
-                learn_rate,
-            } => {
-                let layers_activations = self.compute_all_layers_activations(inputs)?;
-
-                let output_layer_error =
-                    self.compute_error_precomputed(&layers_activations, &target_outputs)?;
-
-                let learn_actions =
-                    self.perform_gradient_decent_step(&layers_activations, &target_outputs)?;
-
-                self.apply_pending_layer_actions(learn_actions.iter(), learn_rate)?;
-
-                Some(output_layer_error)
-            }
             NetworkLearnStrategy::BatchGradientDecent {
                 training_pairs,
-                batch_size,
                 learn_rate,
                 batch_sampling,
             } => {
@@ -277,10 +261,14 @@ impl Network {
                 }
 
                 let batches = match batch_sampling {
-                    BatchSamplingStrategy::Sequential => {
+                    BatchSamplingStrategy::None => {
+                        let size = training_pairs.len();
+                        training_pairs.into_iter().chunks(size)
+                    }
+                    BatchSamplingStrategy::Sequential(batch_size) => {
                         training_pairs.into_iter().chunks(batch_size)
                     }
-                    BatchSamplingStrategy::Shuffle(rng) => {
+                    BatchSamplingStrategy::Shuffle(batch_size, rng) => {
                         let mut training_pairs = training_pairs;
                         rng.shuffle_vec(&mut training_pairs);
                         training_pairs.into_iter().chunks(batch_size)
@@ -290,30 +278,8 @@ impl Network {
                 let mut network_errors = vec![];
 
                 for batch in batches.into_iter() {
-                    let all_layers_activations = batch
-                        .map(|(inputs, target_outputs)| {
-                            let layers_activations = self.compute_all_layers_activations(inputs)?;
-                            Ok((layers_activations, target_outputs))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-
-                    let batch_errors = all_layers_activations
-                        .iter()
-                        .map(|(layers_activations, target_outputs)| {
-                            let output_layer_error = self
-                                .compute_error_precomputed(&layers_activations, &target_outputs);
-                            output_layer_error
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-
-                    let layer_learn_actions = all_layers_activations
-                        .iter()
-                        .map(|(layers_activations, target_outputs)| {
-                            let learn_actions = self
-                                .perform_gradient_decent_step(&layers_activations, &target_outputs);
-                            learn_actions
-                        })
-                        .collect::<Result<Vec<_>>>()?;
+                    let (batch_errors, layer_learn_actions) =
+                        self.process_gradient_descent_batch(batch.collect())?;
 
                     let learn_actions = layer_learn_actions.iter().flatten();
                     self.apply_pending_layer_actions(learn_actions, learn_rate)?;
@@ -334,6 +300,62 @@ impl Network {
             }
         };
         Ok(cost)
+    }
+
+    #[cfg(feature = "threadpool")]
+    fn process_gradient_descent_batch(
+        &mut self,
+        batch: Vec<(LayerValues, LayerValues)>,
+    ) -> Result<(Vec<f64>, Vec<Vec<(usize, LayerLearnStrategy)>>)> {
+        use rayon::prelude::*;
+
+        let (batch_errors, layer_learn_actions) = batch
+            .into_par_iter()
+            .map(|(inputs, target_outputs)| {
+                let layers_activations = self.compute_all_layers_activations(inputs)?;
+                let output_layer_error =
+                    self.compute_error_precomputed(&layers_activations, &target_outputs)?;
+                let learn_actions =
+                    self.perform_gradient_decent_step(&layers_activations, &target_outputs)?;
+                Ok((output_layer_error, learn_actions))
+            })
+            .collect::<Result<(Vec<_>, Vec<_>)>>()?;
+
+        Ok((batch_errors, layer_learn_actions))
+    }
+
+    #[cfg(not(feature = "threadpool"))]
+    fn process_gradient_descent_batch(
+        &mut self,
+        batch: Vec<(LayerValues, LayerValues)>,
+    ) -> Result<(Vec<f64>, Vec<Vec<(usize, LayerLearnStrategy)>>)> {
+        let all_layers_activations = batch
+            .into_iter()
+            .map(|(inputs, target_outputs)| {
+                let layers_activations = self.compute_all_layers_activations(inputs)?;
+                Ok((layers_activations, target_outputs))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let batch_errors = all_layers_activations
+            .iter()
+            .map(|(layers_activations, target_outputs)| {
+                let output_layer_error =
+                    self.compute_error_precomputed(&layers_activations, &target_outputs);
+                output_layer_error
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let layer_learn_actions = all_layers_activations
+            .iter()
+            .map(|(layers_activations, target_outputs)| {
+                let learn_actions =
+                    self.perform_gradient_decent_step(&layers_activations, &target_outputs);
+                learn_actions
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((batch_errors, layer_learn_actions))
     }
 
     #[inline]
@@ -390,85 +412,36 @@ impl Network {
         layers_activations: &Vec<(LayerValues, LayerValues)>,
         target_outputs: &LayerValues,
     ) -> Result<Vec<(usize, LayerLearnStrategy)>> {
-        struct LayerIntermediate<'a> {
-            layer: &'a Layer,
-            layer_id: usize,
-            layer_input: &'a LayerValues,
-            layer_weighted_outputs: &'a LayerValues,
-            activation_mode: NetworkActivationMode,
-        }
-
-        let layer_io_iter = layers_activations
-            .windows(2)
-            .map(|pair| (&pair[0].1, &pair[1].0));
-
-        let activations_iter = self
-            .layers
-            .iter()
-            .enumerate()
-            .map(|(i, layer)| (layer, i, self.layer_activation(i)));
-
         let mut layer_learn_actions = vec![];
         let mut layer_d = None;
 
-        let layer_states =
-            activations_iter
-                .zip(layer_io_iter)
-                .map(|((layer, idx, mode), (l_input, l_output))| {
-                    Ok(LayerIntermediate {
-                        layer,
-                        layer_id: idx,
-                        layer_input: l_input,
-                        layer_weighted_outputs: l_output,
-                        activation_mode: mode?,
-                    })
-                });
-
-        let layer_states = layer_states.collect::<Result<Vec<_>>>()?;
-
+        let layer_states = self.to_intermediate_states(&layers_activations)?;
         for state in layer_states.iter().rev() {
-            // key
-            //  c <-> cost
-            //  a <-> layer activation
-            //  z <-> weighted inputs
-            //  w <-> weigths
-            //
-            //  dc/dw = dz/dw * da/dz * dc/da
-            //    da/dz = activation_d
-            //    dc/da = error_d
-            //    dz/dw = layer.learn (network layer inputs)
-
-            let layer_input = state.layer_input;
-            let layer_weighted_outputs = state.layer_weighted_outputs;
-
             let error_d = match layer_d.take() {
                 Some(prev_layer_error_d) => LayerValues::new(prev_layer_error_d),
                 None => {
-                    let (_, layer_output) = layers_activations
-                        .last()
-                        .context("should always have final layer")?;
-                    state.layer.calculate_error_d(
-                        &layer_output,
-                        &target_outputs,
-                        state.activation_mode.is_softmax(),
-                    )?
+                    let layer_activations = state.layer_activations;
+
+                    match state.activation_mode {
+                        NetworkActivationMode::SoftMax => state
+                            .layer
+                            .calculate_cross_entropy_error_d(&layer_activations, &target_outputs)?,
+                        _ => state
+                            .layer
+                            .calculate_msd_error_d(&layer_activations, &target_outputs)?,
+                    }
                 }
             };
 
+            let layer_weighted_outputs = state.layer_weighted_outputs;
             let activation_d = state.activation_mode.derivative(&layer_weighted_outputs);
             let activated_layer_d = activation_d.multiply_iter(&error_d).collect();
             let input_gradients = state.layer.compute_d(&activated_layer_d)?.collect();
             layer_d = Some(input_gradients);
 
-            // for x in activated_layer_d.iter() {
-            //     if x.is_nan() {
-            //         dbg!(&activated_layer_d, &layer_d, &error_d);
-            //     }
-            // }
-
             let strategy = LayerLearnStrategy::GradientDecent {
                 gradients: activated_layer_d,
-                layer_inputs: layer_input.clone(),
+                layer_inputs: state.layer_input.clone(),
             };
 
             layer_learn_actions.push((state.layer_id, strategy));
@@ -495,6 +468,36 @@ impl Network {
 
     pub fn layer_count(&self) -> usize {
         self.layers.len()
+    }
+
+    fn to_intermediate_states<'a>(
+        &'a self,
+        layers_activations: &'a Vec<(LayerValues, LayerValues)>,
+    ) -> Result<Vec<LayerIntermediate>> {
+        let layer_io_iter = layers_activations
+            .windows(2)
+            .map(|pair| (&pair[0].1, &pair[1].0, &pair[1].1));
+
+        let activations_iter = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, layer)| (layer, i, self.layer_activation(i)));
+
+        let layer_states = activations_iter.zip(layer_io_iter).map(
+            |((layer, idx, mode), (l_input, l_output, l_activation))| {
+                Ok(LayerIntermediate {
+                    layer,
+                    layer_id: idx,
+                    layer_input: l_input,
+                    layer_weighted_outputs: l_output,
+                    layer_activations: l_activation,
+                    activation_mode: mode?,
+                })
+            },
+        );
+
+        Ok(layer_states.collect::<Result<Vec<_>>>()?)
     }
 
     fn apply_pending_layer_actions<'a, I: Iterator<Item = &'a (usize, LayerLearnStrategy)>>(
@@ -537,19 +540,25 @@ impl Network {
     }
 }
 
+struct LayerIntermediate<'a> {
+    layer: &'a Layer,
+    layer_id: usize,
+    layer_input: &'a LayerValues,
+    layer_weighted_outputs: &'a LayerValues,
+    layer_activations: &'a LayerValues,
+    activation_mode: NetworkActivationMode,
+}
+
 pub enum NetworkLearnStrategy {
     MutateRng {
         rand_amount: NodeValue,
-        rng: Rc<dyn RNG>,
-    },
-    GradientDecent {
-        inputs: LayerValues,
-        target_outputs: LayerValues,
-        learn_rate: NodeValue,
+        // #[cfg(feature = "threadpool")]
+        // rng: std::sync::Arc<dyn RNG>,
+        // #[cfg(not(feature = "threadpool"))]
+        // rng: Rc<dyn RNG>,
     },
     BatchGradientDecent {
         training_pairs: Vec<(LayerValues, LayerValues)>,
-        batch_size: usize,
         learn_rate: NodeValue,
         batch_sampling: BatchSamplingStrategy,
     },
@@ -557,8 +566,9 @@ pub enum NetworkLearnStrategy {
 }
 
 pub enum BatchSamplingStrategy {
-    Sequential,
-    Shuffle(Rc<dyn RNG>),
+    None,
+    Sequential(usize),
+    Shuffle(usize, Rc<dyn RNG>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -625,36 +635,9 @@ impl NetworkActivationMode {
     pub fn derivative(&self, output: &LayerValues) -> LayerValues {
         match self {
             NetworkActivationMode::Linear => output.iter().map(|_| 1.0).collect(),
-            // TODO: fix this approx deriv.
-            NetworkActivationMode::SoftMax => self.apply(output),
-            // NetworkActivationMode::SoftMax => {
-            //     let dx = 0.0001;
-            //     let apply_1 = self.apply(&output);
-            // // adding to all inputs here makes no meaningful to computed probs, so this is a very very poor dydx approx
-            //     let apply_2 = self.apply(&output.iter().map(|x| x + dx).collect());
-            //     let mut v = vec![];
-
-            //     for (x1, x2) in apply_1.iter().zip(apply_2.iter()) {
-            //         let dy = x2 - x1;
-            //         let dydx = dy / dx;
-            //         v.push(dydx);
-            //     }
-            //     LayerValues::new(v)
-            // }
-            // NetworkActivationMode::SoftMax => {
-            //     let softmax = self.apply(output);
-            //     softmax
-            //         .iter()
-            //         .enumerate()
-            //         .map(|(j, sj)| {
-            //             softmax
-            //                 .iter()
-            //                 .enumerate()
-            //                 .map(|(i, si)| if i == j { si * (1.0 - si) } else { si * -sj })
-            //                 .sum::<NodeValue>()
-            //         })
-            //         .collect()
-            // }
+            // TODO: cross-entroy loss derivative is calculate elsewhere for FINAL layer only.
+            // can improve api?
+            NetworkActivationMode::SoftMax => output.iter().map(|_| 1.0).collect(),
             NetworkActivationMode::Sigmoid => {
                 let mut sigmoid = self.apply(output);
                 sigmoid.iter_mut().for_each(|x| *x = *x * (1.0 - *x));
@@ -753,7 +736,7 @@ mod tests {
         network
             .learn(NetworkLearnStrategy::MutateRng {
                 rand_amount: 0.1,
-                rng: rng.clone(),
+                // rng: rng.clone(),
             })
             .unwrap();
 
@@ -1059,11 +1042,11 @@ mod tests {
 
         let each_layer_weights: Vec<Vec<_>> = layer_weights(&network).collect();
 
-        multi_sample::gradient_decent::compute_batch_training_iteration(
+        multi_sample::gradient_decent::compute_training_iteration(
             &mut network,
             &training_pairs,
             learn_rate,
-            batch_size.unwrap(),
+            BatchSamplingStrategy::Sequential(batch_size.unwrap()),
         );
 
         for (idx, (current, initial)) in layer_weights(&network)
@@ -1101,17 +1084,18 @@ mod tests {
             batch_size: Option<usize>,
         ) -> f64 {
             let error = if let Some(batch_size) = batch_size {
-                gradient_decent::compute_batch_training_iteration(
+                gradient_decent::compute_training_iteration(
                     network,
                     training_pairs,
                     learn_rate,
-                    batch_size,
+                    BatchSamplingStrategy::Sequential(batch_size),
                 )
             } else {
-                gradient_decent::compute_single_training_iteration(
+                gradient_decent::compute_training_iteration(
                     network,
                     training_pairs,
                     learn_rate,
+                    BatchSamplingStrategy::None,
                 )
             };
 
@@ -1150,31 +1134,11 @@ mod tests {
         pub mod gradient_decent {
             use super::*;
 
-            pub(crate) fn compute_single_training_iteration<const N: usize, const O: usize>(
+            pub fn compute_training_iteration<const N: usize, const O: usize>(
                 network: &mut Network,
                 training_pairs: &[([f64; N], [f64; O])],
                 learn_rate: f64,
-            ) -> f64 {
-                let mut error = 0.0;
-                for (input, output) in training_pairs {
-                    error += network
-                        .learn(NetworkLearnStrategy::GradientDecent {
-                            inputs: input.iter().cloned().collect(),
-                            target_outputs: output.iter().cloned().collect(),
-                            learn_rate,
-                        })
-                        .unwrap()
-                        .unwrap();
-                    error = error / training_pairs.len() as f64;
-                }
-                error
-            }
-
-            pub(crate) fn compute_batch_training_iteration<const N: usize, const O: usize>(
-                network: &mut Network,
-                training_pairs: &[([f64; N], [f64; O])],
-                learn_rate: f64,
-                batch_size: usize,
+                batch_sampling: BatchSamplingStrategy,
             ) -> f64 {
                 network
                     .learn(NetworkLearnStrategy::BatchGradientDecent {
@@ -1182,9 +1146,8 @@ mod tests {
                             .iter()
                             .map(|(i, o)| (i.iter().into(), o.iter().into()))
                             .collect(),
-                        batch_size,
                         learn_rate,
-                        batch_sampling: BatchSamplingStrategy::Sequential,
+                        batch_sampling,
                     })
                     .unwrap()
                     .unwrap()

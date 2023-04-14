@@ -137,9 +137,8 @@ impl Embedding {
                         .network
                         .learn(NetworkLearnStrategy::BatchGradientDecent {
                             training_pairs: training_pairs.into_iter().cloned().collect::<Vec<_>>(),
-                            batch_size,
                             learn_rate,
-                            batch_sampling: BatchSamplingStrategy::Shuffle(self.rng.clone()),
+                            batch_sampling: BatchSamplingStrategy::Shuffle(batch_size, self.rng.clone()),
                         })?;
                     costs.push(cost);
                     debug!(
@@ -158,10 +157,10 @@ impl Embedding {
                     .network
                     .learn(NetworkLearnStrategy::BatchGradientDecent {
                         training_pairs,
-                        batch_size,
                         learn_rate,
-                        batch_sampling: BatchSamplingStrategy::Shuffle(self.rng.clone()),
+                        batch_sampling: BatchSamplingStrategy::Shuffle(batch_size, self.rng.clone()),
                     })?;
+
                 costs.push(cost);
             }
         }
@@ -275,9 +274,21 @@ impl Embedding {
     }
 
     pub fn predict_iter<'a>(&'a self, seed_word: &str) -> impl Iterator<Item = String> + 'a {
+        self.predict_from_iter(&[seed_word])
+    }
+
+    pub fn predict_from_iter<'a>(
+        &'a self,
+        seed_words: &[&str],
+    ) -> impl Iterator<Item = String> + 'a {
         let mut seen_words = HashMap::new();
-        let mut recent_generated_words = VecDeque::new();
-        let mut curr_word = seed_word.to_string();
+        let (curr_word, seed_words) = seed_words
+            .split_last()
+            .expect("should have at lease one element");
+        let mut curr_word = curr_word.to_string();
+        let mut recent_generated_words =
+            VecDeque::from_iter(seed_words.iter().map(|x| x.to_string()));
+            
         std::iter::from_fn(move || {
             if curr_word.as_str() == CONTROL_VOCAB {
                 None
@@ -506,8 +517,8 @@ pub mod builder {
     use serde_json::Value;
 
     use crate::ml::{
-        JsRng, LayerShape, LayerValues, Network, NetworkActivationMode,
-        NetworkShape, RNG, layer::LayerInitStrategy,
+        layer::LayerInitStrategy, JsRng, LayerShape, LayerValues, Network, NetworkActivationMode,
+        NetworkShape, RNG,
     };
 
     use super::{Embedding, CONTROL_VOCAB};
@@ -698,7 +709,7 @@ pub mod builder {
             activation_mode: NetworkActivationMode,
         ) -> NetworkShape {
             let strategy = hidden_layer_init_strategy;
-            let final_layer_strategy = LayerInitStrategy::ScaledFullRandomZeroBias;
+            let final_layer_strategy = LayerInitStrategy::KaimingZeroBias;
             let final_layer: LayerShape = (token_count, final_layer_strategy).into();
             let hidden_layer_shape = hidden_layer_shape.into_iter();
 

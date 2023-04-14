@@ -4,10 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use std::{
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        Arc,
-    },
+    sync::mpsc::{self, Receiver, Sender},
     time::{Duration, Instant},
 };
 
@@ -18,6 +15,7 @@ use plane::ml::{
 
 use crate::training;
 
+#[derive(Debug, Serialize, Deserialize)]
 pub enum TrainerMessage {
     PrintTrainingStatus,
     PrintStatus,
@@ -35,6 +33,9 @@ pub enum TrainerMessage {
     Halt,
     ReplaceEmbeddingState(String, TrainerStateMetadata),
     SuppressAutoPrintStatus,
+    PrintEachRoundNumber,
+    PlotTrainingLossGraph,
+    PlotTrainingLossGraphDispatch(TrainerStateMetadata),
 }
 
 impl TrainerMessage {
@@ -51,6 +52,7 @@ impl TrainerMessage {
             TrainerMessage::TogglePrintAllStatus => TrainerHandleActions::TogglePrintAllStatus,
             TrainerMessage::ReloadFromSnapshot => TrainerHandleActions::ReloadFromSnapshot,
             TrainerMessage::ForceSnapshot => TrainerHandleActions::ForceSnapshot,
+            TrainerMessage::PrintEachRoundNumber => TrainerHandleActions::PrintEachRoundNumber,
             TrainerMessage::SuppressAutoPrintStatus => {
                 TrainerHandleActions::SuppressAutoPrintStatus
             }
@@ -59,10 +61,19 @@ impl TrainerMessage {
             TrainerMessage::ReplaceEmbeddingState(embedding, state) => {
                 TrainerHandleActions::ReplaceEmbeddingState(embedding, state)
             }
+            TrainerMessage::PlotTrainingLossGraph => {
+                TrainerHandleActions::DispatchWithMetadata(TrainerMessage::PlotTrainingLossGraph)
+            }
+            TrainerMessage::PlotTrainingLossGraphDispatch(metadata) => {
+                training::writer::plot_training_loss(
+                    &embedding,
+                    &config,
+                    &metadata
+                );
+                TrainerHandleActions::Nothing
+            }
             TrainerMessage::WriteModelToDisk => {
-                TrainerHandleActions::DispatchWithMetadata(Arc::new(|x| {
-                    TrainerMessage::WriteModelAndMetadataToDisk(x)
-                }))
+                TrainerHandleActions::DispatchWithMetadata(TrainerMessage::WriteModelToDisk)
             }
             TrainerMessage::WriteModelAndMetadataToDisk(metadata) => {
                 training::writer::write_model_to_disk(
@@ -73,10 +84,12 @@ impl TrainerMessage {
                     &config.output_dir,
                     &config.output_label,
                 );
+                info!("Model written to disk");
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::WriteStatsToDisk => {
                 training::writer::write_results_to_disk(&embedding, "embed");
+                info!("Results written to disk");
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::WriteEmbeddingTsvToDisk => {
@@ -86,6 +99,7 @@ impl TrainerMessage {
                     &config.output_dir,
                     &config.output_label,
                 );
+                info!("Embedding TSV written to disk");
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::PredictRandomPhrase => {
@@ -98,13 +112,25 @@ impl TrainerMessage {
             }
         }
     }
+    pub fn create_response(&self, metadata: TrainerStateMetadata) -> Option<Self> {
+        match self {
+            TrainerMessage::WriteModelToDisk => {
+                Some(TrainerMessage::WriteModelAndMetadataToDisk(metadata))
+            }
+            TrainerMessage::PlotTrainingLossGraph => {
+                Some(TrainerMessage::PlotTrainingLossGraphDispatch(metadata))
+            }
+            _ => None,
+        }
+    }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub enum TrainerHandleActions {
     Nothing,
     LearnRateMulMut(NodeValue),
     IncreaseMaxRounds(usize),
-    DispatchWithMetadata(Arc<dyn Fn(TrainerStateMetadata) -> TrainerMessage>),
+    DispatchWithMetadata(TrainerMessage),
     TogglePause,
     TogglePrintAllStatus,
     ReloadFromSnapshot,
@@ -114,6 +140,7 @@ pub enum TrainerHandleActions {
     Halt,
     ReplaceEmbeddingState(String, TrainerStateMetadata),
     SuppressAutoPrintStatus,
+    PrintEachRoundNumber,
 }
 
 impl TrainerHandleActions {
@@ -178,14 +205,16 @@ impl TrainerHandleActions {
             TrainerHandleActions::SuppressAutoPrintStatus => {
                 state.supress_auto_report = !state.supress_auto_report
             }
+            TrainerHandleActions::PrintEachRoundNumber => {
+                state.print_round_number = !state.print_round_number
+            }
             TrainerHandleActions::Halt => {
                 state.trigger_round_report_test_set();
                 state.halt();
             }
-            TrainerHandleActions::DispatchWithMetadata(factory_fn) => {
-                let factory_fn = factory_fn.as_ref();
+            TrainerHandleActions::DispatchWithMetadata(request) => {
                 let metadata = state.metadata();
-                let message = factory_fn(metadata);
+                let message = request.create_response(metadata).unwrap();
                 handle.send(message).unwrap();
             }
             TrainerHandleActions::ReplaceEmbeddingState(snapshot, new_state) => {
@@ -205,7 +234,7 @@ impl TrainerHandleActions {
                     );
                 }
 
-                state.set_embedding(new_embedding, &new_state);
+                state.set_embedding(new_embedding, new_state);
                 state.paused = true;
                 info!("Restored loaded model and state, pausing...");
             }
@@ -251,6 +280,8 @@ pub struct TrainerStateMetadata {
     pub training_rounds: usize,
     pub current_round: usize,
     pub training_report: Option<TrainerReport>,
+    #[serde(default)]
+    pub training_error_history: Vec<(usize, f64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,4 +292,6 @@ pub struct TrainerReport {
     pub predictions_pct: NodeValue,
     pub validation_error: NodeValue,
     pub nll: NodeValue,
+    pub label: Option<String>,
+    pub generated_time: u128,
 }

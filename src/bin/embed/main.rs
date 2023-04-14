@@ -8,6 +8,7 @@ use tracing::metadata::LevelFilter;
 use config::TrainEmbeddingConfig;
 use messages::TrainerMessage;
 
+mod bounded;
 mod config;
 mod messages;
 mod training;
@@ -33,19 +34,14 @@ fn main() -> Result<()> {
 
     let config_clone = config.clone();
     let ui_thread = thread::spawn(move || {
-        use KeyCode::Char;
-
-        loop {
-            match event::read().unwrap() {
-                Event::Key(KeyEvent { code: Char(c), .. }) => {
-                    match parse_repl_char(c, &tx, &config_clone) {
-                        Ok(_) => (),
-                        Err(_) => return,
-                    }
-                }
-                _ => (),
+        if let Some(repl) = config.repl {
+            for c in repl.chars() {
+                parse_repl_char(c, &tx, &config_clone)
+                    .expect("config repl character caused startup to halt");
             }
         }
+
+        block_on_key_press(move |c| parse_repl_char(c, &tx, &config_clone));
     });
 
     thread.join().unwrap();
@@ -63,9 +59,11 @@ fn parse_repl_char(
         'r' => tx.send(TrainerMessage::PrintStatus)?,
         'o' => tx.send(TrainerMessage::PrintTrainingStatus)?,
         'R' => tx.send(TrainerMessage::SuppressAutoPrintStatus)?,
+        'P' => tx.send(TrainerMessage::PrintEachRoundNumber)?,
         'a' => tx.send(TrainerMessage::TogglePrintAllStatus)?,
         'x' => tx.send(TrainerMessage::ReloadFromSnapshot)?,
         'z' => tx.send(TrainerMessage::ForceSnapshot)?,
+        'g' => tx.send(TrainerMessage::PlotTrainingLossGraph)?,
         'n' => tx.send(TrainerMessage::PredictRandomPhrase)?,
         'w' => tx.send(TrainerMessage::WriteStatsToDisk)?,
         'W' => tx.send(TrainerMessage::WriteEmbeddingTsvToDisk)?,
@@ -84,9 +82,12 @@ fn parse_repl_char(
                         'r' => report status (testing set)
                         'o' => report status (training set)
                         'R' => supress auto-report status
+                        'P' => toggle always report round number
+                        'o' => toggle always run testing report 
                         'n' => print new random phrase
                         'x' => reload from auto-save snapshot
                         'z' => force snapshot
+                        'g' => open training plot in browser
                         'w' => write stats to disk
                         'W' => write embedding tsv to disk
                         's' => save model to disk
@@ -102,6 +103,20 @@ fn parse_repl_char(
         _ => (),
     }
     Ok(())
+}
+
+fn block_on_key_press<F: Fn(char) -> Result<()>>(key_press_callback: F) {
+    use KeyCode::Char;
+    loop {
+        match event::read().unwrap() {
+            Event::Key(KeyEvent { code: Char(c), .. }) => {
+                if let Err(_) = key_press_callback(c) {
+                    return;
+                }
+            }
+            _ => (),
+        }
+    }
 }
 
 fn configure_logging() {
@@ -131,11 +146,31 @@ fn parse_cli_args() -> Result<(
 
     // let cli = config::Cli::parse();
 
-    let (config, resumed_state) = match cli.command() {
+    let (mut config, resumed_state) = match cli.command() {
         config::Command::TrainEmbedding(config) => (config, None),
         config::Command::LoadEmbedding(config) => load_embedding(config)?,
     };
+
+    init_train_config(&mut config);
+
     Ok((config, resumed_state))
+}
+
+fn init_train_config(config: &mut config::TrainEmbeddingConfig) {
+    if let (Some(output_label), true) = (&config.output_label, config.output_label_append_details) {
+        let deep_layer_counts = config
+            .hidden_deep_layer_nodes
+            .as_ref()
+            .map(|nodes| format!("x{}", nodes.replace(",", "x")))
+            .unwrap_or_default();
+
+        config.output_label = Some(format!(
+            "{}-e{}-L{}{}",
+            &output_label, &config.embedding_size, &config.hidden_layer_nodes, &deep_layer_counts
+        ));
+
+        config.output_label_append_details = false;
+    }
 }
 
 fn load_embedding(
@@ -148,6 +183,8 @@ fn load_embedding(
     let (snapshot, mut config, state) = training::writer::read_model_from_disk(file_path)?;
 
     config.pause_on_start = true;
+    config.repl = load_config.repl; // always overwrite repl
+
     if let Some(hidden_layer_nodes) = load_config.hidden_layer_nodes {
         config.hidden_layer_nodes = hidden_layer_nodes;
     }
@@ -156,6 +193,9 @@ fn load_embedding(
     }
     if let Some(input_stride_width) = load_config.input_stride_width {
         config.input_stride_width = input_stride_width;
+    }
+    if let Some(batch_size) = load_config.batch_size {
+        config.batch_size = batch_size;
     }
     Ok((config, Some((snapshot, state))))
 }

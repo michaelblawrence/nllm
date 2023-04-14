@@ -12,7 +12,7 @@ pub struct TrainEmbeddingConfig {
     pub hidden_layer_nodes: usize,
 
     #[arg(short = 'H', long, default_value = None)]
-    pub hidden_deep_layer_nodes: Option<usize>,
+    pub hidden_deep_layer_nodes: Option<String>,
 
     #[arg(short = 'c', long, default_value_t = 1000)]
     pub training_rounds: usize,
@@ -46,21 +46,33 @@ pub struct TrainEmbeddingConfig {
     #[serde(default)]
     pub output_label: Option<String>,
 
+    #[arg(short = 'Z', long, default_value = None)]
+    #[serde(default)]
+    pub output_label_append_details: bool,
+
     #[arg(short = 'i', long, default_value = None)]
     #[serde(default)]
     pub input_txt_path: Option<String>,
 
+    #[arg(long, default_value = None)]
+    #[serde(default)]
+    pub repl: Option<String>,
+
     #[arg(short = 'S', long, default_value_t = 120)]
     pub snapshot_interval_secs: u64,
 
-    #[arg(short = 'T', long, default_value_t = 150)]
-    pub phrase_train_set_size: usize,
+    #[arg(short = 'T', long, default_value = None)]
+    pub phrase_train_set_size: Option<usize>,
 
     #[arg(short = 'B', long, value_parser = parse_range::<usize>, default_value = "5..10")]
-    pub phrase_word_length_bounds: (usize, usize),
+    pub phrase_word_length_bounds: (Option<usize>, Option<usize>),
 
     #[arg(short = 'X', long, default_value = "20")]
     pub phrase_test_set_split_pct: Option<NodeValue>,
+
+    #[arg(short = 'W', long, default_value = None)]
+    #[serde(default)]
+    pub phrase_test_set_max_tokens: Option<usize>,
 
     #[arg(short = 'm', long, default_value_t = NetworkActivationMode::Tanh)]
     pub activation_mode: NetworkActivationMode,
@@ -74,10 +86,16 @@ pub struct LoadEmbeddingConfig {
     pub hidden_layer_nodes: Option<usize>,
 
     #[arg(short = 'H', long, default_value = None)]
-    pub hidden_deep_layer_nodes: Option<usize>,
+    pub hidden_deep_layer_nodes: Option<String>,
 
     #[arg(short = 'w', long, default_value = None)]
     pub input_stride_width: Option<usize>,
+
+    #[arg(short = 'b', long, default_value = None)]
+    pub batch_size: Option<usize>,
+
+    #[arg(long, default_value = None)]
+    pub repl: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -107,14 +125,27 @@ pub enum Command {
     LoadEmbedding(LoadEmbeddingConfig),
 }
 
-fn parse_range<T>(s: &str) -> Result<(T, T), Box<dyn std::error::Error + Send + Sync + 'static>>
+fn parse_range<T>(
+    s: &str,
+) -> Result<(Option<T>, Option<T>), Box<dyn std::error::Error + Send + Sync + 'static>>
 where
     T: std::str::FromStr,
     T::Err: std::error::Error + Send + Sync + 'static,
 {
+    let s = s.trim();
     let pos = s.find("..");
     let pos = pos.ok_or_else(|| format!("invalid KEY=value: no `..` found in `{s}`"))?;
 
-    let range = (s[..pos].parse()?, s[pos + 2..].parse()?);
-    Ok(range)
+    let range_start = if pos > 0 {
+        Some(s[..pos].parse()?)
+    } else {
+        None
+    };
+    let range_end = if pos + 2 < s.len() {
+        Some(s[pos + 2..].parse()?)
+    } else {
+        None
+    };
+
+    Ok((range_start, range_end))
 }
