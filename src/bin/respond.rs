@@ -1,11 +1,15 @@
 use std::{
+    collections::{HashSet, VecDeque},
     env,
     fs::File,
     io::{self, Read, Write},
     path::Path,
     rc::Rc,
+    thread,
+    time::Duration,
 };
 
+use anyhow::{Context, Result};
 use plane::ml::{embeddings::builder::EmbeddingBuilder, JsRng};
 
 fn main() {
@@ -21,6 +25,8 @@ fn run(model_fpath: &mut Option<String>) -> bool {
         Some(value) => value,
         None => return false,
     };
+
+    let (json, state) = extract_config(json).expect("failed to parse config");
 
     let rng = Rc::new(JsRng::default());
     let embedding = EmbeddingBuilder::from_snapshot(&json, rng)
@@ -42,16 +48,21 @@ fn run(model_fpath: &mut Option<String>) -> bool {
     let append_space = char_mode && embedding.vocab().contains_key(" ");
 
     println!("Starting... (character input mode = {char_mode})");
-    println!("   - Commands available: [ '.load <path>' | '.reload' | '.quit' ]");
+    println!("   - Commands available: [ '.load <path>' | '.reload' | '.supervise' | '.quit' ]");
     println!("");
 
     let stdin = io::stdin();
+
+    let mut vocab_supervised_predictions_enabled = false;
+    let mut vocab: Option<HashSet<String>> = None;
+
+    let default_min_word_len = 3;
 
     loop {
         println!("");
         print!("Enter prompt for model: ");
         io::stdout().flush().unwrap();
-        
+
         let input_txt = read_line(&stdin);
         let input_txt = match process_repl_commands(&input_txt, model_fpath.as_ref()) {
             CliReplActions::ProcessInput => input_txt,
@@ -61,6 +72,13 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             }
             CliReplActions::Quit => {
                 return false;
+            }
+            CliReplActions::SetVocabSupervisionEnabled(enabled) => {
+                vocab_supervised_predictions_enabled = enabled;
+                if vocab_supervised_predictions_enabled {
+                    configure_vocab(&mut vocab, &state, default_min_word_len);
+                }
+                continue;
             }
             CliReplActions::Reprompt => {
                 continue;
@@ -79,7 +97,15 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             _ => (),
         };
 
-        let response: Vec<_> = embedding.predict_from_iter(&context_tokens).collect();
+        let response: Vec<_> = if let (Some(vocab), true) = (
+            vocab.as_ref(),
+            char_mode && vocab_supervised_predictions_enabled,
+        ) {
+            predict_supervised(&embedding, &context_tokens, vocab, default_min_word_len)
+        } else {
+            embedding.predict_from_iter(&context_tokens).collect()
+        };
+
         let response = if char_mode {
             if append_space {
                 response.join("")
@@ -90,7 +116,7 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             response.join(" ")
         };
 
-        println!("Model Response:        {response}");
+        print_prompt_response(&response);
     }
 }
 
@@ -144,18 +170,172 @@ fn to_context_tokens<'a>(
     context_tokens.into_iter()
 }
 
+fn predict_supervised(
+    embedding: &plane::ml::embeddings::Embedding,
+    context_tokens: &Vec<&str>,
+    vocab: &HashSet<String>,
+    min_word_len: usize,
+) -> Vec<String> {
+    let ctrl_token = embedding.control_vocab();
+    let word_separator_token = " ".to_string();
+    let max_vocab_len: usize = vocab.iter().map(|x| x.len()).max().unwrap();
 
+    let mut context_queue = VecDeque::from_iter(context_tokens.iter().map(|x| x.to_string()));
+    let mut word_queue = vec![];
+    let mut generated_queue = vec![];
+    let mut last_token = context_tokens.last().cloned().unwrap_or(ctrl_token);
+
+    while last_token != ctrl_token {
+        let context_tokens_str: Vec<&str> = context_queue.iter().map(|x| x.as_str()).collect();
+        let generated_token = match embedding.predict_next(&context_tokens_str) {
+            Ok(token) => token,
+            Err(e) => {
+                println!("Error retrieving response: ({e})");
+                continue;
+            }
+        };
+
+        if &generated_token == " " {
+            word_queue.clear();
+        } else if &generated_token == ctrl_token {
+            break;
+        } else {
+            word_queue.push(generated_token.to_string());
+        }
+
+        generated_queue.push(generated_token.to_string());
+        context_queue.push_back(generated_token);
+
+        let possible_vocab_word = word_queue.join("");
+        let insert_separator = if vocab.contains(&possible_vocab_word) {
+            true
+        } else if (min_word_len..max_vocab_len)
+            .into_iter()
+            .rev()
+            .any(|distance| {
+                let start_idx = possible_vocab_word.len().saturating_sub(distance + 1);
+                let trucated_vocab_word = &possible_vocab_word[start_idx..];
+
+                let contains = vocab.contains(trucated_vocab_word);
+                if contains {
+                    generated_queue.truncate(generated_queue.len() - word_queue.len());
+                    context_queue.truncate(context_queue.len() - word_queue.len());
+                    trucated_vocab_word.chars().for_each(|c| {
+                        generated_queue.push(c.to_string());
+                        context_queue.push_back(c.to_string());
+                    });
+                }
+
+                contains
+            })
+        {
+            true
+        } else {
+            false
+        };
+
+        if insert_separator {
+            word_queue.clear();
+            generated_queue.push(word_separator_token.to_string());
+            context_queue.push_back(word_separator_token.to_string());
+        }
+
+        last_token = &context_queue.back().unwrap();
+    }
+    generated_queue
+}
+
+fn parse_word_level_vocab(input_txt_path: &str, min_word_len: Option<usize>) -> HashSet<String> {
+    use io::{BufRead, BufReader};
+
+    let file = File::open(Path::new(&input_txt_path)).unwrap();
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut words = HashSet::new();
+
+    if let Some(min_word_len) = min_word_len {
+        while let Some(Ok(line)) = lines.next() {
+            for word in line.split_whitespace().filter(|w| w.len() >= min_word_len) {
+                words.insert(word.to_string());
+            }
+        }
+    } else {
+        while let Some(Ok(line)) = lines.next() {
+            for word in line.split_whitespace() {
+                let word = word.trim_matches(|c| !char::is_alphanumeric(c));
+                words.insert(word.to_string());
+            }
+        }
+    }
+
+    words
+}
+
+fn configure_vocab(
+    vocab: &mut Option<HashSet<String>>,
+    state: &ExtractedModelConfig,
+    default_min_word_len: usize,
+) {
+    let min_word_len = Some(default_min_word_len);
+    vocab.get_or_insert_with(|| {
+        println!("Loading input_txt vocab...");
+        parse_word_level_vocab(&state.input_txt_path, min_word_len)
+    });
+    println!("Enabled word-level response generation supervison!");
+}
+
+fn print_prompt_response(response: &str) {
+    print!("Model Response:        ");
+    io::stdout().flush().unwrap();
+
+    for word in response.split_whitespace() {
+        print!(" {word}");
+
+        io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_millis(25))
+    }
+}
+
+struct ExtractedModelConfig {
+    input_txt_path: String,
+}
+
+fn extract_config(json: String) -> Result<(String, ExtractedModelConfig)> {
+    use serde_json::Value;
+
+    let mut snapshot: Value = serde_json::from_str(&json)?;
+
+    let config: Value = serde_json::from_value(snapshot["_trainer_config"].take())
+        .context("unable to extract trainer config from saved model")?;
+
+    let _state: Value = serde_json::from_value(snapshot["_trainer_state"].take())
+        .context("unable to extract trainer metatdata from saved model")?;
+
+    let snapshot = serde_json::to_string(&snapshot)?;
+
+    let input_txt_path = config["input_txt_path"]
+        .as_str()
+        .context("could not extract 'input_txt_path' config value")?
+        .to_string();
+
+    Ok((snapshot, ExtractedModelConfig { input_txt_path }))
+}
 
 enum CliReplActions {
     ProcessInput,
     Reload(String),
     Quit,
+    SetVocabSupervisionEnabled(bool),
     Reprompt,
 }
 
 fn process_repl_commands(input_txt: &str, model_fpath: Option<&String>) -> CliReplActions {
     if input_txt == ".quit" {
         return CliReplActions::Quit;
+    }
+
+    if input_txt == ".supervise" {
+        return CliReplActions::SetVocabSupervisionEnabled(true);
     }
 
     if input_txt.starts_with(".load") {
