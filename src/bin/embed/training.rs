@@ -7,8 +7,7 @@ use std::{
 
 use itertools::Itertools;
 use plane::ml::{
-    embeddings::{Embedding, TrainBatchConfig},
-    JsRng, NodeValue, RNG,
+    embeddings::{Embedding, TrainBatchConfig}, NodeValue, RNG, RngStrategy,
 };
 
 use serde_json::Value;
@@ -33,17 +32,17 @@ pub struct TrainerState {
     pub last_report: Option<(Instant, TrainerReport)>,
     pub paused: bool,
     pub round: usize,
-    pub rng: Rc<dyn RNG>,
     training_loss_logger: BoundedValueLogger<(usize, f64)>,
     halt: bool,
     force_report_test_set: bool,
     force_report_train_set: bool,
     round_reported: bool,
+    total_train_time: Duration,
     inital_config: TrainEmbeddingConfig,
 }
 
 impl TrainerState {
-    fn new(embedding: Embedding, config: &TrainEmbeddingConfig, rng: Rc<dyn RNG>) -> Self {
+    fn new(embedding: Embedding, config: &TrainEmbeddingConfig) -> Self {
         Self {
             inital_config: config.clone(),
             embedding,
@@ -60,7 +59,7 @@ impl TrainerState {
             force_report_all: false,
             last_report: None,
             halt: false,
-            rng,
+            total_train_time: Duration::ZERO,
             round: 0,
         }
     }
@@ -70,7 +69,11 @@ impl TrainerState {
             return None;
         }
 
+        let started = Instant::now();
         let train_error = self.embedding.train(phrases, self.learn_rate, batch_size);
+        
+        let train_duration = started.elapsed();
+        self.total_train_time += train_duration;
 
         match train_error {
             Ok(error) if error.is_finite() => {
@@ -169,6 +172,7 @@ impl TrainerState {
             learn_rate: self.learn_rate,
             training_rounds: self.training_rounds,
             current_round: self.round,
+            total_train_seconds: self.total_train_time.as_secs(),
             training_report: self.last_report.as_ref().map(|(_, report)| report.clone()),
             training_error_history: self.training_loss_logger.iter().cloned().collect(),
         }
@@ -207,6 +211,7 @@ impl TrainerState {
         self.round = metadata.current_round;
         self.training_rounds = metadata.training_rounds;
         self.learn_rate = metadata.learn_rate;
+        self.total_train_time = Duration::from_secs(metadata.total_train_seconds);
 
         self.training_loss_logger = {
             let logger_capacity = self.training_loss_logger.capacity();
@@ -242,8 +247,8 @@ pub fn setup_and_train_embeddings_v2<F>(
 where
     F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions,
 {
-    let rng: Rc<dyn RNG> = Rc::new(JsRng::default());
-    let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, rng.clone());
+    let rng: RngStrategy = Default::default();
+    let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, rng.to_rc());
     let mut testing_phrases = match config.phrase_test_set_split_pct.filter(|x| *x > 0.0) {
         Some(pct) => {
             split_training_and_testing(&mut phrases, pct, config.phrase_test_set_max_tokens)
@@ -262,15 +267,16 @@ where
     dbg!((phrases.len(), vocab.len())); // TODO: replace with tracing logging
     let hidden_layer_shape = TrainerState::build_hidden_layer_shape(&config);
 
-    let embedding = Embedding::new_builder(vocab, rng.clone())
+    let embedding = Embedding::new_builder(vocab)
         .with_embedding_dimensions(config.embedding_size)
         .with_hidden_layer_custom_shape(hidden_layer_shape)
         .with_input_stride_width(config.input_stride_width)
         .with_activation_mode(config.activation_mode)
+        .with_rng(rng)
         .build()
         .unwrap();
 
-    let mut state = TrainerState::new(embedding, &config, rng);
+    let mut state = TrainerState::new(embedding, &config);
     let batch_size = state.batch_size();
 
     loop {

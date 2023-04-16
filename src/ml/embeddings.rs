@@ -3,23 +3,25 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     iter,
     ops::Deref,
-    rc::Rc,
 };
 
 use anyhow::{anyhow, Context, Result};
-use serde::{ser::SerializeStruct, Serialize};
-use serde_json::Value;
+use serde::Serialize;
+
 use tracing::debug;
 
 use super::{
-    BatchSamplingStrategy, JsRng, LayerValues, Network, NetworkActivationMode,
-    NetworkLearnStrategy, NetworkShape, NodeValue, SamplingRng, ShuffleRng, RNG,
+    BatchSamplingStrategy, LayerValues, Network, NetworkActivationMode, NetworkLearnStrategy,
+    NetworkShape, NodeValue, RngStrategy, SamplingRng, ShuffleRng,
 };
 
+#[derive(Serialize)]
 pub struct Embedding {
     network: Network,
     vocab: HashMap<String, usize>,
-    rng: Rc<dyn RNG>,
+
+    #[serde(default)]
+    rng: RngStrategy,
 }
 
 const CONTROL_VOCAB: &str = &"<CTRL>";
@@ -30,9 +32,8 @@ impl Embedding {
         embedding_dimensions: usize,
         input_stride_width: usize,
         hidden_layer_shape: Vec<usize>,
-        rng: Rc<dyn RNG>,
     ) -> Self {
-        builder::EmbeddingBuilder::new(vocab, rng)
+        builder::EmbeddingBuilder::new(vocab)
             .with_embedding_dimensions(embedding_dimensions)
             .with_input_stride_width(input_stride_width)
             .with_hidden_layer_custom_shape(hidden_layer_shape)
@@ -40,28 +41,8 @@ impl Embedding {
             .unwrap()
     }
 
-    pub fn new_builder(vocab: HashSet<String>, rng: Rc<dyn RNG>) -> builder::EmbeddingBuilder {
-        builder::EmbeddingBuilder::new(vocab, rng)
-    }
-
-    pub fn embedding_from_snapshot(json: &str, rng: Rc<dyn RNG>) -> Result<Self> {
-        let value: Value = serde_json::from_str(json)?;
-
-        let network = value
-            .get("network")
-            .context("provided json should contain network field")?;
-        let network = serde_json::from_value(network.clone())?;
-
-        let vocab = value
-            .get("vocab")
-            .context("provided json should contain vocab field")?;
-        let vocab = serde_json::from_value(vocab.clone())?;
-
-        Ok(Self {
-            network,
-            vocab,
-            rng,
-        })
+    pub fn new_builder(vocab: HashSet<String>) -> builder::EmbeddingBuilder {
+        builder::EmbeddingBuilder::new(vocab)
     }
 
     pub fn snapshot(&self) -> Result<String> {
@@ -94,7 +75,7 @@ impl Embedding {
         // reduce phrase count for processing on small batches
         let phrases: Box<dyn Iterator<Item = &Vec<String>>> = match &batch_size {
             TrainBatchConfig::SingleBatch(batch_size) => {
-                Box::new(self.rng.take_rand(phrases, *batch_size).into_iter())
+                Box::new(self.rng.to_rc().take_rand(phrases, *batch_size).into_iter())
             }
             _ => Box::new(phrases.iter()),
         };
@@ -138,7 +119,10 @@ impl Embedding {
                         .learn(NetworkLearnStrategy::BatchGradientDecent {
                             training_pairs: training_pairs.into_iter().cloned().collect::<Vec<_>>(),
                             learn_rate,
-                            batch_sampling: BatchSamplingStrategy::Shuffle(batch_size, self.rng.clone()),
+                            batch_sampling: BatchSamplingStrategy::Shuffle(
+                                batch_size,
+                                self.rng.to_rc(),
+                            ),
                         })?;
                     costs.push(cost);
                     debug!(
@@ -158,7 +142,10 @@ impl Embedding {
                     .learn(NetworkLearnStrategy::BatchGradientDecent {
                         training_pairs,
                         learn_rate,
-                        batch_sampling: BatchSamplingStrategy::Shuffle(batch_size, self.rng.clone()),
+                        batch_sampling: BatchSamplingStrategy::Shuffle(
+                            batch_size,
+                            self.rng.to_rc(),
+                        ),
                     })?;
 
                 costs.push(cost);
@@ -288,7 +275,7 @@ impl Embedding {
         let mut curr_word = curr_word.to_string();
         let mut recent_generated_words =
             VecDeque::from_iter(seed_words.iter().map(|x| x.to_string()));
-            
+
         std::iter::from_fn(move || {
             if curr_word.as_str() == CONTROL_VOCAB {
                 None
@@ -451,6 +438,10 @@ impl Embedding {
         layer_shape.stride_count()
     }
 
+    pub fn control_vocab(&self) -> &'static str {
+        CONTROL_VOCAB
+    }
+
     pub fn vocab(&self) -> &HashMap<String, usize> {
         &self.vocab
     }
@@ -464,23 +455,10 @@ impl Default for Embedding {
     fn default() -> Self {
         let vocab = Default::default();
         let hidden_layer_shape = vec![];
-        let rng = Rc::new(JsRng::default());
         let size = 0;
         let input_stride_width = 1;
 
-        Embedding::new(vocab, size, input_stride_width, hidden_layer_shape, rng)
-    }
-}
-
-impl Serialize for Embedding {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        let mut embedding = serializer.serialize_struct("Embedding", 2)?;
-        embedding.serialize_field("network", &self.network)?;
-        embedding.serialize_field("vocab", &self.vocab)?;
-        embedding.end()
+        Embedding::new(vocab, size, input_stride_width, hidden_layer_shape)
     }
 }
 
@@ -508,20 +486,17 @@ impl Deref for TrainBatchConfig {
 }
 
 pub mod builder {
-    use std::{
-        collections::{HashMap, HashSet},
-        rc::Rc,
-    };
+    use std::collections::{HashMap, HashSet};
 
     use anyhow::{Context, Result};
     use serde_json::Value;
 
     use crate::ml::{
-        layer::LayerInitStrategy, JsRng, LayerShape, LayerValues, Network, NetworkActivationMode,
-        NetworkShape, RNG,
+        layer::LayerInitStrategy, LayerShape, LayerValues, Network, NetworkActivationMode,
+        NetworkShape,
     };
 
-    use super::{Embedding, CONTROL_VOCAB};
+    use super::{Embedding, RngStrategy, CONTROL_VOCAB};
 
     #[derive(Clone)]
     pub struct EmbeddingBuilder {
@@ -534,12 +509,11 @@ pub mod builder {
         input_stride_width: usize,
         hidden_layer_shape: Vec<usize>,
         hidden_layer_init_stratergy: LayerInitStrategy,
-        rng: Rc<dyn RNG>,
+        rng: RngStrategy,
     }
 
     impl Default for EmbeddingBuilder {
         fn default() -> Self {
-            let rng = Rc::new(JsRng::default());
             Self {
                 vocab: Default::default(),
                 override_vocab: None,
@@ -550,21 +524,20 @@ pub mod builder {
                 input_stride_width: 1,
                 hidden_layer_shape: vec![10],
                 hidden_layer_init_stratergy: LayerInitStrategy::ScaledFullRandom,
-                rng,
+                rng: Default::default(),
             }
         }
     }
 
     impl EmbeddingBuilder {
-        pub fn new(vocab: HashSet<String>, rng: Rc<dyn RNG>) -> Self {
+        pub fn new(vocab: HashSet<String>) -> Self {
             Self {
                 vocab,
-                rng,
                 ..Default::default()
             }
         }
 
-        pub fn from_snapshot(json: &str, rng: Rc<dyn RNG>) -> Result<Self> {
+        pub fn from_snapshot(json: &str) -> Result<Self> {
             let value: Value = serde_json::from_str(json)?;
 
             let network = value
@@ -592,7 +565,6 @@ pub mod builder {
                 input_stride_width: input_stride_width.unwrap_or(1),
                 embedding_dimensions,
                 hidden_layer_shape,
-                rng,
                 ..default_builder
             })
         }
@@ -633,8 +605,24 @@ pub mod builder {
                 Some(vocab) => {
                     context.restored_exact_vocab = true;
                     vocab
+                        .get(&CONTROL_VOCAB.to_string())
+                        .filter(|&id| *id == 0)
+                        .context(format!(
+                            "restored vocab must contain control token '{}'",
+                            CONTROL_VOCAB
+                        ))?;
+                    vocab
                 }
                 None => {
+                    self.vocab
+                        .get(&CONTROL_VOCAB.to_string())
+                        .ok_or(())
+                        .err()
+                        .context(format!(
+                            "provided vocab must not contain control token '{}'",
+                            CONTROL_VOCAB
+                        ))?;
+
                     let ordered_vocab = {
                         let mut v = self.vocab.into_iter().collect::<Vec<_>>();
                         v.sort();
@@ -695,7 +683,7 @@ pub mod builder {
             let embedding = Embedding {
                 network,
                 vocab,
-                rng: self.rng,
+                rng: self.rng.upgrade(),
             };
 
             Ok((embedding, context))
@@ -740,6 +728,10 @@ pub mod builder {
             )
         }
 
+        pub fn with_rng(mut self, rng: RngStrategy) -> Self {
+            self.rng = rng;
+            self
+        }
         pub fn with_activation_mode(mut self, activation_mode: NetworkActivationMode) -> Self {
             self.activation_mode = activation_mode;
             self
@@ -1047,8 +1039,6 @@ mod tests {
     mod training {
         use std::time::{Duration, Instant};
 
-        use crate::ml::JsRng;
-
         use super::*;
 
         #[derive(Clone)]
@@ -1070,9 +1060,7 @@ mod tests {
             ),
             config: TestEmbeddingConfig,
         ) -> Embedding {
-            let rng: Rc<dyn RNG> = Rc::new(JsRng::default());
-
-            let mut embedding = Embedding::new_builder(vocab, rng.clone())
+            let mut embedding = Embedding::new_builder(vocab)
                 .with_embedding_dimensions(config.embedding_size)
                 .with_hidden_layer_size(config.hidden_layer_nodes)
                 .with_input_stride_width(config.input_stride_width)

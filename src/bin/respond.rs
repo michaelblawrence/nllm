@@ -4,13 +4,12 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     path::Path,
-    rc::Rc,
     thread,
     time::Duration,
 };
 
 use anyhow::{Context, Result};
-use plane::ml::{embeddings::builder::EmbeddingBuilder, JsRng};
+use plane::ml::embeddings::builder::EmbeddingBuilder;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -28,8 +27,7 @@ fn run(model_fpath: &mut Option<String>) -> bool {
 
     let (json, state) = extract_config(json).expect("failed to parse config");
 
-    let rng = Rc::new(JsRng::default());
-    let embedding = EmbeddingBuilder::from_snapshot(&json, rng)
+    let embedding = EmbeddingBuilder::from_snapshot(&json)
         .expect("failed to rebuild state from snapshot")
         .build()
         .expect("failed to rebuild instance from snapshot state");
@@ -277,11 +275,18 @@ fn configure_vocab(
     default_min_word_len: usize,
 ) {
     let min_word_len = Some(default_min_word_len);
-    vocab.get_or_insert_with(|| {
-        println!("Loading input_txt vocab...");
-        parse_word_level_vocab(&state.input_txt_path, min_word_len)
-    });
-    println!("Enabled word-level response generation supervison!");
+    match &state.input_txt_path {
+        Some(input_txt_path) => {
+            vocab.get_or_insert_with(|| {
+                println!("Loading input_txt vocab...");
+                parse_word_level_vocab(&input_txt_path, min_word_len)
+            });
+            println!("Enabled word-level response generation supervison!");
+        }
+        None => {
+            println!("Failed to enable word-level response generation supervison: input_txt vocab file path is missing");
+        }
+    }
 }
 
 fn print_prompt_response(response: &str) {
@@ -294,10 +299,12 @@ fn print_prompt_response(response: &str) {
         io::stdout().flush().unwrap();
         thread::sleep(Duration::from_millis(25))
     }
+
+    println!("");
 }
 
 struct ExtractedModelConfig {
-    input_txt_path: String,
+    input_txt_path: Option<String>,
 }
 
 fn extract_config(json: String) -> Result<(String, ExtractedModelConfig)> {
@@ -313,10 +320,7 @@ fn extract_config(json: String) -> Result<(String, ExtractedModelConfig)> {
 
     let snapshot = serde_json::to_string(&snapshot)?;
 
-    let input_txt_path = config["input_txt_path"]
-        .as_str()
-        .context("could not extract 'input_txt_path' config value")?
-        .to_string();
+    let input_txt_path = config["input_txt_path"].as_str().map(|x| x.to_string());
 
     Ok((snapshot, ExtractedModelConfig { input_txt_path }))
 }

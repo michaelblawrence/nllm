@@ -1,8 +1,70 @@
-use std::ops::Deref;
+use std::{cell::UnsafeCell, ops::Deref, rc::Rc};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::ml::NodeValue;
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub enum RngStrategy {
+    #[default]
+    Default,
+    Debug {
+        seed: u64,
+    },
+    #[serde(skip)]
+    Cached(Rc<dyn RNG>),
+}
+
+impl Deref for RngStrategy {
+    type Target = dyn RNG;
+
+    fn deref(&self) -> &Self::Target {
+        self
+    }
+}
+
+impl RNG for RngStrategy {
+    fn rand(&self) -> NodeValue {
+        self.with_rng(|x| x.rand())
+    }
+}
+
+impl RngStrategy {
+    pub fn to_rc(&self) -> Rc<dyn RNG> {
+        match self {
+            RngStrategy::Default => Rc::new(Self::default_rng_factory()),
+            RngStrategy::Debug { seed } => Rc::new(Self::seedable_rng_factory(*seed)),
+            RngStrategy::Cached(instance) => instance.clone(),
+        }
+    }
+
+    pub fn with_rng<F: Fn(&dyn RNG) -> O, O>(&self, func: F) -> O {
+        match self {
+            RngStrategy::Default => func(&Self::default_rng_factory()),
+            RngStrategy::Debug { seed } => func(&Self::seedable_rng_factory(*seed)),
+            RngStrategy::Cached(instance) => func(instance.as_ref()),
+        }
+    }
+
+    pub fn upgrade(self) -> Self {
+        match self {
+            RngStrategy::Default => {
+                let rng = self.to_rc();
+                Self::Cached(rng)
+            }
+            x => x,
+        }
+    }
+
+    fn default_rng_factory() -> impl RNG {
+        JsRng::default()
+    }
+
+    fn seedable_rng_factory(seed: u64) -> impl RNG {
+        SeedableTestRng::new(seed)
+    }
+}
 
 #[cfg(any(test, feature = "thread"))]
 #[derive(Default)]
@@ -21,6 +83,25 @@ impl RNG for JsRng {
     #[cfg(not(any(test, feature = "thread")))]
     fn rand(&self) -> NodeValue {
         js_sys::Math::random() as NodeValue
+    }
+}
+
+pub struct SeedableTestRng(UnsafeCell<algo::park_miller::ParkMiller>);
+
+impl SeedableTestRng {
+    pub fn new(seed: u64) -> Self {
+        Self(UnsafeCell::new(algo::park_miller::ParkMiller::new(seed)))
+    }
+}
+
+impl RNG for SeedableTestRng {
+    fn rand(&self) -> NodeValue {
+        let rand = {
+            let inner = unsafe { &mut *self.0.get() };
+            let rand = inner.rand() - 1;
+            rand as NodeValue
+        };
+        rand * algo::park_miller::F64_MULTIPLIER
     }
 }
 
@@ -85,5 +166,32 @@ impl<T: Deref<Target = dyn RNG>> SamplingRng for T {
         })?;
 
         Ok(sampled_idx)
+    }
+}
+
+mod algo {
+    pub mod park_miller {
+        const MODULUS: u64 = 2_147_483_647;
+        const MULTIPLIER: u64 = 16_807;
+        // const MULTIPLIER: u64 = 1_672_535_203;
+
+        pub(crate) const F64_MULTIPLIER: f64 = 1.0 / 2_147_483_646 as f64;
+
+        pub struct ParkMiller {
+            state: u64,
+        }
+
+        impl ParkMiller {
+            pub fn new(seed: u64) -> Self {
+                Self {
+                    state: seed % MODULUS,
+                }
+            }
+
+            pub fn rand(&mut self) -> u64 {
+                self.state = self.state.wrapping_mul(MULTIPLIER) % MODULUS;
+                self.state
+            }
+        }
     }
 }

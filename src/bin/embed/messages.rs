@@ -185,9 +185,8 @@ impl TrainerHandleActions {
             TrainerHandleActions::ReloadFromSnapshot => {
                 if let Some(snapshot) = &state.snapshot.0 {
                     info!("Recovering state from snapshot, pausing...");
-                    let rng = state.rng.clone();
                     state.paused = true;
-                    state.embedding = EmbeddingBuilder::from_snapshot(&snapshot, rng)
+                    state.embedding = EmbeddingBuilder::from_snapshot(&snapshot)
                         .unwrap()
                         .build()
                         .unwrap();
@@ -218,8 +217,7 @@ impl TrainerHandleActions {
                 handle.send(message).unwrap();
             }
             TrainerHandleActions::ReplaceEmbeddingState(snapshot, new_state) => {
-                let rng = state.rng.clone();
-                let (new_embedding, build_ctx) = EmbeddingBuilder::from_snapshot(&snapshot, rng)
+                let (new_embedding, build_ctx) = EmbeddingBuilder::from_snapshot(&snapshot)
                     .unwrap()
                     .with_hidden_layer_custom_shape(state.hidden_layer_shape())
                     .with_input_stride_width(state.input_stride_width())
@@ -279,6 +277,8 @@ pub struct TrainerStateMetadata {
     pub learn_rate: f64,
     pub training_rounds: usize,
     pub current_round: usize,
+    #[serde(default)]
+    pub total_train_seconds: u64,
     pub training_report: Option<TrainerReport>,
     #[serde(default)]
     pub training_error_history: Vec<(usize, f64)>,

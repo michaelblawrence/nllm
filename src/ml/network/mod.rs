@@ -668,12 +668,8 @@ impl Default for NetworkActivationMode {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
     use test_log::test;
     use tracing::info;
-
-    use crate::ml::JsRng;
 
     use super::*;
 
@@ -727,7 +723,6 @@ mod tests {
 
     #[test]
     fn can_network_learn_randomly() {
-        let rng = Rc::new(JsRng::default());
         let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::PositiveRandom);
         shape.set_activation_mode(NetworkActivationMode::SoftMax);
         let mut network = Network::new(shape);

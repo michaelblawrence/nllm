@@ -3,7 +3,7 @@ use std::{collections::HashSet, rc::Rc};
 use yew::prelude::*;
 use yew_hooks::use_timeout;
 
-use crate::ml::{embeddings::Embedding, JsRng};
+use crate::ml::embeddings::Embedding;
 
 use super::{
     handle::{self, EmbeddingHandle},
@@ -16,7 +16,7 @@ pub type VocabAndPhrases = (HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>)
 pub fn use_embeddings<F, C>(
     config: Rc<TrainEmbeddingConfig>,
     with_emedding_fn: F,
-    cleanup_fn: C
+    cleanup_fn: C,
 ) -> (
     UseStateHandle<EmbeddingHandle>,
     UseStateHandle<Rc<VocabAndPhrases>>,
@@ -44,21 +44,19 @@ where
                     return;
                 }
 
-                embedding_handle.set(embedding_handle.replace_with(
-                    |mut embedding_instance| {
-                        let (_, phrases, _) = &**vocab_and_phrases;
+                embedding_handle.set(embedding_handle.replace_with(|mut embedding_instance| {
+                    let (_, phrases, _) = &**vocab_and_phrases;
 
-                        let error = parser::train_embedding(
-                            &mut embedding_instance,
-                            &phrases,
-                            config.train_rate,
-                            config.batch_size,
-                            config.process_all_batches,
-                        );
+                    let error = parser::train_embedding(
+                        &mut embedding_instance,
+                        &phrases,
+                        config.train_rate,
+                        config.batch_size,
+                        config.process_all_batches,
+                    );
 
-                        with_emedding_fn(embedding_instance, error, (*vocab_and_phrases).clone())
-                    },
-                ));
+                    with_emedding_fn(embedding_instance, error, (*vocab_and_phrases).clone())
+                }));
 
                 train_remaining_iters.set(*train_remaining_iters - 1);
             }
@@ -97,7 +95,9 @@ where
                 vocab_and_phrases.set(v_and_p);
                 train_remaining_iters.set(0);
 
-                move || {cleanup_fn();}
+                move || {
+                    cleanup_fn();
+                }
             }
         },
         config.clone(),
@@ -107,7 +107,7 @@ where
         {
             let embedding_handle = embedding_handle.clone();
             let config = config.clone();
-            
+
             move |vocab_and_phrases: &Rc<VocabAndPhrases>| {
                 let (vocab, ..) = &**vocab_and_phrases;
 
@@ -116,7 +116,6 @@ where
                     config.embedding_size,
                     config.input_stride_width,
                     vec![config.hidden_layer_nodes],
-                    Rc::new(JsRng::default()),
                 )));
 
                 // train_remaining_iters.set(config.training_rounds);
