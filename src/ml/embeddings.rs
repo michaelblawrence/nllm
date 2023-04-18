@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use tracing::debug;
@@ -59,205 +59,159 @@ impl Embedding {
         learn_rate: NodeValue,
         batch_size: B,
     ) -> Result<NodeValue> {
-        let control_vocab_idx = self
-            .vocab
-            .get(&CONTROL_VOCAB.to_string())
-            .expect("CONTROL_VOCAB should be present in vocab");
-        let word_locality_factor = self.input_stride_width();
-
-        // TODO: validate this in a better place
-        if word_locality_factor < 1 {
-            dbg!(word_locality_factor);
-            return Err(anyhow!("need at least one sample"));
-        }
         let batch_size: TrainBatchConfig = batch_size.into();
 
         // reduce phrase count for processing on small batches
         let phrases: Box<dyn Iterator<Item = &Vec<String>>> = match &batch_size {
             TrainBatchConfig::SingleBatch(batch_size) => {
-                Box::new(self.rng.to_rc().take_rand(phrases, *batch_size).into_iter())
+                Box::new(self.rng.take_rand(phrases, *batch_size).into_iter())
             }
             _ => Box::new(phrases.iter()),
         };
 
-        let indexed_phrases = phrases.flat_map(|phrase| {
-            phrase
-                .iter()
-                .flat_map(|word| self.vocab.get(&word.to_string()))
-                .chain(iter::repeat(control_vocab_idx).take(word_locality_factor - 1))
-        });
-
-        let vectored_phrases = iter::repeat(control_vocab_idx)
-            .take(word_locality_factor - 1)
-            .chain(indexed_phrases)
-            .map(|&vocab_idx| self.one_hot(vocab_idx).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-
-        let windowed_word_vectors = vectored_phrases.windows(word_locality_factor + 1).map(
-            |word_vectors| match word_vectors.split_last() {
-                Some((last, rest)) => (rest, last),
-                None => panic!("should have last"),
-            },
-        );
-
-        let training_pairs: Vec<(LayerValues, LayerValues)> = windowed_word_vectors
-            .map(|(x, y)| {
-                (
-                    x.into_iter().flatten().cloned().collect(),
-                    LayerValues::new(y.clone()),
-                )
-            })
-            .collect();
-
-        let mut costs = vec![];
-
-        match batch_size {
+        let training_pairs = self.into_context_target_pairs(phrases);
+        let (batches, batch_size) = match batch_size {
             TrainBatchConfig::Batches(batch_size) => {
-                for training_pairs in training_pairs.chunks(batch_size.pow(2)) {
-                    let cost = self
-                        .network
-                        .learn(NetworkLearnStrategy::BatchGradientDecent {
-                            training_pairs: training_pairs.into_iter().cloned().collect::<Vec<_>>(),
-                            learn_rate,
-                            batch_sampling: BatchSamplingStrategy::Shuffle(
-                                batch_size,
-                                self.rng.to_rc(),
-                            ),
-                        })?;
-                    costs.push(cost);
-                    debug!(
-                        " -- net train iter cost {} (N = {})",
-                        cost.clone().unwrap_or_default(),
-                        training_pairs.len()
-                    );
-                }
+                let training_pairs = training_pairs
+                    .chunks(batch_size.pow(2))
+                    .map(|training_pairs| training_pairs.into_iter().cloned().collect::<Vec<_>>())
+                    .collect();
+
+                (training_pairs, batch_size)
             }
             TrainBatchConfig::SingleBatch(batch_size) => {
                 let mut training_pairs = training_pairs;
                 self.rng.shuffle_vec(&mut training_pairs);
                 training_pairs.truncate(batch_size);
 
-                let cost = self
-                    .network
-                    .learn(NetworkLearnStrategy::BatchGradientDecent {
-                        training_pairs,
-                        learn_rate,
-                        batch_sampling: BatchSamplingStrategy::Shuffle(
-                            batch_size,
-                            self.rng.to_rc(),
-                        ),
-                    })?;
-
-                costs.push(cost);
+                (vec![training_pairs], batch_size)
             }
+        };
+
+        let mut costs = vec![];
+
+        for training_pairs in batches {
+            let rng = self.rng.clone();
+            let batch_sampling = BatchSamplingStrategy::Shuffle(batch_size, rng);
+            let training_pairs_len = training_pairs.len();
+
+            let cost = self
+                .network
+                .learn(NetworkLearnStrategy::BatchGradientDecent {
+                    training_pairs,
+                    learn_rate,
+                    batch_sampling,
+                })?;
+
+            costs.push(cost);
+
+            debug!(
+                " -- net train iter cost {} (N = {})",
+                cost.clone().unwrap_or_default(),
+                training_pairs_len
+            );
         }
 
-        let cost = costs.iter().flatten().sum::<NodeValue>() / costs.len() as NodeValue;
+        let costs: LayerValues = costs.into_iter().flatten().collect();
+        let ave_cost = costs.ave();
+        Ok(ave_cost)
+    }
 
-        Ok(cost)
+    fn into_context_target_pairs<'a, P>(&self, phrases: P) -> Vec<(LayerValues, LayerValues)>
+    where
+        P: Iterator<Item = &'a Vec<String>>,
+    {
+        let vectored_phrases: Vec<Vec<f64>> = phrases
+            .flat_map(|phrase| self.get_padded_network_input_iter(&phrase[..]))
+            .flatten() // flatten here ignores any error variants (missing vocab etc.)
+            .map(|one_hot| one_hot.collect::<Vec<_>>())
+            .collect();
+
+        let word_locality_factor = self.input_stride_width();
+        let windowed_word_vectors = vectored_phrases.windows(word_locality_factor + 1);
+
+        windowed_word_vectors
+            .map(|context_token_vectors| {
+                let (last, rest) = context_token_vectors.split_last().unwrap();
+                let expected_output = LayerValues::new(last.clone());
+                let network_inputs: LayerValues = rest.into_iter().flatten().cloned().collect();
+
+                (network_inputs, expected_output)
+            })
+            .collect()
+    }
+
+    pub fn sample_probabilities(&self, context_tokens: &[&str]) -> Result<LayerValues> {
+        let network_input = self.get_padded_network_input(context_tokens)?;
+        let output = self.network.compute(network_input)?;
+        let probabilities = self.compute_probabilities(&output)?;
+        Ok(probabilities)
+    }
+
+    fn compute_probabilities(&self, output: &LayerValues) -> Result<LayerValues> {
+        let last_layer_shape = self.last_layer_shape()?;
+        let post_apply_mode = match last_layer_shape.mode_override() {
+            Some(NetworkActivationMode::SoftMax) => NetworkActivationMode::Linear,
+            _ => NetworkActivationMode::SoftMax,
+        };
+        let probabilities = post_apply_mode.apply(&output);
+        Ok(probabilities)
     }
 
     pub fn predict_next(&self, last_words: &[&str]) -> Result<String> {
-        let network_input = self.get_padded_network_input(last_words)?;
-        let probabilities = self.compute_probabilities(network_input)?;
+        let probabilities = self.sample_probabilities(last_words)?;
         let sampled_idx = self.rng.sample_uniform(&probabilities)?;
+        let token = self.query_token(sampled_idx).cloned();
 
-        Ok(self
-            .vocab
-            .iter()
-            .find(|(_, vocab_idx)| **vocab_idx == sampled_idx)
-            .context("sampled vocab word should be in vocab dict")?
-            .0
-            .clone())
+        token.context("sampled vocab word should be in vocab dict")
     }
 
     pub fn predict_from(&self, last_word: &str) -> Result<String> {
-        let last_words: Vec<_> = iter::repeat(CONTROL_VOCAB)
-            .take(self.input_stride_width() - 1)
-            .chain([last_word].into_iter())
-            .collect();
-        let network_input = self.get_padded_network_input(&last_words[..])?;
-        let probabilities = self.compute_probabilities(network_input)?;
-        let sampled_idx = self.rng.sample_uniform(&probabilities)?;
-
-        Ok(self
-            .vocab
-            .iter()
-            .find(|(_, vocab_idx)| **vocab_idx == sampled_idx)
-            .context("sampled vocab word should be in vocab dict")?
-            .0
-            .clone())
+        self.predict_next(&[last_word])
     }
 
-    pub fn nll(&self, last_words: &Vec<&str>, expected_next_word: &str) -> Result<NodeValue> {
-        let network_input = self.get_padded_network_input(&last_words[..])?;
-
+    pub fn nll(&self, context_tokens: &Vec<&str>, expected_next_word: &str) -> Result<NodeValue> {
         let expected_vocab_idx = *self
             .vocab
             .get(&expected_next_word.to_string())
             .context("provided vocab word should be in vocab dict")?;
+        let expected_ouput = self.one_hot(expected_vocab_idx);
+        let context_vectors = self.get_padded_network_input(context_tokens)?;
 
-        let probabilities = self.compute_probabilities(network_input)?;
+        self.nll_vector(context_vectors, expected_ouput.collect())
+    }
 
+    pub fn nll_batch(&self, phrases: &Vec<Vec<String>>) -> Result<NodeValue> {
+        let testing_pairs = self.into_context_target_pairs(phrases.iter());
+        let mut nlls = vec![];
+
+        for (prev, actual) in testing_pairs {
+            let nll = self.nll_vector(prev, actual)?;
+            nlls.push(nll);
+        }
+
+        let nlls = LayerValues::new(nlls);
+        Ok(nlls.ave())
+    }
+
+    pub fn nll_vector(
+        &self,
+        context_vectors: LayerValues,
+        expected_ouput: LayerValues,
+    ) -> Result<NodeValue> {
+        let expected_vocab_idx = expected_ouput
+            .iter()
+            .position(|x| *x == 1.0)
+            .context("provided vocab word should be in vocab dict")?;
+
+        let output = self.network.compute(context_vectors)?;
+        let probabilities = self.compute_probabilities(&output)?;
         let log_logits = probabilities
             .get(expected_vocab_idx)
             .expect("output should have same count as vocab")
             .ln();
 
         Ok(-log_logits)
-    }
-
-    fn compute_probabilities(
-        &self,
-        network_input: LayerValues,
-    ) -> Result<LayerValues, anyhow::Error> {
-        let network_shape = &self.network.shape();
-        let last_layer_shape = network_shape
-            .iter()
-            .last()
-            .context("should have final layer defined")?;
-
-        let post_apply_mode = match last_layer_shape.mode_override() {
-            Some(NetworkActivationMode::SoftMax) => NetworkActivationMode::Linear,
-            _ => NetworkActivationMode::SoftMax,
-        };
-
-        let output = self.network.compute(network_input)?;
-        let probabilities = post_apply_mode.apply(&output);
-        Ok(probabilities)
-    }
-
-    pub fn nll_batch(&self, phrases: &Vec<Vec<String>>) -> Result<NodeValue> {
-        let word_locality_factor = 1;
-        let control_vocab = CONTROL_VOCAB.to_string();
-        let indexed_phrases = phrases
-            .iter()
-            .flat_map(|phrase| phrase.iter().chain([&control_vocab]));
-
-        let all_words = iter::repeat(&control_vocab)
-            .take(word_locality_factor)
-            .chain(indexed_phrases)
-            .collect::<Vec<_>>();
-
-        let windowed_word_vectors =
-            all_words
-                .windows(word_locality_factor + 1)
-                .map(|word_vectors| match word_vectors.split_last() {
-                    Some((last, rest)) => (rest, last),
-                    None => panic!("should have "),
-                });
-
-        let testing_pairs =
-            windowed_word_vectors.map(|(x, y)| (x.into_iter().map(|x| x.as_str()), y));
-
-        let mut nlls = vec![];
-
-        for (prev, actual) in testing_pairs {
-            let nll = self.nll(&prev.collect(), actual)?;
-            nlls.push(nll);
-        }
-
-        Ok(nlls.iter().sum::<NodeValue>() / nlls.len() as NodeValue)
     }
 
     pub fn predict_iter<'a>(&'a self, seed_word: &str) -> impl Iterator<Item = String> + 'a {
@@ -305,75 +259,57 @@ impl Embedding {
         })
     }
 
-    fn get_padded_network_input(&self, last_words: &[&str]) -> Result<LayerValues> {
+    fn get_padded_network_input<T: AsRef<str>>(&self, input_tokens: &[T]) -> Result<LayerValues> {
         let input_stride_width = self.input_stride_width();
-        let vocab_idxs = iter::repeat(&CONTROL_VOCAB)
-            .take(input_stride_width.saturating_sub(last_words.len()))
-            .chain(last_words.iter())
-            .skip(last_words.len().saturating_sub(input_stride_width))
+        let padded_network_input = self
+            .get_padded_network_input_iter(input_tokens)
+            .skip(input_tokens.len())
+            .take(input_stride_width)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(padded_network_input.into_iter().flatten().collect())
+    }
+
+    fn get_padded_network_input_iter<'a, T: AsRef<str>>(
+        &'a self,
+        input_tokens: &'a [T],
+    ) -> impl Iterator<Item = Result<impl Iterator<Item = f64>>> + 'a {
+        iter::repeat(CONTROL_VOCAB)
+            .take(self.input_stride_width())
+            .chain(input_tokens.iter().map(|x| x.as_ref()))
+            .chain([CONTROL_VOCAB].into_iter())
             .map(|vocab_word| {
-                self.vocab
-                    .get(&vocab_word.to_string())
-                    .context("can not find vocab word")
+                self.vocab.get(&vocab_word.to_string()).with_context(|| {
+                    format!("failed to resolve vocab from dict: unknown token '{vocab_word}'")
+                })
             })
-            .collect::<Vec<_>>();
-
-        if let Some(Err(e)) = vocab_idxs.iter().find(|v| v.is_err()) {
-            return Err(anyhow!("failed to resolve vocab from dict: {e}"));
-        }
-
-        let network_input = vocab_idxs
-            .into_iter()
-            .flatten()
-            .flat_map(|vocab_idx| self.one_hot(*vocab_idx))
-            .collect();
-        Ok(network_input)
+            .map(|vocab_idx| vocab_idx.map(|&vocab_idx| self.one_hot(vocab_idx)))
     }
 
     pub fn compute_error_batch(&self, phrases: &Vec<Vec<String>>) -> Result<NodeValue> {
-        let mut errors = vec![];
+        let mut errors: Vec<NodeValue> = vec![];
 
-        for testing_phrase in phrases.iter() {
-            let error = self.compute_error(testing_phrase)?;
-            errors.push(error);
+        let pairs = self.into_context_target_pairs(phrases.iter());
+        for (inputs, target_outputs) in pairs {
+            let error = self.network.compute_error(inputs, &target_outputs)?;
+            errors.push(error.ave());
         }
-        let error = errors
-            .into_iter()
-            .filter(|x| !x.is_nan())
-            .sum::<NodeValue>()
-            / phrases.len() as NodeValue;
 
-        Ok(error)
+        let errors = LayerValues::new(errors);
+        Ok(errors.ave())
     }
 
     pub fn compute_error(&self, phrase: &Vec<String>) -> Result<NodeValue> {
-        let indexed_phrase = phrase
-            .iter()
-            .map(|word| self.vocab.get(&word.to_string()))
-            .take_while(|word| word.is_some())
-            .flatten();
+        let mut errors: Vec<NodeValue> = vec![];
 
-        let vectored_phrase = indexed_phrase
-            .map(|&vocab_idx| self.one_hot(vocab_idx).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-
-        let mut errors = vec![];
-
-        for word_vectors in vectored_phrase.chunks_exact(self.input_stride_width() + 1) {
-            let (last_word_vector, context_word_vectors) = word_vectors
-                .split_last()
-                .context("should have last element")?;
-
-            let context_word_vectors = context_word_vectors.into_iter().flatten();
-            let inputs = context_word_vectors.cloned().collect();
-            let target_outputs = LayerValues::new(last_word_vector.clone());
-
+        let pairs = self.into_context_target_pairs([phrase].into_iter());
+        for (inputs, target_outputs) in pairs {
             let error = self.network.compute_error(inputs, &target_outputs)?;
-            let error: NodeValue = error.ave();
-            errors.push(error);
+            errors.push(error.ave());
         }
 
-        Ok(errors.iter().sum::<NodeValue>() / errors.len() as NodeValue)
+        let errors = LayerValues::new(errors);
+        Ok(errors.ave())
     }
 
     pub fn embeddings(&self, vocab_entry: &str) -> Result<LayerValues> {
@@ -417,7 +353,7 @@ impl Embedding {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
             .context("can not sort dot product collection")?;
 
-        let (_furthest_vocab, furthest_dot_product) = dot_products
+        let (_, furthest_dot_product) = dot_products
             .iter()
             .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
             .context("can not sort dot product collection")?;
@@ -428,9 +364,22 @@ impl Embedding {
         Ok((nearest_vocab.to_string(), similarity_fact))
     }
 
+    fn last_layer_shape(&self) -> Result<super::LayerShape> {
+        let network_shape = &self.network.shape();
+        let last_layer_shape = network_shape.iter().last();
+        last_layer_shape.context("should have final layer defined")
+    }
+
     fn one_hot(&self, idx: usize) -> impl Iterator<Item = NodeValue> {
         let vocab_len = self.vocab.len();
         (0..vocab_len).map(move |i| if i == idx { 1.0 } else { 0.0 })
+    }
+
+    pub fn query_token(&self, token_idx: usize) -> Option<&String> {
+        self.vocab
+            .iter()
+            .find(|(_, vocab_idx)| **vocab_idx == token_idx)
+            .map(|(token, _)| token)
     }
 
     pub fn input_stride_width(&self) -> usize {
@@ -440,6 +389,13 @@ impl Embedding {
 
     pub fn control_vocab(&self) -> &'static str {
         CONTROL_VOCAB
+    }
+
+    pub fn control_vocab_index(&self) -> usize {
+        *self
+            .vocab
+            .get(&CONTROL_VOCAB.to_string())
+            .expect("CONTROL_VOCAB should be present in vocab")
     }
 
     pub fn vocab(&self) -> &HashMap<String, usize> {
@@ -819,6 +775,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embeddings_phrases_can_transform_to_training_pairs() {
+        let phrase_str = "one two three four".to_string();
+        let phrase: Vec<String> = phrase_str
+            .split_whitespace()
+            .map(|word| word.to_string())
+            .collect();
+
+        let rng = RngStrategy::testable(12345);
+        let embedding = Embedding::new_builder(phrase.iter().cloned().collect())
+            .with_input_stride_width(2)
+            .with_rng(rng)
+            .build()
+            .unwrap();
+
+        let vocab = embedding.vocab();
+        let ctrl_token = embedding.control_vocab();
+        let one_hot = |token: &str| embedding.one_hot(vocab[&token.to_string()]);
+
+        let expected_pairs = [
+            ([ctrl_token, ctrl_token], "one"),
+            ([ctrl_token, "one"], "two"),
+            (["one", "two"], "three"),
+            (["two", "three"], "four"),
+            (["three", "four"], ctrl_token),
+        ];
+
+        let expected_context_target_pairs: Vec<(LayerValues, LayerValues)> = expected_pairs
+            .iter()
+            .map(|(ctx, target)| {
+                let ctx = ctx.iter().map(|x| one_hot(&x)).flatten();
+                let target = one_hot(&target);
+                (ctx.collect(), target.collect())
+            })
+            .collect();
+
+        let context_target_pairs = embedding.into_context_target_pairs([phrase].iter());
+
+        assert_eq!(context_target_pairs, expected_context_target_pairs);
+    }
+
+    #[test]
+    fn embeddings_phrases_can_pad_tokens_to_network_input() {
+        let vocab: HashSet<String> = ["one", "two", "three", "four"]
+            .into_iter()
+            .map(|word| word.to_string())
+            .collect();
+
+        let rng = RngStrategy::testable(12345);
+        let embedding = Embedding::new_builder(vocab)
+            .with_input_stride_width(3)
+            .with_rng(rng)
+            .build()
+            .unwrap();
+
+        let vocab = embedding.vocab();
+        let ctrl_token = embedding.control_vocab();
+        let vocab_idx = |vector: LayerValues| {
+            vector
+                .chunks_exact(vocab.len())
+                .flat_map(|x| x.iter().position(|&z| z == 1.0))
+                .flat_map(|idx| embedding.query_token(idx).map(|x| x.as_str()))
+                .collect::<Vec<_>>()
+        };
+
+        let expected_padded_vectors = &[ctrl_token, ctrl_token, "two"];
+        let context_padded_vectors =
+            vocab_idx(embedding.get_padded_network_input(&["two"]).unwrap());
+        assert_eq!(&context_padded_vectors[..], expected_padded_vectors);
+
+        let expected_padded_vectors = &[ctrl_token, "one", "two"];
+        let context_padded_vectors =
+            vocab_idx(embedding.get_padded_network_input(&["one", "two"]).unwrap());
+        assert_eq!(&context_padded_vectors[..], expected_padded_vectors);
+
+        let expected_padded_vectors = &["one", "two", "three"];
+        let context_padded_vectors = vocab_idx(
+            embedding
+                .get_padded_network_input(&["one", "two", "three"])
+                .unwrap(),
+        );
+        assert_eq!(&context_padded_vectors[..], expected_padded_vectors);
+
+        let expected_padded_vectors = &["two", "three", "four"];
+        let context_padded_vectors = vocab_idx(
+            embedding
+                .get_padded_network_input(&["one", "two", "three", "four"])
+                .unwrap(),
+        );
+        assert_eq!(&context_padded_vectors[..], expected_padded_vectors);
+    }
+
+    #[test]
     #[ignore = "takes too long"]
     fn embeddings_work_simple_counter_prediction_v2() {
         let phrases = [
@@ -1060,11 +1108,13 @@ mod tests {
             ),
             config: TestEmbeddingConfig,
         ) -> Embedding {
+            let rng = RngStrategy::testable(1234);
             let mut embedding = Embedding::new_builder(vocab)
                 .with_embedding_dimensions(config.embedding_size)
                 .with_hidden_layer_size(config.hidden_layer_nodes)
                 .with_input_stride_width(config.input_stride_width)
                 .with_activation_mode(config.activation_mode)
+                .with_rng(rng)
                 .build()
                 .unwrap();
 
