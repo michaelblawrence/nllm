@@ -10,7 +10,7 @@ use std::{
 
 use plane::ml::{
     embeddings::{builder::EmbeddingBuilder, Embedding},
-    JsRng, NodeValue, RNG,
+    NodeValue, RngStrategy, RNG,
 };
 
 use crate::training;
@@ -65,11 +65,7 @@ impl TrainerMessage {
                 TrainerHandleActions::DispatchWithMetadata(TrainerMessage::PlotTrainingLossGraph)
             }
             TrainerMessage::PlotTrainingLossGraphDispatch(metadata) => {
-                training::writer::plot_training_loss(
-                    &embedding,
-                    &config,
-                    &metadata
-                );
+                training::writer::plot_training_loss(&embedding, &config, &metadata);
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::WriteModelToDisk => {
@@ -103,7 +99,7 @@ impl TrainerMessage {
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::PredictRandomPhrase => {
-                let vocab_idx = JsRng::default().rand_range(0, embedding.vocab().len());
+                let vocab_idx = RngStrategy::default().rand_range(0, embedding.vocab().len());
                 let seed_word = embedding.vocab().keys().nth(vocab_idx).unwrap();
                 let sep = if config.use_character_tokens { "" } else { " " };
                 let predicted_phrase = embedding.predict_iter(seed_word).join(sep);

@@ -7,11 +7,12 @@ use std::{
 
 use itertools::Itertools;
 use plane::ml::{
-    embeddings::{Embedding, TrainBatchConfig}, NodeValue, RNG, RngStrategy,
+    embeddings::{Embedding, TrainBatchConfig},
+    NodeValue, RngStrategy, RNG,
 };
 
 use serde_json::Value;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     bounded::BoundedValueLogger,
@@ -71,7 +72,7 @@ impl TrainerState {
 
         let started = Instant::now();
         let train_error = self.embedding.train(phrases, self.learn_rate, batch_size);
-        
+
         let train_duration = started.elapsed();
         self.total_train_time += train_duration;
 
@@ -247,6 +248,7 @@ pub fn setup_and_train_embeddings_v2<F>(
 where
     F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions,
 {
+    info!("Initialising vocab and train/test sets");
     let rng: RngStrategy = Default::default();
     let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, rng.to_rc());
     let mut testing_phrases = match config.phrase_test_set_split_pct.filter(|x| *x > 0.0) {
@@ -257,14 +259,24 @@ where
     };
 
     if config.use_character_tokens {
+        info!("Tranforming vocab and train/test sets to character-level tokens");
         let word_mode = false; // TODO config?
         phrases = characterize_phrases(phrases, Some(config.input_stride_width), word_mode);
         testing_phrases =
             characterize_phrases(testing_phrases, Some(config.input_stride_width), word_mode);
         vocab = compute_vocab(&phrases);
     }
+    
+    let token_count = |x: &Vec<Vec<String>>| x.iter().map(|phrase| phrase.len()).sum::<usize>();
+    info!(
+        "Completed token initialisation: (vocab size = {} tokens)",
+        vocab.len()
+    );
+    info!("Loaded: [ tokens(train_set) = {}, sequences(train_set) = {}, tokens(test_set) = {}, sequences(test_set) = {} ]",
+        token_count(&phrases), phrases.len(),
+        token_count(&testing_phrases), testing_phrases.len()
+    );
 
-    dbg!((phrases.len(), vocab.len())); // TODO: replace with tracing logging
     let hidden_layer_shape = TrainerState::build_hidden_layer_shape(&config);
 
     let embedding = Embedding::new_builder(vocab)
@@ -371,22 +383,24 @@ pub fn init_phrases_and_vocab(
         .flat_map(|phrase| phrase.iter())
         .cloned()
         .fold(HashMap::new(), |mut counts, word| {
-            counts.entry(word).and_modify(|x| *x += 1).or_insert(1_i32);
+            if &word != " " {
+                counts.entry(word).and_modify(|x| *x += 1).or_insert(1_u64);
+            }
             counts
         });
 
     phrases.sort_by_cached_key(|phrase| {
-        -phrase
+        phrase
             .iter()
-            .map(|word| vocab_counts[word].pow(2))
-            .sum::<i32>()
+            .map(|word| -(vocab_counts.get(word).unwrap_or(&1).pow(2) as i128))
+            .sum::<i128>()
     });
 
     if let Some(phrase_train_set_size) = config.phrase_train_set_size {
         phrases.truncate(phrase_train_set_size);
     }
 
-    info!(
+    debug!(
         "First 3 phrases: {:#?}",
         phrases
             .iter()
@@ -432,6 +446,7 @@ fn characterize_phrases(
     min_word_len: Option<usize>,
     word_mode: bool,
 ) -> Vec<Vec<String>> {
+    let separator = " ".to_string();
     phrases
         .into_iter()
         .filter_map(|phrase| match min_word_len {
@@ -441,8 +456,7 @@ fn characterize_phrases(
                 None
             }
             _ => Some(
-                phrase
-                    .into_iter()
+                Itertools::intersperse(phrase.into_iter(), separator.clone())
                     .flat_map(|word| word.chars().map(|c| c.to_string()).collect_vec())
                     .collect_vec(),
             ),
@@ -617,11 +631,12 @@ mod validate {
                     correct_first_word_predictions += 1;
                 }
 
-                let error = embedding.compute_error(testing_phrase)?;
-                let nll = embedding.nll(&context_word_vectors, &actual)?;
-                validation_errors.push((error, nll));
                 total_first_word_predictions += 1;
             }
+
+            let error = embedding.compute_error(testing_phrase)?;
+            let nll = embedding.nll_batch(&vec![testing_phrase.iter().cloned().collect()])?;
+            validation_errors.push((error, nll));
         }
 
         let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
@@ -687,7 +702,7 @@ pub mod writer {
             config.output_label.as_ref().unwrap_or(&title.to_string())
         );
         let title = plotly::common::Title::new(&title);
-        
+
         plot.set_layout(plot.layout().clone().title(title));
 
         plot.show();
