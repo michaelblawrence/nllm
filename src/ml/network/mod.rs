@@ -1,14 +1,14 @@
-use std::{rc::Rc, str::FromStr};
+use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::ml::{ShuffleRng, RNG};
+use crate::ml::ShuffleRng;
 
 use layer::{Layer, LayerInitStrategy, LayerLearnStrategy};
 pub use layer::{LayerValues, NodeValue};
 
-use super::JsRng;
+use super::RngStrategy;
 
 pub mod layer;
 
@@ -77,8 +77,7 @@ impl NetworkShape {
     }
 
     pub fn desc_pretty(&self) -> String {
-        let stride_count =
-            |x: &LayerShape| x.stride_count.filter(|x| *x > 1).map(|x| format!("x{}", x));
+        let stride_count = |x: &LayerShape| x.stride().map(|x| format!("x{}", x));
 
         let mut node_counts = self
             .iter()
@@ -106,7 +105,7 @@ impl LayerShape {
         Self {
             node_count,
             strategy,
-            stride_count,
+            stride_count: stride_count.filter(|x| *x > 1),
             activation_mode,
         }
     }
@@ -122,12 +121,20 @@ impl LayerShape {
         self.activation_mode
     }
 
+    pub fn stride(&self) -> Option<usize> {
+        self.stride_count
+    }
+
     pub fn stride_count(&self) -> usize {
         self.stride_count.unwrap_or(1)
     }
 
     pub fn node_count(&self) -> usize {
         self.node_count
+    }
+
+    pub fn strategy(&self) -> &LayerInitStrategy {
+        &self.strategy
     }
 }
 
@@ -150,16 +157,17 @@ pub struct Network {
 
 impl Network {
     pub fn new(shape: NetworkShape) -> Self {
-        Self::new_with_rng(shape, Rc::new(JsRng::default()))
+        Self::new_with_rng(shape, RngStrategy::default())
     }
 
-    pub fn new_with_rng(shape: NetworkShape, rng: Rc<dyn RNG>) -> Self {
+    pub fn new_with_rng(shape: NetworkShape, rng: RngStrategy) -> Self {
         let mut layers = vec![];
+        let rng = rng.upgrade();
 
         for (pair_idx, pair) in shape.iter().collect::<Vec<_>>().windows(2).enumerate() {
             if let [lhs, rhs] = pair {
-                let layer_input_nodes = lhs.node_count * lhs.stride_count.unwrap_or(1);
-                let stride_count = rhs.stride_count.and_then(|n| {
+                let layer_input_nodes = lhs.node_count() * lhs.stride_count();
+                let stride_count = rhs.stride().and_then(|n| {
                     assert_eq!(
                         0, pair_idx,
                         "layer stride not yet supported for non-starting layers"
@@ -168,11 +176,11 @@ impl Network {
                 });
 
                 let layer = Layer::new(
-                    rhs.node_count,
+                    rhs.node_count(),
                     layer_input_nodes,
-                    &rhs.strategy,
+                    &rhs.strategy(),
                     stride_count,
-                    rng.clone(),
+                    &rng,
                 );
 
                 layers.push(layer)
@@ -568,7 +576,7 @@ pub enum NetworkLearnStrategy {
 pub enum BatchSamplingStrategy {
     None,
     Sequential(usize),
-    Shuffle(usize, Rc<dyn RNG>),
+    Shuffle(usize, RngStrategy),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -671,12 +679,15 @@ mod tests {
     use test_log::test;
     use tracing::info;
 
+    use comparer::ApproxFloatingPointComparable;
+
     use super::*;
 
     #[test]
     fn can_create_network() {
         let shape = NetworkShape::new(2, 2, vec![], LayerInitStrategy::Zero);
-        let network = Network::new(shape);
+        let rng = RngStrategy::testable(12345);
+        let network = Network::new_with_rng(shape, rng);
 
         assert_eq!(2, network.input_vector_size().unwrap());
     }
@@ -684,7 +695,8 @@ mod tests {
     #[test]
     fn can_create_hidden_layer_network() {
         let shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::Zero);
-        let network = Network::new(shape);
+        let rng = RngStrategy::testable(12345);
+        let network = Network::new_with_rng(shape, rng);
 
         assert_eq!(2, network.input_vector_size().unwrap());
     }
@@ -693,20 +705,22 @@ mod tests {
     fn can_compute_hidden_layer_network_zeros_linear_activation() {
         let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::Zero);
         shape.set_activation_mode(NetworkActivationMode::Linear);
-        let network = Network::new(shape);
+        let rng = RngStrategy::testable(12345);
+        let network = Network::new_with_rng(shape, rng);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
 
-        assert_eq!(vec![0.0, 0.0], *output);
+        assert_eq!(vec![0.0, 0.0].approx(), output.approx());
     }
 
     #[test]
     fn can_compute_hidden_layer_network_zeros() {
         let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::Zero);
         shape.set_activation_mode(NetworkActivationMode::SoftMax);
-        let network = Network::new(shape);
+        let rng = RngStrategy::testable(12345);
+        let network = Network::new_with_rng(shape, rng);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
 
-        assert_eq!(vec![0.5, 0.5], *output);
+        assert_eq!(vec![0.5, 0.5].approx(), output.approx());
         assert_eq!(1.0, output.iter().sum::<NodeValue>());
     }
 
@@ -714,10 +728,11 @@ mod tests {
     fn can_compute_hidden_layer_network_rands() {
         let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::PositiveRandom);
         shape.set_activation_mode(NetworkActivationMode::SoftMax);
-        let network = Network::new(shape);
+        let rng = RngStrategy::testable(12345);
+        let network = Network::new_with_rng(shape, rng);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
 
-        assert_ne!(vec![0.5, 0.5], *output);
+        assert_ne!(vec![0.5, 0.5].approx(), output.approx());
         assert_eq!(output.iter().sum::<NodeValue>().min(0.999), 0.999);
     }
 
@@ -725,7 +740,8 @@ mod tests {
     fn can_network_learn_randomly() {
         let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::PositiveRandom);
         shape.set_activation_mode(NetworkActivationMode::SoftMax);
-        let mut network = Network::new(shape);
+        let rng = RngStrategy::testable(12345);
+        let mut network = Network::new_with_rng(shape, rng);
 
         let output_1 = network.compute([2.0, 2.0].iter().into()).unwrap();
         network
@@ -737,9 +753,9 @@ mod tests {
 
         let output_2 = network.compute([2.0, 2.0].iter().into()).unwrap();
 
-        assert_ne!(vec![0.5, 0.5], *output_1);
-        assert_ne!(vec![0.5, 0.5], *output_2);
-        assert_ne!(*output_1, *output_2);
+        assert_ne!(vec![0.5, 0.5].approx(), output_1.approx());
+        assert_ne!(vec![0.5, 0.5].approx(), output_2.approx());
+        assert_ne!(output_1.approx(), output_2.approx());
     }
 
     #[test]
@@ -1067,7 +1083,8 @@ mod tests {
             activation_mode: NetworkActivationMode,
         ) -> Network {
             shape.set_activation_mode(activation_mode);
-            let network = Network::new(shape);
+            let rng = RngStrategy::testable(12345);
+            let network = Network::new_with_rng(shape, rng);
             network
         }
 
@@ -1146,6 +1163,40 @@ mod tests {
                     })
                     .unwrap()
                     .unwrap()
+            }
+        }
+    }
+
+    mod comparer {
+        #[derive(Debug)]
+        pub struct ApproxFloatingPointComparer<'a> {
+            inner: &'a Vec<f64>,
+        }
+
+        impl<'a> PartialEq for ApproxFloatingPointComparer<'a> {
+            fn eq(&self, other: &Self) -> bool {
+                if self.inner == other.inner {
+                    true
+                } else if self.inner.len() == other.inner.len() {
+                    for (a, b) in self.inner.iter().zip(other.inner.iter()) {
+                        if (a - b).abs() > 0.0001 {
+                            return false;
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+
+        pub trait ApproxFloatingPointComparable<'a> {
+            fn approx(&'a self) -> ApproxFloatingPointComparer<'a>;
+        }
+
+        impl<'a> ApproxFloatingPointComparable<'a> for Vec<f64> {
+            fn approx(&'a self) -> ApproxFloatingPointComparer<'a> {
+                ApproxFloatingPointComparer { inner: &self }
             }
         }
     }

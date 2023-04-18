@@ -5,15 +5,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::ml::NodeValue;
 
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum RngStrategy {
-    #[default]
     Default,
     Debug {
-        seed: u64,
+        seed: u32,
     },
-    #[serde(skip)]
-    Cached(Rc<dyn RNG>),
+    #[serde(serialize_with = "serialize_cached")]
+    #[serde(skip_deserializing)]
+    Cached(Rc<dyn RNG>, Box<RngStrategy>),
+}
+
+impl Default for RngStrategy {
+    fn default() -> Self {
+        Self::Default.upgrade()
+    }
 }
 
 impl Deref for RngStrategy {
@@ -31,39 +37,49 @@ impl RNG for RngStrategy {
 }
 
 impl RngStrategy {
+    pub fn testable(seed: u32) -> Self {
+        RngStrategy::Debug { seed }.upgrade()
+    }
+    
     pub fn to_rc(&self) -> Rc<dyn RNG> {
         match self {
-            RngStrategy::Default => Rc::new(Self::default_rng_factory()),
-            RngStrategy::Debug { seed } => Rc::new(Self::seedable_rng_factory(*seed)),
-            RngStrategy::Cached(instance) => instance.clone(),
+            RngStrategy::Cached(instance, _) => instance.clone(),
+            rng => rng.factory().unwrap().into(),
         }
     }
 
     pub fn with_rng<F: Fn(&dyn RNG) -> O, O>(&self, func: F) -> O {
         match self {
-            RngStrategy::Default => func(&Self::default_rng_factory()),
-            RngStrategy::Debug { seed } => func(&Self::seedable_rng_factory(*seed)),
-            RngStrategy::Cached(instance) => func(instance.as_ref()),
+            RngStrategy::Cached(instance, _) => func(instance.as_ref()),
+            rng => func(&*rng.factory().unwrap()),
         }
     }
 
     pub fn upgrade(self) -> Self {
         match self {
-            RngStrategy::Default => {
-                let rng = self.to_rc();
-                Self::Cached(rng)
-            }
-            x => x,
+            RngStrategy::Cached(instance, strategy) => RngStrategy::Cached(instance, strategy),
+            rng => RngStrategy::Cached(rng.to_rc(), Box::new(rng)),
         }
     }
 
-    fn default_rng_factory() -> impl RNG {
-        JsRng::default()
+    fn factory(&self) -> Option<Box<dyn RNG>> {
+        match self {
+            RngStrategy::Default => Some(Box::new(JsRng::default())),
+            RngStrategy::Debug { seed } => Some(Box::new(SeedableTestRng::new(*seed))),
+            RngStrategy::Cached(_, _) => None,
+        }
     }
+}
 
-    fn seedable_rng_factory(seed: u64) -> impl RNG {
-        SeedableTestRng::new(seed)
-    }
+fn serialize_cached<S>(
+    _: &Rc<dyn RNG>,
+    inner: &Box<RngStrategy>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    inner.serialize(serializer)
 }
 
 #[cfg(any(test, feature = "thread"))]
@@ -86,11 +102,13 @@ impl RNG for JsRng {
     }
 }
 
-pub struct SeedableTestRng(UnsafeCell<algo::park_miller::ParkMiller>);
+pub struct SeedableTestRng(UnsafeCell<algo::mersenne_twister::MersenneTwister>);
 
 impl SeedableTestRng {
-    pub fn new(seed: u64) -> Self {
-        Self(UnsafeCell::new(algo::park_miller::ParkMiller::new(seed)))
+    pub fn new(seed: u32) -> Self {
+        Self(UnsafeCell::new(
+            algo::mersenne_twister::MersenneTwister::new(seed),
+        ))
     }
 }
 
@@ -101,7 +119,69 @@ impl RNG for SeedableTestRng {
             let rand = inner.rand() - 1;
             rand as NodeValue
         };
+        rand * algo::mersenne_twister::F64_MULTIPLIER
+    }
+}
+
+pub struct FastSeedableTestRng(UnsafeCell<algo::park_miller::ParkMiller>);
+
+impl FastSeedableTestRng {
+    pub fn new(seed: u64) -> Self {
+        Self(UnsafeCell::new(algo::park_miller::ParkMiller::new(seed)))
+    }
+}
+
+impl RNG for FastSeedableTestRng {
+    fn rand(&self) -> NodeValue {
+        let rand = {
+            let inner = unsafe { &mut *self.0.get() };
+            let rand = inner.rand() - 1;
+            rand as NodeValue
+        };
         rand * algo::park_miller::F64_MULTIPLIER
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seedable_test_rng_samples_uniformly() {
+        let rng = SeedableTestRng::new(6);
+        assert_rng(&rng);
+    }
+
+    #[test]
+    fn fast_seedable_test_rng_samples_uniformly() {
+        let rng = FastSeedableTestRng::new(6);
+        assert_rng(&rng);
+    }
+
+    fn assert_rng(rng: &dyn RNG) {
+        let mut buckets = vec![0; 13];
+        let span = 1.0 / buckets.len() as f64;
+
+        let iters = 10_000;
+        for _ in 0..iters {
+            let rand = rng.rand();
+            let bucket_idx = (rand / span) as usize;
+            buckets[bucket_idx] += 1;
+        }
+
+        let min_expected = iters / (buckets.len() + 1).max((buckets.len() as f64 * 0.1) as usize);
+        for (i, bucket) in buckets.iter().enumerate() {
+            assert!(
+                *bucket > min_expected,
+                "bucket[{i}] distribution is not even {:?}",
+                buckets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("bucket[{i}]: {:.1}%", 100.0 * *c as f64 / iters as f64))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
     }
 }
 
@@ -170,6 +250,57 @@ impl<T: Deref<Target = dyn RNG>> SamplingRng for T {
 }
 
 mod algo {
+    pub mod mersenne_twister {
+        pub const F64_MULTIPLIER: f64 = 1.0 / u32::MAX as f64;
+
+        pub struct MersenneTwister {
+            state: [u32; 624],
+            index: usize,
+        }
+
+        impl MersenneTwister {
+            pub fn new(seed: u32) -> Self {
+                let mut mt = Self {
+                    state: [0; 624],
+                    index: 624,
+                };
+                mt.state[0] = seed;
+                for i in 1..624 {
+                    let prev = mt.state[i - 1];
+                    mt.state[i] = 0x6c078965_u32.wrapping_mul((prev ^ (prev >> 30)) + i as u32);
+                }
+                mt
+            }
+
+            pub fn rand(&mut self) -> u32 {
+                if self.index >= 624 {
+                    self.twist();
+                }
+                let mut y = self.state[self.index];
+                y ^= y >> 11;
+                y ^= (y << 7) & 0x9d2c_5680;
+                y ^= (y << 15) & 0xefc6_0000;
+                y ^= y >> 18;
+                self.index += 1;
+                y
+            }
+
+            fn twist(&mut self) {
+                const MATRIX_A: u32 = 0x9908_b0df;
+                const UPPER_MASK: u32 = 0x8000_0000;
+                const LOWER_MASK: u32 = 0x7fff_ffff;
+                for i in 0..624 {
+                    let x = (self.state[i] & UPPER_MASK) + (self.state[(i + 1) % 624] & LOWER_MASK);
+                    let mut x_a = x >> 1;
+                    if x % 2 != 0 {
+                        x_a ^= MATRIX_A;
+                    }
+                    self.state[i] = self.state[(i + 397) % 624] ^ x_a;
+                }
+                self.index = 0;
+            }
+        }
+    }
     pub mod park_miller {
         const MODULUS: u64 = 2_147_483_647;
         const MULTIPLIER: u64 = 16_807;

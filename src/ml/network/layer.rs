@@ -6,7 +6,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::ml::RNG;
+use crate::ml::{RNG, RngStrategy};
 
 #[cfg(not(short_floats))]
 pub type NodeValue = f64;
@@ -29,7 +29,7 @@ impl Layer {
         inputs_count: usize,
         init_stratergy: &LayerInitStrategy,
         stride_count: Option<usize>,
-        rng: Rc<dyn RNG>,
+        rng: &RngStrategy,
     ) -> Self {
         let weights_size = inputs_count * size;
         let stride_count = stride_count.filter(|n| *n > 1);
@@ -48,7 +48,7 @@ impl Layer {
             layer.weights.iter_mut(),
             layer.bias.iter_mut().flatten(),
             inputs_count,
-            rng.as_ref(),
+            &rng,
         );
 
         layer
@@ -123,7 +123,7 @@ impl Layer {
 
                 for (x, grad) in self.weights.iter_mut().zip(weights_gradients.iter()) {
                     let next_val = *x - (grad * learn_rate);
-                    *x = if !next_val.is_nan() {
+                    *x = if next_val.is_finite() {
                         next_val
                     } else {
                         // continue;
@@ -134,7 +134,7 @@ impl Layer {
                 }
                 for (x, grad) in self.bias.iter_mut().flatten().zip(gradients.iter()) {
                     let next_val = *x - (grad * learn_rate);
-                    *x = if !next_val.is_nan() {
+                    *x = if next_val.is_finite() {
                         next_val
                     } else {
                         // continue;
@@ -389,7 +389,7 @@ impl LayerInitStrategy {
         weights: impl Iterator<Item = &'a mut NodeValue>,
         bias: impl Iterator<Item = &'a mut NodeValue>,
         inputs_count: usize,
-        rng: &dyn RNG,
+        rng: &RngStrategy,
     ) {
         use LayerInitStrategy::*;
 
