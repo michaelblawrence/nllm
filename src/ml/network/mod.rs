@@ -85,6 +85,10 @@ impl NetworkShape {
 
         itertools::Itertools::join(&mut node_counts, " -> ")
     }
+
+    pub fn layers_shape(&self) -> &[LayerShape] {
+        self.layers_shape.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -539,7 +543,7 @@ impl Network {
 
     #[inline]
     fn final_layer_activation(&self) -> Result<NetworkActivationMode> {
-        let last_idx = self.shape.layers_shape.len() - 1;
+        let last_idx = self.shape.len() - 1;
         self.layer_activation(last_idx)
     }
 

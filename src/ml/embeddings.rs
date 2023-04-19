@@ -220,41 +220,47 @@ impl Embedding {
 
     pub fn predict_from_iter<'a>(
         &'a self,
-        seed_words: &[&str],
+        seed_tokens: &[&str],
     ) -> impl Iterator<Item = String> + 'a {
-        let mut seen_words = HashMap::new();
-        let (curr_word, seed_words) = seed_words
+        let mut token_counts = HashMap::new();
+        let (curr_token, seed_tokens) = seed_tokens
             .split_last()
             .expect("should have at lease one element");
-        let mut curr_word = curr_word.to_string();
-        let mut recent_generated_words =
-            VecDeque::from_iter(seed_words.iter().map(|x| x.to_string()));
+
+        let mut curr_token = curr_token.to_string();
+        let mut context_tokens = VecDeque::from_iter(seed_tokens.iter().map(|x| x.to_string()));
+
+        let input_stride_width = self.input_stride_width();
+        let max_len = |token: &str| if token.len() > 1 { 4 } else { 40 };
 
         std::iter::from_fn(move || {
-            if curr_word.as_str() == CONTROL_VOCAB {
+            if curr_token.as_str() == CONTROL_VOCAB {
                 None
-            } else if seen_words.get(&curr_word).cloned().unwrap_or_default() > 3 {
+            } else if token_counts.get(&curr_token).unwrap_or(&0) > &max_len(&curr_token) {
                 None
             } else {
-                let last_word = curr_word.clone();
+                let last_token = curr_token.clone();
 
-                recent_generated_words.push_back(last_word.clone());
-                *seen_words.entry(last_word.clone()).or_insert(0) += 1;
+                context_tokens.push_back(last_token.clone());
+                let skip_count =
+                    last_token.len() == 1 && !last_token.chars().next().unwrap().is_alphabetic();
 
-                curr_word = self
-                    .predict_next(
-                        &recent_generated_words
-                            .iter()
-                            .map(|a| a.as_str())
-                            .collect::<Vec<_>>()[..],
-                    )
-                    .ok()?;
-                let input_stride_width = self.input_stride_width();
-                while recent_generated_words.len() > input_stride_width {
-                    recent_generated_words.pop_front();
+                if !skip_count {
+                    *token_counts.entry(last_token.clone()).or_insert(0) += 1;
                 }
 
-                Some(last_word)
+                let context_tokens_slice = &context_tokens
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect::<Vec<_>>()[..];
+
+                curr_token = self.predict_next(&context_tokens_slice).ok()?;
+
+                while context_tokens.len() > input_stride_width {
+                    context_tokens.pop_front();
+                }
+
+                Some(curr_token.clone()).filter(|token| &token != &CONTROL_VOCAB)
             }
         })
     }
