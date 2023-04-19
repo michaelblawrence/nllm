@@ -9,7 +9,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use plane::ml::embeddings::builder::EmbeddingBuilder;
+use itertools::Itertools;
+use plane::ml::{embeddings::builder::EmbeddingBuilder, RngStrategy, SamplingRng};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -26,9 +27,11 @@ fn run(model_fpath: &mut Option<String>) -> bool {
     };
 
     let (json, state) = extract_config(json).expect("failed to parse config");
+    let rng = RngStrategy::default();
 
     let embedding = EmbeddingBuilder::from_snapshot(&json)
         .expect("failed to rebuild state from snapshot")
+        .with_rng(rng.clone())
         .build()
         .expect("failed to rebuild instance from snapshot state");
 
@@ -46,7 +49,7 @@ fn run(model_fpath: &mut Option<String>) -> bool {
     let append_space = char_mode && embedding.vocab().contains_key(" ");
 
     println!("Starting... (character input mode = {char_mode})");
-    println!("   - Commands available: [ '.load <path>' | '.reload' | '.supervise' | '.quit' ]");
+    println!("   - Commands available: [ '.load <path>' | '.reload' | '.supervise' | '.reset' | '.quit' ]");
     println!("");
 
     let stdin = io::stdin();
@@ -99,7 +102,13 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             vocab.as_ref(),
             char_mode && vocab_supervised_predictions_enabled,
         ) {
-            predict_supervised(&embedding, &context_tokens, vocab, default_min_word_len)
+            predict_supervised(
+                &embedding,
+                &context_tokens,
+                vocab,
+                default_min_word_len,
+                &rng,
+            )
         } else {
             embedding.predict_from_iter(&context_tokens).collect()
         };
@@ -173,6 +182,7 @@ fn predict_supervised(
     context_tokens: &Vec<&str>,
     vocab: &HashSet<String>,
     min_word_len: usize,
+    rng: &RngStrategy,
 ) -> Vec<String> {
     let ctrl_token = embedding.control_vocab();
     let word_separator_token = " ".to_string();
@@ -193,7 +203,7 @@ fn predict_supervised(
             }
         };
 
-        if &generated_token == " " {
+        if !is_token_alphabetic(&generated_token) {
             word_queue.clear();
         } else if &generated_token == ctrl_token {
             break;
@@ -234,13 +244,62 @@ fn predict_supervised(
 
         if insert_separator {
             word_queue.clear();
-            generated_queue.push(word_separator_token.to_string());
-            context_queue.push_back(word_separator_token.to_string());
+
+            let context_tokens_str: Vec<&str> = context_queue.iter().map(|x| x.as_str()).collect();
+            let word_separator_token =
+                match predict_word_separator_token(embedding, rng, &context_tokens_str) {
+                    Ok(token) => token,
+                    Err(e) => {
+                        println!("Error sampling separator token: ({e})");
+                        word_separator_token.to_string()
+                    }
+                };
+
+            generated_queue.push(word_separator_token.clone());
+            context_queue.push_back(word_separator_token.clone());
         }
 
         last_token = &context_queue.back().unwrap();
     }
+
+    while generated_queue.last().unwrap() != ctrl_token {
+        generated_queue.pop();
+    }
+
     generated_queue
+}
+
+fn predict_word_separator_token(
+    embedding: &plane::ml::embeddings::Embedding,
+    rng: &RngStrategy,
+    context_tokens_str: &[&str],
+) -> Result<String> {
+    let token_probabilites = embedding.sample_probabilities(&context_tokens_str)?;
+    let ordered_tokens: Vec<_> = embedding
+        .vocab()
+        .iter()
+        .sorted_by_key(|(_, &id)| id)
+        .map(|(token, _)| token)
+        .collect();
+
+    let word_separator_probabilites: Vec<_> = ordered_tokens
+        .iter()
+        .zip(token_probabilites.iter())
+        .filter(|(token, _)| !is_token_alphabetic(&token))
+        .collect();
+
+    let probabilities = word_separator_probabilites.iter().map(|(_, &x)| x);
+    let sum_probabilities: f64 = probabilities.clone().sum();
+    let probabilities = probabilities.map(|x| x / sum_probabilities).collect();
+
+    let idx = rng.sample_uniform(&probabilities)?;
+    let token = *word_separator_probabilites[idx].0;
+
+    Ok(token.clone())
+}
+
+fn is_token_alphabetic(token: &String) -> bool {
+    token.chars().next().unwrap_or(' ').is_alphabetic()
 }
 
 fn parse_word_level_vocab(input_txt_path: &str, min_word_len: Option<usize>) -> HashSet<String> {
@@ -340,6 +399,10 @@ fn process_repl_commands(input_txt: &str, model_fpath: Option<&String>) -> CliRe
 
     if input_txt == ".supervise" {
         return CliReplActions::SetVocabSupervisionEnabled(true);
+    }
+
+    if input_txt == ".reset" {
+        return CliReplActions::SetVocabSupervisionEnabled(false);
     }
 
     if input_txt.starts_with(".load") {
