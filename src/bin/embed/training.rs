@@ -266,7 +266,7 @@ where
             characterize_phrases(testing_phrases, Some(config.input_stride_width), word_mode);
         vocab = compute_vocab(&phrases);
     }
-    
+
     let token_count = |x: &Vec<Vec<String>>| x.iter().map(|phrase| phrase.len()).sum::<usize>();
     info!(
         "Completed token initialisation: (vocab size = {} tokens)",
@@ -468,8 +468,13 @@ pub fn parse_phrases(config: &TrainEmbeddingConfig) -> Vec<Vec<String>> {
     match &config.input_txt_path {
         Some(path) => read_plaintext_phrases(&path),
         None => {
-            let phrase_json = include_str!("../../../res/phrase_list.json");
-            let phrase_json: Value = serde_json::from_str(phrase_json).unwrap();
+            use std::io::Read;
+
+            // TODO: remove fallback when old config files archived
+            let mut file = File::open("../../../res/phrase_list.json").unwrap(); // TODO: error handling
+            let mut phrase_json = String::new();
+            file.read_to_string(&mut phrase_json).unwrap();
+            let phrase_json: Value = serde_json::from_str(&phrase_json).unwrap();
 
             phrase_json
                 .as_array()

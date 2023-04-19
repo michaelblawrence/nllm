@@ -197,5 +197,11 @@ fn load_embedding(
     if let Some(batch_size) = load_config.batch_size {
         config.batch_size = batch_size;
     }
+    if let Some(input_txt_path) = load_config.input_txt_path {
+        config.input_txt_path = Some(input_txt_path);
+    }
+    if let Some(phrase_test_set_max_tokens) = load_config.phrase_test_set_max_tokens {
+        config.phrase_test_set_max_tokens = Some(phrase_test_set_max_tokens);
+    }
     Ok((config, Some((snapshot, state))))
 }

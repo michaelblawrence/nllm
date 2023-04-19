@@ -94,6 +94,12 @@ pub struct LoadEmbeddingConfig {
     #[arg(short = 'b', long, default_value = None)]
     pub batch_size: Option<usize>,
 
+    #[arg(short = 'i', long, default_value = None)]
+    pub input_txt_path: Option<String>,
+
+    #[arg(short = 'W', long, default_value = None)]
+    pub phrase_test_set_max_tokens: Option<usize>,
+
     #[arg(long, default_value = None)]
     pub repl: Option<String>,
 }
