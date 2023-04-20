@@ -71,7 +71,8 @@ pub(crate) fn split_training_and_testing(
 pub(crate) fn parse_vocab_and_phrases(
     max_vocab: Option<usize>,
 ) -> (HashSet<String>, Vec<Vec<String>>) {
-    let phrase_json = include_str!("../../../res/phrase_list.json");
+    // let phrase_json = include_str!("../../../res/phrase_list.json");
+    let phrase_json = todo!();
     let phrase_json: serde_json::Value = serde_json::from_str(phrase_json).unwrap();
     let mut phrases: Vec<Vec<String>> = phrase_json
         .as_array()
