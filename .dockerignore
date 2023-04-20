@@ -1,9 +1,7 @@
-/target
+/.vscode
 /dist
 /out
-/.vscode
 /res
-!/res/scripts
 !/res/tinyimdb.txt
 !/res/tinyshakespeare.txt
-.DS_Store
+/target
