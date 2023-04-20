@@ -12,6 +12,7 @@ RUN set -eux; \
 		mkdir src/bin; \
 		mkdir src/bin/embed; \
 		cp src/main.rs src/bin/derivate.rs; \
+		cp src/main.rs src/bin/upload.rs; \
 		cp src/main.rs src/bin/embed/main.rs;
 
 COPY Cargo.toml Cargo.lock ./
