@@ -9,12 +9,17 @@ edition = "2021"
 name = "embed"
 required-features = ["cli", "thread"]
 
+[[bin]]
+name = "upload"
+required-features = ["db"]
+
 [dependencies]
 anyhow = { version = "1.0.69", features = ["backtrace"] }
 clap = { version = "4.1.13", features = ["derive"], optional = true }
 crossterm = { version = "0.26.1", optional = true }
 itertools = "0.10.5"
 js-sys = "0.3.61"
+mongodb = { version = "2.5.0", default-features = false, features = ["tokio-sync"], optional = true }
 plotly = { version = "0.8.3", features = ["wasm"] }
 rand = { version = "0.8.5", optional = true }
 rand_distr = { version = "0.4.3", optional = true }
@@ -35,6 +40,7 @@ rand = { version = "0.8.5" }
 test-log = { version = "0.2.11", default-features = false, features = ["trace"] }
 
 [features]
+db = ["mongodb"]
 cli = ["crossterm", "clap"]
 thread = ["rand", "rand_distr"]
 threadpool = ["rayon"]
