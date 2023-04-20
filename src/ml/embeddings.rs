@@ -450,7 +450,7 @@ impl Deref for TrainBatchConfig {
 pub mod builder {
     use std::collections::{HashMap, HashSet};
 
-    use anyhow::{Context, Result};
+    use anyhow::{anyhow, Context, Result};
     use serde_json::Value;
 
     use crate::ml::{
@@ -469,7 +469,7 @@ pub mod builder {
         activation_mode: NetworkActivationMode,
         embedding_dimensions: usize,
         input_stride_width: usize,
-        hidden_layer_shape: Vec<usize>,
+        hidden_layer_shape: Vec<LayerShapeConfig>,
         hidden_layer_init_stratergy: LayerInitStrategy,
         rng: RngStrategy,
     }
@@ -484,7 +484,7 @@ pub mod builder {
                 activation_mode: NetworkActivationMode::Tanh,
                 embedding_dimensions: 2,
                 input_stride_width: 1,
-                hidden_layer_shape: vec![10],
+                hidden_layer_shape: vec![10.into()],
                 hidden_layer_init_stratergy: LayerInitStrategy::ScaledFullRandom,
                 rng: Default::default(),
             }
@@ -514,7 +514,7 @@ pub mod builder {
 
             let input_stride_width = Self::input_stride_width(&network);
             let hidden_layer_shape = Self::hidden_layer_shape_from_network(&network);
-            let hidden_layer_shape = hidden_layer_shape.map(|shape| shape.node_count()).collect();
+            let hidden_layer_shape = hidden_layer_shape.map(|shape| shape.into()).collect();
 
             let default_builder = Self::default();
             let embedding_dimensions = Self::embedding_dimensions(&network);
@@ -536,7 +536,7 @@ pub mod builder {
             let embeddings_layer = embedding.flatten_embeddings()?;
             let input_stride_width = Self::input_stride_width(&embedding.network);
             let hidden_layer_shape = Self::hidden_layer_shape_from_network(&embedding.network);
-            let hidden_layer_shape = hidden_layer_shape.map(|shape| shape.node_count()).collect();
+            let hidden_layer_shape = hidden_layer_shape.map(|shape| shape.into()).collect();
             let rng = embedding.rng.clone();
 
             let default_builder = Self::default();
@@ -637,7 +637,7 @@ pub mod builder {
                         self.hidden_layer_shape,
                         self.hidden_layer_init_stratergy,
                         self.activation_mode,
-                    );
+                    )?;
                     Network::new(network_shape)
                 }
             };
@@ -654,20 +654,32 @@ pub mod builder {
         fn build_shape(
             token_count: usize,
             embedding_layer_shape: LayerShape,
-            hidden_layer_shape: Vec<usize>,
+            hidden_layer_shape: Vec<LayerShapeConfig>,
             hidden_layer_init_strategy: LayerInitStrategy,
             activation_mode: NetworkActivationMode,
-        ) -> NetworkShape {
-            let strategy = hidden_layer_init_strategy;
-            let final_layer_strategy = LayerInitStrategy::KaimingZeroBias;
-            let final_layer: LayerShape = (token_count, final_layer_strategy).into();
-            let hidden_layer_shape = hidden_layer_shape.into_iter();
+        ) -> Result<NetworkShape> {
+            let to_hidden_layer = |n: LayerShapeConfig| -> Result<LayerShape> {
+                let shape = (n.dimensions, hidden_layer_init_strategy.clone());
+                let shape: LayerShape = shape.into();
 
-            let layers_shape = [embedding_layer_shape]
+                if n.residual {
+                    Err(anyhow!("residual_connections not yet supported"))?;
+                    Ok(shape.with_residual_connections(true))
+                } else {
+                    Ok(shape)
+                }
+            };
+
+            let output_layer = (token_count, LayerInitStrategy::KaimingZeroBias);
+            let output_layer: LayerShape = output_layer.into();
+            let output_layer_shape =
+                output_layer.with_activation_mode(NetworkActivationMode::SoftMax);
+
+            let layers_shape = [Ok(embedding_layer_shape)]
                 .into_iter()
-                .chain(hidden_layer_shape.map(|n| (n, strategy.clone()).into()))
-                .chain([final_layer.with_activation_mode(NetworkActivationMode::SoftMax)])
-                .collect();
+                .chain(hidden_layer_shape.into_iter().map(to_hidden_layer))
+                .chain([Ok(output_layer_shape)])
+                .collect::<Result<_>>()?;
 
             NetworkShape::new_custom(token_count, layers_shape, activation_mode)
         }
@@ -709,13 +721,16 @@ pub mod builder {
             self
         }
 
-        pub fn with_hidden_layer_custom_shape(mut self, hidden_layer_shape: Vec<usize>) -> Self {
-            self.hidden_layer_shape = hidden_layer_shape;
+        pub fn with_hidden_layer_custom_shape<S: Into<LayerShapeConfig>>(
+            mut self,
+            hidden_layer_shape: Vec<S>,
+        ) -> Self {
+            self.hidden_layer_shape = hidden_layer_shape.into_iter().map(|x| x.into()).collect();
             self
         }
 
         pub fn with_hidden_layer_size(mut self, hidden_layer_size: usize) -> Self {
-            self.hidden_layer_shape = vec![hidden_layer_size];
+            self.hidden_layer_shape = vec![hidden_layer_size.into()];
             self
         }
 
@@ -728,7 +743,7 @@ pub mod builder {
         }
 
         fn is_distinct_layer_shape(
-            self_hidden_layer_shape: &Vec<usize>,
+            self_hidden_layer_shape: &Vec<LayerShapeConfig>,
             input_stride_width: usize,
             network: &Network,
         ) -> bool {
@@ -741,7 +756,7 @@ pub mod builder {
                     let ref_hidden_layer_shape =
                         ref_hidden_layer_shape.map(|shape| shape.node_count());
 
-                    !ref_hidden_layer_shape.eq(self_hidden_layer_shape.iter().cloned())
+                    !ref_hidden_layer_shape.eq(self_hidden_layer_shape.iter().map(|x| x.dimensions))
                 }
             }
         }
@@ -763,7 +778,40 @@ pub mod builder {
         }
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone, Debug)]
+    pub struct LayerShapeConfig {
+        dimensions: usize,
+        residual: bool,
+    }
+
+    impl LayerShapeConfig {
+        pub fn with_residual_connections(self) -> Self {
+            Self {
+                residual: true,
+                ..self
+            }
+        }
+    }
+
+    impl From<usize> for LayerShapeConfig {
+        fn from(value: usize) -> Self {
+            Self {
+                dimensions: value,
+                residual: false,
+            }
+        }
+    }
+
+    impl From<LayerShape> for LayerShapeConfig {
+        fn from(value: LayerShape) -> Self {
+            Self {
+                dimensions: value.node_count(),
+                residual: value.residual_connections(),
+            }
+        }
+    }
+
+    #[derive(Clone, Default, Debug)]
     pub struct BuilderContext {
         pub rebuilt_network: bool,
         pub restored_exact_network: bool,

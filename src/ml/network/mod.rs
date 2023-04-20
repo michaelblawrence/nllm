@@ -42,12 +42,24 @@ impl NetworkShape {
         inputs_count: usize,
         layers_shape: Vec<LayerShape>,
         activation_mode: NetworkActivationMode,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let residual_connections_mismatch = layers_shape
+            .windows(2)
+            .map(|l| (&l[0], &l[1]))
+            .filter(|(lhs, _)| lhs.residual_connections)
+            .any(|(lhs, rhs)| lhs.output_vector_len() != rhs.output_vector_len());
+
+        if residual_connections_mismatch {
+            return Err(anyhow!(
+                "layers with residual connections must share vector dimensions"
+            ));
+        }
+
+        Ok(Self {
             inputs_count,
             layers_shape,
             activation_mode,
-        }
+        })
     }
 
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = LayerShape> + 'a {
@@ -97,6 +109,8 @@ pub struct LayerShape {
     strategy: LayerInitStrategy,
     stride_count: Option<usize>,
     activation_mode: Option<NetworkActivationMode>,
+    #[serde(default)]
+    residual_connections: bool,
 }
 
 impl LayerShape {
@@ -111,12 +125,20 @@ impl LayerShape {
             strategy,
             stride_count: stride_count.filter(|x| *x > 1),
             activation_mode,
+            residual_connections: false,
         }
     }
 
     pub fn with_activation_mode(self, mode: NetworkActivationMode) -> Self {
         Self {
             activation_mode: Some(mode),
+            ..self
+        }
+    }
+
+    pub fn with_residual_connections(self, enable: bool) -> Self {
+        Self {
+            residual_connections: enable,
             ..self
         }
     }
@@ -137,8 +159,16 @@ impl LayerShape {
         self.node_count
     }
 
+    pub fn output_vector_len(&self) -> usize {
+        self.node_count * self.stride_count.unwrap_or(1)
+    }
+
     pub fn strategy(&self) -> &LayerInitStrategy {
         &self.strategy
+    }
+
+    pub fn residual_connections(&self) -> bool {
+        self.residual_connections
     }
 }
 
@@ -149,6 +179,7 @@ impl From<(usize, LayerInitStrategy)> for LayerShape {
             strategy,
             stride_count: None,
             activation_mode: None,
+            residual_connections: false,
         }
     }
 }
@@ -168,29 +199,14 @@ impl Network {
         let mut layers = vec![];
         let rng = rng.upgrade();
 
-        for (pair_idx, pair) in shape.iter().collect::<Vec<_>>().windows(2).enumerate() {
-            if let [lhs, rhs] = pair {
-                let layer_input_nodes = lhs.node_count() * lhs.stride_count();
-                let stride_count = rhs.stride().and_then(|n| {
-                    assert_eq!(
-                        0, pair_idx,
-                        "layer stride not yet supported for non-starting layers"
-                    );
-                    Some(n)
-                });
-
-                let layer = Layer::new(
-                    rhs.node_count(),
-                    layer_input_nodes,
-                    &rhs.strategy(),
-                    stride_count,
-                    &rng,
-                );
-
-                layers.push(layer)
-            } else {
-                panic!("failed to window layer shape");
+        for (pair_idx, (lhs, rhs)) in itertools::Itertools::tuple_windows(shape.iter()).enumerate()
+        {
+            if pair_idx != 0 && rhs.stride().is_some() {
+                todo!("layer stride not yet supported for non-starting layers");
             }
+            let layer_input_nodes = lhs.output_vector_len();
+            let layer = Layer::new(layer_input_nodes, &rhs, &rng);
+            layers.push(layer)
         }
 
         Self { layers, shape }

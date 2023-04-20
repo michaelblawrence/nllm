@@ -1,11 +1,11 @@
-use std::{
-    ops::{Deref, DerefMut},
-};
+use std::ops::{Deref, DerefMut};
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::ml::{RNG, RngStrategy};
+use crate::ml::{RngStrategy, RNG};
+
+use super::LayerShape;
 
 #[cfg(not(short_floats))]
 pub type NodeValue = f64;
@@ -23,24 +23,19 @@ pub struct Layer {
 }
 
 impl Layer {
-    pub fn new(
-        size: usize,
-        inputs_count: usize,
-        init_stratergy: &LayerInitStrategy,
-        stride_count: Option<usize>,
-        rng: &RngStrategy,
-    ) -> Self {
-        let weights_size = inputs_count * size;
-        let stride_count = stride_count.filter(|n| *n > 1);
+    pub fn new(inputs_count: usize, shape: &LayerShape, rng: &RngStrategy) -> Self {
+        let size = shape.node_count();
+        let init_stratergy = &shape.strategy();
+
         let mut layer = Self {
-            weights: vec![0.0; weights_size],
+            weights: vec![0.0; inputs_count * size],
             bias: match &init_stratergy {
                 LayerInitStrategy::NoBias => None,
                 _ => Some(vec![0.0; size]),
             },
             inputs_count,
             size,
-            stride_count,
+            stride_count: shape.stride(),
         };
 
         init_stratergy.apply(
