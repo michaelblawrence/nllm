@@ -28,7 +28,7 @@ RUN set -eux; \
         touch src/bin/embed/main.rs src/bin/derivate.rs src/main.rs; \
 		just build;
 
-RUN set -eux;
+RUN set -eux; \
         just install; \
         just install-upload;
 

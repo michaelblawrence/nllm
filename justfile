@@ -77,6 +77,6 @@ push-node node_ip version="v1":
   ssh root@{{node_ip}} mkdir -p /home/docker/code/{{version}}
   git archive --format=zip HEAD > ./res/archive.zip
   scp -p ./res/archive.zip root@{{node_ip}}:/home/docker/code
-  ssh root@{{node_ip}} "cd /home/docker/code/{{version}}; unzip ../archive.zip"
+  ssh root@{{node_ip}} "cd /home/docker/code/{{version}}; unzip -o ../archive.zip"
   scp -p ./res/tiny*.txt root@{{node_ip}}:/home/docker/code/{{version}}/res/
   ssh root@{{node_ip}} "cd /home/docker/code/{{version}}; just docker-test"
