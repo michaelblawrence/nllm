@@ -61,14 +61,14 @@ docker-up-mongo: docker-down-mongo
 
 docker-test: docker-build
   docker run --name embedtestrun --rm embed just testrun-tinyshakespeare
-  docker logs -f embedtestrun
+  docker logs -f embedtestrun || true
 
 docker-test-tty: docker-build
   docker run --rm -it embed just testrun-tinyshakespeare
 
 docker-test-upload: docker-build
   docker run --name embedtestupload --rm embed just testrun-tinyshakespeare upload-tinyshakespeare
-  docker logs -f embedtestupload
+  docker logs -f embedtestupload || true
 
 docker-test-upload-tty: docker-build
   docker run --rm -it embed just testrun-tinyshakespeare upload-tinyshakespeare
