@@ -22,11 +22,12 @@ RUN set -eux; \
 		cargo build --features="cli thread threadpool" --release --bin embed;
 
 COPY src src
-COPY justfile ./
 
 RUN set -eux; \
         touch src/bin/embed/main.rs src/bin/derivate.rs src/main.rs; \
-		just build;
+		cargo build --features="cli thread threadpool" --release --bin embed;
+
+COPY justfile ./
 
 RUN set -eux; \
         just install; \
