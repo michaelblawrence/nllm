@@ -17,6 +17,7 @@ itertools = "0.10.5"
 js-sys = "0.3.61"
 plotly = { version = "0.8.3", features = ["wasm"] }
 rand = { version = "0.8.5", optional = true }
+rand_distr = { version = "0.4.3", optional = true }
 rayon = { version = "1.7.0", optional = true }
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = "1.0.93"
@@ -35,6 +36,6 @@ test-log = { version = "0.2.11", default-features = false, features = ["trace"] 
 
 [features]
 cli = ["crossterm", "clap"]
-thread = ["rand"]
+thread = ["rand", "rand_distr"]
 threadpool = ["rayon"]
 short_floats = []
