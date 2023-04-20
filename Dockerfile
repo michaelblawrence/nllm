@@ -26,8 +26,11 @@ COPY justfile ./
 
 RUN set -eux; \
         touch src/bin/embed/main.rs src/bin/derivate.rs src/main.rs; \
-		just build; \
-        just install;
+		just build;
+
+RUN set -eux;
+        just install; \
+        just install-upload;
 
 COPY res/tinyimdb.txt ./
 COPY res/tinyshakespeare.txt ./
