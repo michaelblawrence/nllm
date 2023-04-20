@@ -1,12 +1,7 @@
-use std::{
-    collections::HashSet,
-    env,
-    fs::{self, File},
-    io::{BufRead, BufReader, BufWriter, Write},
-};
+use std::{env, fs::File, io::BufReader, path::Path};
 
 use anyhow::Result;
-use itertools::Itertools;
+
 use mongodb::sync::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,7 +16,17 @@ fn main() -> Result<()> {
     configure_logging();
     let args: Vec<String> = env::args().skip(1).collect();
     let fpath_arg = args.first();
-    let file = File::open(fpath_arg.as_ref().unwrap()).unwrap();
+    let path = fpath_arg.cloned().unwrap();
+    let path: &Path = Path::new(&path);
+    let path = if path.is_dir() {
+        info!("Attempting to find json in dir...");
+        first_json_dir_entry(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    info!("Opening model from disk: {}", path.to_str().unwrap());
+    let file = File::open(path).unwrap();
     let reader = BufReader::new(file);
     let model = serde_json::from_reader(reader)?;
 
@@ -36,6 +41,21 @@ fn main() -> Result<()> {
 
     info!("Uploaded model to db");
     Ok(())
+}
+
+fn first_json_dir_entry(path: &Path) -> std::path::PathBuf {
+    path.read_dir()
+        .unwrap()
+        .find(|file| {
+            let dir_entry = &file.as_ref().unwrap();
+            let file_name = &dir_entry.file_name();
+            let file_name = file_name.to_str().unwrap();
+            let file_type = dir_entry.file_type().unwrap();
+            file_type.is_file() && file_name.ends_with(".json")
+        })
+        .expect("could not match json files in dir")
+        .unwrap()
+        .path()
 }
 
 fn configure_logging() {
