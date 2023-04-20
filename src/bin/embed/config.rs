@@ -34,6 +34,10 @@ pub struct TrainEmbeddingConfig {
     #[arg(short = 'r', long, default_value_t = 1e-3)]
     pub train_rate: NodeValue,
 
+    #[arg(short = 'q', long, default_value_t = false)]
+    #[serde(default)]
+    pub quit_on_complete: bool,
+
     #[arg(short = 'p', long, default_value_t = false)]
     #[serde(default)]
     pub pause_on_start: bool,
@@ -99,6 +103,9 @@ pub struct LoadEmbeddingConfig {
 
     #[arg(short = 'W', long, default_value = None)]
     pub phrase_test_set_max_tokens: Option<usize>,
+
+    #[arg(long, default_value_t = false)]
+    pub force_continue: bool,
 
     #[arg(long, default_value = None)]
     pub repl: Option<String>,

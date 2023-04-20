@@ -24,6 +24,7 @@ pub enum TrainerMessage {
     ForceSnapshot,
     WriteStatsToDisk,
     WriteEmbeddingTsvToDisk,
+    RenameOutputLabel(String),
     WriteModelToDisk,
     WriteModelAndMetadataToDisk(TrainerStateMetadata),
     MultiplyLearnRateBy(NodeValue),
@@ -36,6 +37,7 @@ pub enum TrainerMessage {
     PrintEachRoundNumber,
     PlotTrainingLossGraph,
     PlotTrainingLossGraphDispatch(TrainerStateMetadata),
+    NoOp,
 }
 
 impl TrainerMessage {
@@ -68,11 +70,14 @@ impl TrainerMessage {
                 training::writer::plot_training_loss(&embedding, &config, &metadata);
                 TrainerHandleActions::Nothing
             }
+            TrainerMessage::RenameOutputLabel(output_label) => {
+                TrainerHandleActions::RenameOutputLabel(output_label)
+            }
             TrainerMessage::WriteModelToDisk => {
                 TrainerHandleActions::DispatchWithMetadata(TrainerMessage::WriteModelToDisk)
             }
             TrainerMessage::WriteModelAndMetadataToDisk(metadata) => {
-                training::writer::write_model_to_disk(
+                let path = training::writer::write_model_to_disk(
                     &embedding,
                     &config,
                     &metadata,
@@ -80,7 +85,7 @@ impl TrainerMessage {
                     &config.output_dir,
                     &config.output_label,
                 );
-                info!("Model written to disk");
+                info!("Model written to disk: {}", path.to_string_lossy());
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::WriteStatsToDisk => {
@@ -88,6 +93,7 @@ impl TrainerMessage {
                 info!("Results written to disk");
                 TrainerHandleActions::Nothing
             }
+            // TODO: dispatch back metadata for consistent output label handling
             TrainerMessage::WriteEmbeddingTsvToDisk => {
                 training::writer::write_embedding_tsv_to_disk(
                     &embedding,
@@ -106,6 +112,7 @@ impl TrainerMessage {
                 info!("Predicted a new random phrase:  {}", predicted_phrase);
                 TrainerHandleActions::Nothing
             }
+            TrainerMessage::NoOp => TrainerHandleActions::Nothing,
         }
     }
     pub fn create_response(&self, metadata: TrainerStateMetadata) -> Option<Self> {
@@ -127,6 +134,7 @@ pub enum TrainerHandleActions {
     LearnRateMulMut(NodeValue),
     IncreaseMaxRounds(usize),
     DispatchWithMetadata(TrainerMessage),
+    RenameOutputLabel(String),
     TogglePause,
     TogglePrintAllStatus,
     ReloadFromSnapshot,
@@ -212,6 +220,9 @@ impl TrainerHandleActions {
                 let message = request.create_response(metadata).unwrap();
                 handle.send(message).unwrap();
             }
+            TrainerHandleActions::RenameOutputLabel(output_label) => {
+                state.set_output_label(output_label);
+            }
             TrainerHandleActions::ReplaceEmbeddingState(snapshot, new_state) => {
                 let (new_embedding, build_ctx) = EmbeddingBuilder::from_snapshot(&snapshot)
                     .unwrap()
@@ -266,6 +277,11 @@ where
             None => self.rx.try_recv().context("failed to recv message"),
         }
     }
+
+    pub fn run(&self, embedding: &Embedding, msg: Message) -> TrainerHandleActions {
+        let handler = &self.handler;
+        handler(&embedding, msg)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -273,6 +289,8 @@ pub struct TrainerStateMetadata {
     pub learn_rate: f64,
     pub training_rounds: usize,
     pub current_round: usize,
+    #[serde(default)]
+    pub output_label: Option<String>,
     #[serde(default)]
     pub total_train_seconds: u64,
     pub training_report: Option<TrainerReport>,

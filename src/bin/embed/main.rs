@@ -1,4 +1,4 @@
-use std::{sync::mpsc, thread};
+use std::{io::Write, sync::mpsc, thread};
 
 use anyhow::{anyhow, Result};
 use clap::{Args, FromArgMatches};
@@ -41,7 +41,8 @@ fn main() -> Result<()> {
             }
         }
 
-        block_on_key_press(move |c| parse_repl_char(c, &tx, &config_clone));
+        let tx1 = tx.clone();
+        block_on_key_press(move |c| parse_repl_char(c, &tx, &config_clone), &tx1);
     });
 
     thread.join().unwrap();
@@ -72,6 +73,9 @@ fn parse_repl_char(
         '.' => tx.send(TrainerMessage::MultiplyLearnRateBy(2.0))?,
         'e' => tx.send(TrainerMessage::IncreaseMaxRounds(config.training_rounds))?,
         'p' => tx.send(TrainerMessage::TogglePause)?,
+        'l' => tx.send(prompt("output_label", |x| {
+            TrainerMessage::RenameOutputLabel(x)
+        }))?,
         'q' => {
             tx.send(TrainerMessage::Halt)?;
             Err(anyhow!("Application Halted"))?
@@ -94,6 +98,7 @@ fn parse_repl_char(
                         ',' => divide learn rate by 2
                         '.' => multiply learn rate by 2
                         'e' => extend training rounds
+                        'l' => rename output label (applies to subsequent save model operations)
                         'h' => display help
                         'p' => toggle pause
                         'q' => quit
@@ -105,16 +110,53 @@ fn parse_repl_char(
     Ok(())
 }
 
-fn block_on_key_press<F: Fn(char) -> Result<()>>(key_press_callback: F) {
+fn block_on_key_press<F: Fn(char) -> Result<()>>(
+    key_press_callback: F,
+    tx: &mpsc::Sender<TrainerMessage>,
+) {
     use KeyCode::Char;
     loop {
-        match event::read().unwrap() {
-            Event::Key(KeyEvent { code: Char(c), .. }) => {
-                if let Err(_) = key_press_callback(c) {
+        match event::poll(std::time::Duration::from_secs(10)) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(_) = tx.send(TrainerMessage::NoOp) {
                     return;
                 }
+                continue;
             }
-            _ => (),
+            Err(_) => return,
+        };
+        if let Event::Key(KeyEvent { code: Char(c), .. }) = event::read().unwrap() {
+            if let Err(_) = key_press_callback(c) {
+                return;
+            }
+        }
+    }
+}
+
+fn prompt<F: Fn(String) -> TrainerMessage>(
+    var_name: &str,
+    message_factory_fn: F,
+) -> TrainerMessage {
+    let mut input = String::new();
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+
+    stdout
+        .write_fmt(format_args!(
+            "Set new value for '{var_name}' [or type '.cancel']: "
+        ))
+        .unwrap();
+    stdout.flush().unwrap();
+
+    match stdin.read_line(&mut input) {
+        Ok(_) if input.trim() != ".cancel" => {
+            println!("Setting new value of '{var_name}'. Exiting edit mode...");
+            message_factory_fn(input.trim().to_string())
+        }
+        _ => {
+            println!("Retaining previous value of '{var_name}'. Exiting edit mode...");
+            TrainerMessage::NoOp
         }
     }
 }
@@ -202,6 +244,9 @@ fn load_embedding(
     }
     if let Some(phrase_test_set_max_tokens) = load_config.phrase_test_set_max_tokens {
         config.phrase_test_set_max_tokens = Some(phrase_test_set_max_tokens);
+    }
+    if load_config.force_continue {
+        config.quit_on_complete = false;
     }
     Ok((config, Some((snapshot, state))))
 }

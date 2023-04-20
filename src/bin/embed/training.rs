@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     rc::Rc,
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -24,6 +25,8 @@ use crate::{
 
 pub struct TrainerState {
     pub embedding: Embedding,
+    pub handle_tx: mpsc::Sender<TrainerMessage>,
+    pub output_label: Option<String>,
     pub learn_rate: f64,
     pub training_rounds: usize,
     pub print_round_number: bool,
@@ -43,10 +46,16 @@ pub struct TrainerState {
 }
 
 impl TrainerState {
-    fn new(embedding: Embedding, config: &TrainEmbeddingConfig) -> Self {
+    fn new(
+        embedding: Embedding,
+        config: &TrainEmbeddingConfig,
+        handle_tx: &mpsc::Sender<TrainerMessage>,
+    ) -> Self {
         Self {
-            inital_config: config.clone(),
             embedding,
+            handle_tx: handle_tx.clone(),
+            inital_config: config.clone(),
+            output_label: config.output_label.clone(),
             learn_rate: config.train_rate,
             training_rounds: config.training_rounds,
             paused: config.pause_on_start,
@@ -107,17 +116,26 @@ impl TrainerState {
     }
 
     fn complete_round(&mut self) {
-        if !self.paused {
-            self.round += 1;
-        }
-
         self.force_report_test_set = false;
         self.force_report_train_set = false;
         self.round_reported = false;
 
-        if self.round == self.training_rounds && !self.paused {
-            info!("Completed rounds run, pausing...");
+        let quit_on_complete = self.inital_config.quit_on_complete;
+        let complete_entire_run = self.round == self.training_rounds
+            || (quit_on_complete && self.round > self.training_rounds);
+
+        if complete_entire_run && !self.paused {
+            if self.inital_config.quit_on_complete {
+                info!("Completed rounds run, exiting...");
+                self.halt();
+            } else {
+                info!("Completed rounds run, pausing...");
+            }
+
+            self.trigger_round_report_test_set();
             self.pause();
+        } else if !self.paused {
+            self.round += 1;
         }
     }
 
@@ -173,6 +191,7 @@ impl TrainerState {
             learn_rate: self.learn_rate,
             training_rounds: self.training_rounds,
             current_round: self.round,
+            output_label: self.output_label.clone(),
             total_train_seconds: self.total_train_time.as_secs(),
             training_report: self.last_report.as_ref().map(|(_, report)| report.clone()),
             training_error_history: self.training_loss_logger.iter().cloned().collect(),
@@ -212,6 +231,7 @@ impl TrainerState {
         self.round = metadata.current_round;
         self.training_rounds = metadata.training_rounds;
         self.learn_rate = metadata.learn_rate;
+        self.output_label = metadata.output_label;
         self.total_train_time = Duration::from_secs(metadata.total_train_seconds);
 
         self.training_loss_logger = {
@@ -228,6 +248,10 @@ impl TrainerState {
         self.last_report = None;
     }
 
+    pub fn set_output_label(&mut self, output_label: String) {
+        self.output_label = Some(output_label);
+    }
+
     pub fn trigger_round_report_test_set(&mut self) {
         self.force_report_test_set = true;
     }
@@ -237,6 +261,20 @@ impl TrainerState {
     }
 
     pub fn halt(&mut self) {
+        let quit_on_complete = self.inital_config.quit_on_complete;
+        let run_completed = self.round >= self.training_rounds;
+
+        if quit_on_complete && run_completed && !self.halt {
+            let metadata = self.metadata();
+            let msg = TrainerMessage::WriteModelAndMetadataToDisk(metadata);
+
+            self.handle_tx
+                .send(msg)
+                .expect("failed to invoke model write to disk");
+
+            info!("Trigger action completed: save model to file");
+        }
+
         self.halt = true;
     }
 }
@@ -245,6 +283,52 @@ pub fn setup_and_train_embeddings_v2<F>(
     config: TrainEmbeddingConfig,
     handle: TrainerHandle<TrainerMessage, F>,
 ) -> Embedding
+where
+    F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions,
+{
+    let (phrases, testing_phrases, mut state) = init_embedding_state(config, &handle);
+    let batch_size = state.batch_size();
+
+    loop {
+        let training_error = state.train(&phrases, batch_size);
+        let recv_timeout = state.paused.then_some(Duration::from_secs(1));
+
+        while let Ok(msg) = handle.try_recv(recv_timeout) {
+            let action = handle.run(&state.embedding, msg);
+            action.apply(&mut state, &handle);
+        }
+
+        if state.should_report_round() {
+            report_round(&mut state, &testing_phrases, training_error, None);
+        }
+
+        if state.should_report_test_set_round() {
+            report_round(&mut state, &phrases, training_error, Some("train"));
+        }
+
+        if state.should_report_round_number_only() {
+            let training_error = training_error
+                .map(|loss| format!("(train_loss {loss:<12.10})"))
+                .unwrap_or_default();
+
+            info!("Round {} completed {}", state.round + 1, training_error);
+        }
+
+        if state.halt {
+            info!("Stopping rounds run...");
+            break;
+        }
+
+        state.complete_round();
+    }
+
+    state.embedding
+}
+
+fn init_embedding_state<F>(
+    config: TrainEmbeddingConfig,
+    handle: &TrainerHandle<TrainerMessage, F>,
+) -> (Vec<Vec<String>>, Vec<Vec<String>>, TrainerState)
 where
     F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions,
 {
@@ -288,44 +372,9 @@ where
         .build()
         .unwrap();
 
-    let mut state = TrainerState::new(embedding, &config);
-    let batch_size = state.batch_size();
+    let state = TrainerState::new(embedding, &config, &handle.tx);
 
-    loop {
-        let training_error = state.train(&phrases, batch_size);
-        let recv_timeout = state.paused.then_some(Duration::from_secs(5));
-
-        while let Ok(msg) = handle.try_recv(recv_timeout) {
-            let handler = &handle.handler;
-            let action = handler(&state.embedding, msg);
-            action.apply(&mut state, &handle);
-        }
-
-        if state.should_report_round() {
-            report_round(&mut state, &testing_phrases, training_error, None);
-        }
-
-        if state.should_report_test_set_round() {
-            report_round(&mut state, &phrases, training_error, Some("train"));
-        }
-
-        if state.should_report_round_number_only() {
-            let training_error = training_error
-                .map(|loss| format!("(train_loss {loss:<12.10})"))
-                .unwrap_or_default();
-
-            info!("Round {} completed {}", state.round + 1, training_error);
-        }
-
-        if state.halt {
-            info!("Stopping rounds run...");
-            break;
-        }
-
-        state.complete_round();
-    }
-
-    state.embedding
+    (phrases, testing_phrases, state)
 }
 
 fn report_round(
@@ -667,6 +716,7 @@ pub mod writer {
         collections::{HashMap, HashSet},
         fs::File,
         io::{BufReader, Write},
+        path::PathBuf,
     };
 
     use anyhow::{Context, Result};
@@ -740,9 +790,13 @@ pub mod writer {
         label: &str,
         output_dir: &Option<String>,
         output_label: &Option<String>,
-    ) {
+    ) -> PathBuf {
         let snapshot = embedding.snapshot().unwrap();
         let mut snapshot: Value = serde_json::from_str(&snapshot).unwrap();
+
+        let output_label = state.output_label.as_ref().or(output_label.as_ref());
+        let mut config = config.clone();
+        config.output_label = output_label.cloned();
 
         snapshot["_trainer_config"] = serde_json::to_value(&config).unwrap();
         snapshot["_trainer_state"] = serde_json::to_value(&state).unwrap();
@@ -751,15 +805,17 @@ pub mod writer {
         let fpath = path::create_output_fpath(
             ("model", ".json"),
             output_dir.as_ref(),
-            output_label.as_ref(),
+            output_label,
             Some(state),
             label,
         );
 
-        File::create(fpath)
+        File::create(&fpath)
             .unwrap()
             .write_fmt(format_args!("{snapshot_pretty}"))
             .unwrap();
+
+        fpath
     }
 
     pub fn write_embedding_tsv_to_disk(
@@ -890,7 +946,14 @@ pub mod writer {
                 _ => default_fname_description(label),
             };
             let (fname_prefix, fname_ext) = fname_prefix_ext;
-            let fpath = dir_path.join(format!("{fname_prefix}-{}{fname_ext}", fname_description));
+            let fpath = dir_path.join(format!("{fname_prefix}-{fname_description}{fname_ext}"));
+
+            if let Ok(true) = fpath.try_exists() {
+                let fpath_prefix = dir_path.join(format!("{fname_prefix}-{fname_description}"));
+                if let Some(value) = get_next_path(fpath_prefix, fname_ext.to_string()) {
+                    return value;
+                }
+            }
             fpath
         }
 
@@ -911,6 +974,18 @@ pub mod writer {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis()
+        }
+
+        fn get_next_path(fpath_prefix: PathBuf, fpath_postfix: String) -> Option<PathBuf> {
+            let fpath_prefix = fpath_prefix.to_str()?;
+            let fpath_postfix = fpath_postfix.trim_start_matches('.');
+            for i in 2..50 {
+                let fpath: PathBuf = format!("{fpath_prefix}.{i}.{fpath_postfix}").into();
+                if let Ok(false) = fpath.try_exists() {
+                    return Some(fpath);
+                }
+            }
+            None
         }
 
         fn create_output_dir(
