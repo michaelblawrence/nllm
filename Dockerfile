@@ -1,4 +1,4 @@
-FROM rust:1.68.2-alpine3.17
+FROM rust:1.68.2-alpine3.17 as builder
 
 RUN set -eux; \
         apk add --no-cache musl-dev; \
@@ -27,11 +27,13 @@ RUN set -eux; \
         touch src/bin/embed/main.rs src/bin/derivate.rs src/main.rs; \
 		cargo build --features="cli thread threadpool" --release --bin embed;
 
+RUN set -eux; \
+        cargo install --features="cli thread threadpool" --bin embed --path .; \
+        cargo install --features="db" --bin upload --path .;
+
 COPY justfile ./
 
-RUN set -eux; \
-        just install; \
-        just install-upload;
+COPY res/tinyimdb.txt res/tinyshakespeare.txt ./res/
 
-COPY res/tinyimdb.txt ./
-COPY res/tinyshakespeare.txt ./
+RUN set -eux; \
+        mkdir out
