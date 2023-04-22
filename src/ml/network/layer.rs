@@ -25,27 +25,28 @@ pub struct Layer {
 impl Layer {
     pub fn new(inputs_count: usize, shape: &LayerShape, rng: &RngStrategy) -> Self {
         let size = shape.node_count();
-        let init_stratergy = &shape.strategy();
+        let init_strategy = &shape.strategy();
 
-        let mut layer = Self {
-            weights: vec![0.0; inputs_count * size],
-            bias: match &init_stratergy {
-                LayerInitStrategy::NoBias => None,
-                _ => Some(vec![0.0; size]),
-            },
-            inputs_count,
-            size,
-            stride_count: shape.stride(),
+        let mut weights = vec![0.0; inputs_count * size];
+        let mut bias = match &init_strategy {
+            LayerInitStrategy::NoBias => None,
+            _ => Some(vec![0.0; size]),
         };
 
-        init_stratergy.apply(
-            layer.weights.iter_mut(),
-            layer.bias.iter_mut().flatten(),
+        init_strategy.apply(
+            weights.iter_mut(),
+            bias.iter_mut().flatten(),
             inputs_count,
             &rng,
         );
 
-        layer
+        Self {
+            weights,
+            bias,
+            inputs_count,
+            size,
+            stride_count: shape.stride(),
+        }
     }
 
     pub fn compute(&self, inputs: &LayerValues) -> Result<LayerValues> {
@@ -77,39 +78,37 @@ impl Layer {
         Ok(LayerValues(outputs))
     }
 
-    pub fn compute_d<'a>(
-        &'a self,
-        forward_layer_gradients: &'a LayerValues,
-    ) -> Result<impl Iterator<Item = NodeValue> + 'a> {
-        let iter = self.weights.chunks(self.size()).map(|weights| {
-            weights
-                .iter()
-                .zip(forward_layer_gradients.iter())
-                .map(|(weight, next_layer_grad)| next_layer_grad * weight)
-                .sum::<NodeValue>()
-        });
+    pub fn multiply_weight_matrix(
+        &self,
+        outputs_dimension_vector: &LayerValues,
+    ) -> Result<Vec<NodeValue>> {
+        let layer_outputs_count = self.size() * self.stride_count.unwrap_or(1);
+        if outputs_dimension_vector.len() != layer_outputs_count {
+            return Err(anyhow!(
+                "mismatched dimensions for matrix mul. expected={}, actual={}, (strideN={}, inputs={})",
+                self.size(),
+                outputs_dimension_vector.len(),
+                self.stride_count.unwrap_or(1),
+                self.inputs_count,
+            ));
+        }
 
-        Ok(iter)
+        let output_weights_per_input = self.weights.chunks(self.size());
+
+        Ok(output_weights_per_input
+            .map(|output_weights| {
+                outputs_dimension_vector
+                    .iter()
+                    .zip(output_weights.iter().cycle())
+                    .map(|(x, weight)| x * weight)
+                    .sum::<NodeValue>()
+            })
+            .collect())
     }
 
-    pub fn learn(&mut self, strategy: &LayerLearnStrategy, learn_rate: NodeValue) -> Result<()> {
+    pub fn learn(&mut self, strategy: &LayerLearnAction, learn_rate: NodeValue) -> Result<()> {
         match strategy {
-            LayerLearnStrategy::MutateRng {
-                weight_factor,
-                bias_factor,
-                // rng,
-            } => {
-                let rng = crate::ml::JsRng::default(); // TODO: remove rng lean? find better way of passing instance
-                for x in self.weights.iter_mut() {
-                    let old = *x;
-                    *x = old + (old * weight_factor * rng.rand())
-                }
-                for x in self.bias.iter_mut().flatten() {
-                    let old = *x;
-                    *x = old + (old * bias_factor * rng.rand())
-                }
-            }
-            LayerLearnStrategy::GradientDecent {
+            LayerLearnAction::GradientDecent {
                 gradients,
                 layer_inputs,
             } => {
@@ -152,28 +151,28 @@ impl Layer {
         let scaled_weights_len = weights_len * stride_count * stride_count;
 
         if scaled_weights_len != gradients.len() * layer_inputs.len() {
-            dbg!(
-                weights_len,
-                gradients.len() * layer_inputs.len(),
-                stride_count
-            );
-            return Err(anyhow!("mismatched inputs/gradients dimensions"));
+            return Err(anyhow!(
+                "mismatched inputs/gradients dimensions len(w)={}, len(x)={}, len(grad)={}, strideN={}",
+                weights_len, layer_inputs.len(), gradients.len(),stride_count
+            ));
         }
 
-        let weights_gradients = layer_inputs
-            .chunks(self.inputs_count)
-            .zip(gradients.chunks(self.size))
-            .fold(
-                vec![0.0; weights_len],
-                |mut state, (layer_inputs, gradients)| {
-                    layer_inputs
-                        .into_iter()
-                        .flat_map(|layer_input| gradients.iter().map(move |g| g * layer_input))
-                        .zip(state.iter_mut())
-                        .for_each(|(gradient, x)| *x += gradient);
-                    state
-                },
-            );
+        let layer_input_strides = layer_inputs.chunks(self.inputs_count);
+        let layer_output_gradient_strides = gradients.chunks(self.size);
+
+        let weights_gradients = layer_input_strides.zip(layer_output_gradient_strides).fold(
+            vec![0.0; weights_len],
+            |mut weights_gradients, (layer_inputs, output_gradients)| {
+                layer_inputs
+                    .into_iter()
+                    .flat_map(|layer_input| {
+                        output_gradients.iter().map(move |grad| grad * layer_input)
+                    })
+                    .zip(weights_gradients.iter_mut())
+                    .for_each(|(gradient, weights_gradient)| *weights_gradient += gradient);
+                weights_gradients
+            },
+        );
 
         Ok(weights_gradients)
     }
@@ -221,7 +220,7 @@ impl Layer {
         Ok(LayerValues(error))
     }
 
-    pub fn calculate_cross_entropy_error_d(
+    pub fn cross_entropy_error_d(
         &self,
         softmax_outputs: &LayerValues,
         expected_outputs: &LayerValues,
@@ -243,7 +242,7 @@ impl Layer {
             .collect()
     }
 
-    pub fn calculate_msd_error_d(
+    pub fn msd_error_d(
         &self,
         outputs: &LayerValues,
         expected_outputs: &LayerValues,
@@ -454,15 +453,7 @@ impl LayerInitStrategy {
     }
 }
 
-pub enum LayerLearnStrategy {
-    MutateRng {
-        weight_factor: NodeValue,
-        bias_factor: NodeValue,
-        // #[cfg(feature = "threadpool")]
-        // rng: std::sync::Arc<dyn RNG>,
-        // #[cfg(not(feature = "threadpool"))]
-        // rng: Rc<dyn RNG>,
-    },
+pub enum LayerLearnAction {
     GradientDecent {
         gradients: LayerValues,
         layer_inputs: LayerValues,
