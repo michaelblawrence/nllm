@@ -31,7 +31,7 @@ cargo-respond input_file:
 
 run input_file="./res/tinyshakespeare.txt" rounds="100000":
   embed --quit-on-complete \
-    --single-batch-iterations --char --train-rate 0.0016 --batch-size 32 \
+    --single-batch-iterations --char --train-rate 0.0016 --batch-size 256 \
     --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
     --hidden-layer-nodes 650  --embedding-size 16 --input-stride-width 64 --repl "PR" \
     --training-rounds {{rounds}} -i {{input_file}} \
@@ -93,7 +93,7 @@ docker-test-upload-tty: docker-build
 
 docker-run run_script="run" script_args="": docker-build
   mkdir -p out/script-{{run_script}}
-  docker run --name embedtestrun --rm -v ./out/script-{{run_script}}:/app/out \
+  docker run --name embedtestrun --rm -v `pwd`/out/script-{{run_script}}:/app/out \
     embed just {{run_script}} {{script_args}}
 
 configure-node node_ip public_key_path:
