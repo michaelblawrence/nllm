@@ -6,12 +6,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use itertools::Itertools;
 use plane::ml::{
     embeddings::{Embedding, TrainBatchConfig},
     NodeValue, RngStrategy, RNG,
 };
 
+use anyhow::Result;
+use itertools::Itertools;
 use serde_json::Value;
 use tracing::{debug, error, info};
 
@@ -34,9 +35,10 @@ pub struct TrainerState {
     pub force_report_all: bool,
     pub snapshot: (Option<String>, Instant),
     pub last_report: Option<(Instant, TrainerReport)>,
-    pub paused: bool,
+    paused: bool,
     pub round: usize,
     training_loss_logger: BoundedValueLogger<(usize, f64)>,
+    rounds_until_pause_enabled: usize,
     halt: bool,
     force_report_test_set: bool,
     force_report_train_set: bool,
@@ -68,6 +70,7 @@ impl TrainerState {
             force_report_train_set: false,
             force_report_all: false,
             last_report: None,
+            rounds_until_pause_enabled: 0,
             halt: false,
             total_train_time: Duration::ZERO,
             round: 0,
@@ -75,16 +78,20 @@ impl TrainerState {
     }
 
     fn train(&mut self, phrases: &Vec<Vec<String>>, batch_size: TrainBatchConfig) -> Option<f64> {
-        if self.paused {
+        if self.training_paused() {
             return None;
         }
-
         let started = Instant::now();
+
         let train_error = self.embedding.train(phrases, self.learn_rate, batch_size);
 
         let train_duration = started.elapsed();
         self.total_train_time += train_duration;
 
+        self.try_record_train_iteration(train_error)
+    }
+
+    fn try_record_train_iteration(&mut self, train_error: Result<f64>) -> Option<f64> {
         match train_error {
             Ok(error) if error.is_finite() => {
                 if self.should_perform_autosave() {
@@ -120,6 +127,17 @@ impl TrainerState {
         self.force_report_train_set = false;
         self.round_reported = false;
 
+        if self.rounds_until_pause_enabled > 0 {
+            self.rounds_until_pause_enabled -= 1;
+
+            if self.rounds_until_pause_enabled == 0 && self.paused {
+                info!(
+                    "Queued rounds completed (round = {}), pausing...",
+                    self.round + 1
+                );
+            }
+        }
+
         let quit_on_complete = self.inital_config.quit_on_complete;
         let complete_entire_run = self.round == self.training_rounds
             || (quit_on_complete && self.round > self.training_rounds);
@@ -134,13 +152,38 @@ impl TrainerState {
 
             self.trigger_round_report_test_set();
             self.pause();
-        } else if !self.paused {
+        } else if !self.training_paused() {
             self.round += 1;
         }
     }
 
-    fn pause(&mut self) {
+    pub fn pause(&mut self) -> bool {
+        let was_paused = self.paused;
+
         self.paused = true;
+        self.rounds_until_pause_enabled = 0;
+
+        was_paused != self.paused
+    }
+
+    pub fn unpause(&mut self) -> bool {
+        let was_paused = self.paused;
+
+        self.paused = false;
+        self.rounds_until_pause_enabled = 0;
+
+        was_paused != self.paused
+    }
+
+    pub fn defer_pause(&mut self, rounds: usize) {
+        self.paused = true;
+
+        let rounds_until_pause_enabled = self.rounds_until_pause_enabled.max(1);
+        self.rounds_until_pause_enabled = rounds_until_pause_enabled + rounds;
+    }
+
+    pub fn training_paused(&self) -> bool {
+        self.paused && self.rounds_until_pause_enabled == 0
     }
 
     fn perform_snapshot(&mut self) {
@@ -291,7 +334,7 @@ where
 
     loop {
         let training_error = state.train(&phrases, batch_size);
-        let recv_timeout = state.paused.then_some(Duration::from_secs(1));
+        let recv_timeout = state.training_paused().then_some(Duration::from_secs(1));
 
         while let Ok(msg) = handle.try_recv(recv_timeout) {
             let action = handle.run(&state.embedding, msg);

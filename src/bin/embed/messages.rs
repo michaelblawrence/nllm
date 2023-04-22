@@ -1,5 +1,4 @@
-use anyhow::{Context, Result};
-use itertools::Itertools;
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -10,7 +9,7 @@ use std::{
 
 use plane::ml::{
     embeddings::{builder::EmbeddingBuilder, Embedding},
-    NodeValue, RngStrategy, RNG,
+    NodeValue,
 };
 
 use crate::training;
@@ -38,6 +37,7 @@ pub enum TrainerMessage {
     PlotTrainingLossGraph,
     PlotTrainingLossGraphDispatch(TrainerStateMetadata),
     NoOp,
+    UnpauseForSingleIteration,
 }
 
 impl TrainerMessage {
@@ -50,6 +50,9 @@ impl TrainerMessage {
             TrainerMessage::PrintTrainingStatus => TrainerHandleActions::PrintTrainingStatus,
             TrainerMessage::PrintStatus => TrainerHandleActions::PrintStatus,
             TrainerMessage::Halt => TrainerHandleActions::Halt,
+            TrainerMessage::UnpauseForSingleIteration => {
+                TrainerHandleActions::UnpauseForSingleIteration
+            }
             TrainerMessage::TogglePause => TrainerHandleActions::TogglePause,
             TrainerMessage::TogglePrintAllStatus => TrainerHandleActions::TogglePrintAllStatus,
             TrainerMessage::ReloadFromSnapshot => TrainerHandleActions::ReloadFromSnapshot,
@@ -105,11 +108,9 @@ impl TrainerMessage {
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::PredictRandomPhrase => {
-                let vocab_idx = RngStrategy::default().rand_range(0, embedding.vocab().len());
-                let seed_word = embedding.vocab().keys().nth(vocab_idx).unwrap();
                 let sep = if config.use_character_tokens { "" } else { " " };
-                let predicted_phrase = embedding.predict_iter(seed_word).join(sep);
-                info!("Predicted a new random phrase:  {}", predicted_phrase);
+                let generated_phrase = embedding.generate_sequence_string(sep);
+                info!("Generated a new phrase:  {}", generated_phrase);
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::NoOp => TrainerHandleActions::Nothing,
@@ -145,6 +146,7 @@ pub enum TrainerHandleActions {
     ReplaceEmbeddingState(String, TrainerStateMetadata),
     SuppressAutoPrintStatus,
     PrintEachRoundNumber,
+    UnpauseForSingleIteration,
 }
 
 impl TrainerHandleActions {
@@ -166,12 +168,17 @@ impl TrainerHandleActions {
             TrainerHandleActions::TogglePrintAllStatus => {
                 state.force_report_all = !state.force_report_all
             }
+            TrainerHandleActions::UnpauseForSingleIteration => {
+                info!("Pausing after next round...");
+                state.defer_pause(1);
+            }
             TrainerHandleActions::TogglePause => {
-                state.paused = !state.paused;
-                if state.paused {
-                    info!("Pausing rounds run, pausing...");
-                } else {
+                if state.training_paused() {
+                    state.unpause();
                     info!("Resuming rounds run, starting...");
+                } else {
+                    state.pause();
+                    info!("Pausing rounds run, pausing...");
                 }
             }
             TrainerHandleActions::IncreaseMaxRounds(rounds) => {
@@ -181,22 +188,33 @@ impl TrainerHandleActions {
                 info!(
                     "Changed max training rounds from {old_training_rounds} to {training_rounds}"
                 );
-                if state.paused {
+                if state.unpause() {
                     info!("Resuming rounds run, starting...");
-                    state.paused = false;
                 }
             }
             TrainerHandleActions::ReloadFromSnapshot => {
-                if let Some(snapshot) = &state.snapshot.0 {
-                    info!("Recovering state from snapshot, pausing...");
-                    state.paused = true;
-                    state.embedding = EmbeddingBuilder::from_snapshot(&snapshot)
-                        .unwrap()
-                        .build()
-                        .unwrap();
+                let state_recovered = if let Some(snapshot) = &state.snapshot.0 {
+                    info!("Recovering state from snapshot..");
+                    match EmbeddingBuilder::from_snapshot(&snapshot).and_then(|x| x.build()) {
+                        Ok(embedding) => {
+                            state.embedding = embedding;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
                 } else {
-                    info!("No snapshot found to recover state from, continuing...");
-                }
+                    Err(anyhow!(
+                        "No snapshot found to recover state from, continuing..."
+                    ))
+                };
+
+                match state_recovered {
+                    Ok(_) => {
+                        info!("Recovered state from snapshot, pausing..");
+                        state.pause();
+                    }
+                    Err(e) => info!("Failed to restore snapshot: '{}', continuing...", e),
+                };
             }
             TrainerHandleActions::ForceSnapshot => {
                 let json = state.embedding.snapshot().unwrap();
@@ -240,7 +258,7 @@ impl TrainerHandleActions {
                 }
 
                 state.set_embedding(new_embedding, new_state);
-                state.paused = true;
+                state.pause();
                 info!("Restored loaded model and state, pausing...");
             }
         }
