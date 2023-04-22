@@ -2,10 +2,11 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 use crate::ml::ShuffleRng;
 
-use layer::{Layer, LayerInitStrategy, LayerLearnStrategy};
+use layer::{Layer, LayerInitStrategy, LayerLearnAction};
 pub use layer::{LayerValues, NodeValue};
 
 use super::RngStrategy;
@@ -24,14 +25,14 @@ impl NetworkShape {
         inputs_count: usize,
         outputs_count: usize,
         hidden_layer_shape: Vec<usize>,
-        init_stratergy: LayerInitStrategy,
+        init_strategy: LayerInitStrategy,
     ) -> Self {
         Self {
-            inputs_count: inputs_count,
+            inputs_count,
             layers_shape: hidden_layer_shape
                 .into_iter()
-                .map(|layer_size| (layer_size, init_stratergy.clone()))
-                .chain([(outputs_count, init_stratergy.clone())])
+                .map(|layer_size| (layer_size, init_strategy.clone()))
+                .chain([(outputs_count, init_strategy.clone())])
                 .map(|x| x.into())
                 .collect(),
             activation_mode: Default::default(),
@@ -262,22 +263,9 @@ impl Network {
         Ok(output_layer_error.ave())
     }
 
+    #[instrument(level = "info", name = "net_learn", skip_all)]
     pub fn learn(&mut self, strategy: NetworkLearnStrategy) -> Result<Option<NodeValue>> {
         let cost = match strategy {
-            NetworkLearnStrategy::MutateRng {
-                rand_amount, /*rng*/
-            } => {
-                let strategy = LayerLearnStrategy::MutateRng {
-                    weight_factor: rand_amount,
-                    bias_factor: rand_amount,
-                    // rng,
-                };
-                for layer in self.layers.iter_mut() {
-                    layer.learn(&strategy, 1.0)?;
-                }
-
-                None
-            }
             NetworkLearnStrategy::BatchGradientDecent {
                 training_pairs,
                 learn_rate,
@@ -331,10 +319,11 @@ impl Network {
     }
 
     #[cfg(feature = "threadpool")]
+    #[instrument(level = "info", name = "grad_batch", skip_all)]
     fn process_gradient_descent_batch(
         &mut self,
         batch: Vec<(LayerValues, LayerValues)>,
-    ) -> Result<(Vec<f64>, Vec<Vec<(usize, LayerLearnStrategy)>>)> {
+    ) -> Result<(Vec<f64>, Vec<Vec<(usize, LayerLearnAction)>>)> {
         use rayon::prelude::*;
 
         let (batch_errors, layer_learn_actions) = batch
@@ -347,7 +336,7 @@ impl Network {
                     self.perform_gradient_decent_step(&layers_activations, &target_outputs)?;
                 Ok((output_layer_error, learn_actions))
             })
-            .collect::<Result<(Vec<_>, Vec<_>)>>()?;
+            .collect::<Result<_>>()?;
 
         Ok((batch_errors, layer_learn_actions))
     }
@@ -356,7 +345,7 @@ impl Network {
     fn process_gradient_descent_batch(
         &mut self,
         batch: Vec<(LayerValues, LayerValues)>,
-    ) -> Result<(Vec<f64>, Vec<Vec<(usize, LayerLearnStrategy)>>)> {
+    ) -> Result<(Vec<f64>, Vec<Vec<(usize, LayerLearnAction)>>)> {
         let all_layers_activations = batch
             .into_iter()
             .map(|(inputs, target_outputs)| {
@@ -439,40 +428,60 @@ impl Network {
         &self,
         layers_activations: &Vec<(LayerValues, LayerValues)>,
         target_outputs: &LayerValues,
-    ) -> Result<Vec<(usize, LayerLearnStrategy)>> {
-        let mut layer_learn_actions = vec![];
-        let mut layer_d = None;
-
+    ) -> Result<Vec<(usize, LayerLearnAction)>> {
         let layer_states = self.to_intermediate_states(&layers_activations)?;
+
+        // BEWARE: a little bit of maths to compute MLP parameters via back-propagation
+        //
+        // --- forward pass ---
+        // l = loss( a(z0(x)) ) = loss( a( w * a(z'(x)) + b ) )
+        //      [ a(..) is activation function (tanh, sigmoid, etc.)]
+        //      [ z(x)  is the weighted inputs of a given MLP layer]
+        //      [ z(x)  is equal to either (w * a(z'(x)) + b) or the network inputs, 'x' ]
+        //
+        // --- backward pass ---
+        // dl/da  = loss_d(..)
+        // dl/dz0 = dl/da * da/dz  =  loss_d(..) * activation_d(z, ..)
+        //              [this allows us to calc gradients for final MLP layer]
+        // dl/dz' = dl/dz * dz/dz' =  dl/dz * (w * da/dz')  =  dl/dz * w * activation_d(z', ..)
+        //              [this allows us to calc gradients for any MLP layer]
+        // dl/dw  = dl/dz * dz/dw  =  dl/dz * a(z'(x))
+        //              [as seen above we can calculate dl/dz for any layer]
+        // dl/db  = dl/dz * dz/db  =  dl/dz
+
+        let mut layer_learn_actions = vec![];
+        let mut backprop_activation_gradients = None;
+
         for state in layer_states.iter().rev() {
-            let error_d = match layer_d.take() {
-                Some(prev_layer_error_d) => LayerValues::new(prev_layer_error_d),
+            let dl_da = match backprop_activation_gradients.take() {
+                Some(prev_layer_dl_dx) => LayerValues::new(prev_layer_dl_dx),
                 None => {
                     let layer_activations = state.layer_activations;
+                    let layer = &state.layer;
 
                     match state.activation_mode {
-                        NetworkActivationMode::SoftMax => state
-                            .layer
-                            .calculate_cross_entropy_error_d(&layer_activations, &target_outputs)?,
-                        _ => state
-                            .layer
-                            .calculate_msd_error_d(&layer_activations, &target_outputs)?,
+                        NetworkActivationMode::SoftMax => {
+                            layer.cross_entropy_error_d(&layer_activations, &target_outputs)?
+                        }
+                        _ => layer.msd_error_d(&layer_activations, &target_outputs)?,
                     }
                 }
             };
 
-            let layer_weighted_outputs = state.layer_weighted_outputs;
-            let activation_d = state.activation_mode.derivative(&layer_weighted_outputs);
-            let activated_layer_d = activation_d.multiply_iter(&error_d).collect();
-            let input_gradients = state.layer.compute_d(&activated_layer_d)?.collect();
-            layer_d = Some(input_gradients);
+            let da_dz = state
+                .activation_mode
+                .derivative(&state.layer_weighted_outputs);
 
-            let strategy = LayerLearnStrategy::GradientDecent {
-                gradients: activated_layer_d,
+            let dl_dz = dl_da.multiply_iter(&da_dz).collect();
+            let dl_dx = state.layer.multiply_weight_matrix(&dl_dz)?;
+
+            let strategy = LayerLearnAction::GradientDecent {
+                gradients: dl_dz,
                 layer_inputs: state.layer_input.clone(),
             };
 
             layer_learn_actions.push((state.layer_id, strategy));
+            backprop_activation_gradients = Some(dl_dx);
         }
 
         Ok(layer_learn_actions)
@@ -528,7 +537,45 @@ impl Network {
         Ok(layer_states.collect::<Result<Vec<_>>>()?)
     }
 
-    fn apply_pending_layer_actions<'a, I: Iterator<Item = &'a (usize, LayerLearnStrategy)>>(
+    #[instrument(level = "info", skip_all)]
+    #[cfg(feature = "threadpool")]
+    fn apply_pending_layer_actions<'a, I: Iterator<Item = &'a (usize, LayerLearnAction)>>(
+        &mut self,
+        learn_actions: I,
+        learn_rate: f64,
+    ) -> Result<()> {
+        use std::collections::HashMap;
+        use itertools::Itertools;
+        use rayon::prelude::*;
+
+        let layer_actions: HashMap<usize, Vec<&LayerLearnAction>> = learn_actions
+            .group_by(|x| x.0)
+            .into_iter()
+            .map(|(id, group)| (id, group.map(|(_, b)| b).collect_vec()))
+            .collect();
+
+        let each_layers_actions = self
+            .layers
+            .iter_mut()
+            .enumerate()
+            .map(|(idx, layer)| (layer, layer_actions.get(&idx)))
+            .collect_vec();
+
+        each_layers_actions
+            .into_par_iter()
+            .try_for_each(|(layer, layer_actions)| {
+                for layer_action in layer_actions.unwrap_or(&vec![]) {
+                    layer.learn(&layer_action, learn_rate)?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+
+        Ok(())
+    }
+
+    #[instrument(level = "info", skip_all)]
+    #[cfg(not(feature = "threadpool"))]
+    fn apply_pending_layer_actions<'a, I: Iterator<Item = &'a (usize, LayerLearnAction)>>(
         &mut self,
         learn_actions: I,
         learn_rate: f64,
@@ -578,13 +625,6 @@ struct LayerIntermediate<'a> {
 }
 
 pub enum NetworkLearnStrategy {
-    MutateRng {
-        rand_amount: NodeValue,
-        // #[cfg(feature = "threadpool")]
-        // rng: std::sync::Arc<dyn RNG>,
-        // #[cfg(not(feature = "threadpool"))]
-        // rng: Rc<dyn RNG>,
-    },
     BatchGradientDecent {
         training_pairs: Vec<(LayerValues, LayerValues)>,
         learn_rate: NodeValue,
@@ -754,28 +794,6 @@ mod tests {
 
         assert_ne!(vec![0.5, 0.5].approx(), output.approx());
         assert_eq!(output.iter().sum::<NodeValue>().min(0.999), 0.999);
-    }
-
-    #[test]
-    fn can_network_learn_randomly() {
-        let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::PositiveRandom);
-        shape.set_activation_mode(NetworkActivationMode::SoftMax);
-        let rng = RngStrategy::testable(12345);
-        let mut network = Network::new_with_rng(shape, rng);
-
-        let output_1 = network.compute([2.0, 2.0].iter().into()).unwrap();
-        network
-            .learn(NetworkLearnStrategy::MutateRng {
-                rand_amount: 0.1,
-                // rng: rng.clone(),
-            })
-            .unwrap();
-
-        let output_2 = network.compute([2.0, 2.0].iter().into()).unwrap();
-
-        assert_ne!(vec![0.5, 0.5].approx(), output_1.approx());
-        assert_ne!(vec![0.5, 0.5].approx(), output_2.approx());
-        assert_ne!(output_1.approx(), output_2.approx());
     }
 
     #[test]
