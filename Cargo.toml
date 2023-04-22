@@ -13,6 +13,10 @@ required-features = ["args", "thread"]
 name = "upload"
 required-features = ["db"]
 
+[[bin]]
+name = "derivate"
+required-features = ["thread"]
+
 [dependencies]
 anyhow = { version = "1.0.69", features = ["backtrace"] }
 clap = { version = "4.1.13", features = ["derive"], optional = true }

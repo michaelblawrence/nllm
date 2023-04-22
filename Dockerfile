@@ -19,20 +19,15 @@ COPY Cargo.toml Cargo.lock ./
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
         
 RUN set -eux; \
-		cargo build --features="cli thread threadpool" --release --bin embed;
+        cargo install --features="cli thread threadpool" --bin embed --path .;
 
 COPY src src
+RUN touch src/bin/embed/main.rs src/bin/derivate.rs src/main.rs;
 
 RUN set -eux; \
-        touch src/bin/embed/main.rs src/bin/derivate.rs src/main.rs; \
-		cargo build --features="cli thread threadpool" --release --bin embed;
-
-RUN set -eux; \
-        cargo install --features="cli thread threadpool" --bin embed --path .; \
-        cargo install --features="db" --bin upload --path .;
+        cargo install --features="cli thread threadpool" --bin embed --path .;
 
 COPY justfile ./
-
 COPY res/tinyimdb.txt res/tinyshakespeare.txt ./res/
 
 RUN set -eux; \
