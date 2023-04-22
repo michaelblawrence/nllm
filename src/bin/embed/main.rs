@@ -1,8 +1,6 @@
 use std::{io::Write, sync::mpsc, thread};
 
 use anyhow::{anyhow, Result};
-use clap::{Args, FromArgMatches};
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use tracing::metadata::LevelFilter;
 
 use config::TrainEmbeddingConfig;
@@ -72,6 +70,7 @@ fn parse_repl_char(
         ',' => tx.send(TrainerMessage::MultiplyLearnRateBy(0.5))?,
         '.' => tx.send(TrainerMessage::MultiplyLearnRateBy(2.0))?,
         'e' => tx.send(TrainerMessage::IncreaseMaxRounds(config.training_rounds))?,
+        '/' => tx.send(TrainerMessage::UnpauseForSingleIteration)?,
         'p' => tx.send(TrainerMessage::TogglePause)?,
         'l' => tx.send(prompt("output_label", |x| {
             TrainerMessage::RenameOutputLabel(x)
@@ -100,6 +99,7 @@ fn parse_repl_char(
                         'e' => extend training rounds
                         'l' => rename output label (applies to subsequent save model operations)
                         'h' => display help
+                        '/' => pause after a single iteration
                         'p' => toggle pause
                         'q' => quit
                         "
@@ -110,11 +110,13 @@ fn parse_repl_char(
     Ok(())
 }
 
+#[cfg(feature = "cli")]
 fn block_on_key_press<F: Fn(char) -> Result<()>>(
     key_press_callback: F,
     tx: &mpsc::Sender<TrainerMessage>,
 ) {
-    use KeyCode::Char;
+    use crossterm::event::{self, Event, KeyCode::Char, KeyEvent};
+
     loop {
         match event::poll(std::time::Duration::from_secs(10)) {
             Ok(true) => {}
@@ -127,6 +129,41 @@ fn block_on_key_press<F: Fn(char) -> Result<()>>(
             Err(_) => return,
         };
         if let Event::Key(KeyEvent { code: Char(c), .. }) = event::read().unwrap() {
+            if let Err(_) = key_press_callback(c) {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "cli"))]
+fn block_on_key_press<F: Fn(char) -> Result<()>>(
+    key_press_callback: F,
+    tx: &mpsc::Sender<TrainerMessage>,
+) {
+    use std::io::{BufRead, Read};
+
+    let stdin = std::io::stdin();
+    loop {
+        let mut stdin = stdin.lock();
+        let buffer = match stdin.fill_buf() {
+            Ok(buffer) if !buffer.is_empty() => buffer,
+            Ok(_) => {
+                if let Err(_) = tx.send(TrainerMessage::NoOp) {
+                    return;
+                }
+                continue;
+            }
+            Err(_) => return,
+        };
+
+        let n = buffer.len();
+        
+        let buffer: String = std::str::from_utf8(buffer).unwrap().to_string();
+        stdin.consume(n);
+        drop(stdin);
+
+        for c in buffer.trim().chars() {
             if let Err(_) = key_press_callback(c) {
                 return;
             }
@@ -166,6 +203,7 @@ fn configure_logging() {
         .compact()
         .with_target(false)
         .with_max_level(LevelFilter::INFO)
+        // .with_span_events(FmtSpan::CLOSE)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).unwrap();
@@ -175,6 +213,8 @@ fn parse_cli_args() -> Result<(
     TrainEmbeddingConfig,
     Option<(String, messages::TrainerStateMetadata)>,
 )> {
+    use clap::{Args, FromArgMatches};
+
     let cli = clap::Command::new("embed").disable_help_flag(true).arg(
         clap::Arg::new("help")
             .long("help")

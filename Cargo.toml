@@ -7,7 +7,7 @@ edition = "2021"
 
 [[bin]]
 name = "embed"
-required-features = ["cli", "thread"]
+required-features = ["args", "thread"]
 
 [[bin]]
 name = "upload"
@@ -41,7 +41,8 @@ test-log = { version = "0.2.11", default-features = false, features = ["trace"] 
 
 [features]
 db = ["mongodb"]
-cli = ["crossterm", "clap"]
+cli = ["crossterm", "args"]
+args = ["clap"]
 thread = ["rand", "rand_distr"]
 threadpool = ["rayon"]
 short_floats = []
