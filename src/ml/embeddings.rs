@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use super::{
     BatchSamplingStrategy, LayerValues, Network, NetworkActivationMode, NetworkLearnStrategy,
@@ -53,6 +53,7 @@ impl Embedding {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
+    #[instrument(level = "info", name = "embed_train", skip_all)]
     pub fn train<B: Into<TrainBatchConfig>>(
         &mut self,
         phrases: &Vec<Vec<String>>,
@@ -60,39 +61,12 @@ impl Embedding {
         batch_size: B,
     ) -> Result<NodeValue> {
         let batch_size: TrainBatchConfig = batch_size.into();
-
-        // reduce phrase count for processing on small batches
-        let phrases: Box<dyn Iterator<Item = &Vec<String>>> = match &batch_size {
-            TrainBatchConfig::SingleBatch(batch_size) => {
-                Box::new(self.rng.take_rand(phrases, *batch_size).into_iter())
-            }
-            _ => Box::new(phrases.iter()),
-        };
-
-        let training_pairs = self.into_context_target_pairs(phrases);
-        let (batches, batch_size) = match batch_size {
-            TrainBatchConfig::Batches(batch_size) => {
-                let training_pairs = training_pairs
-                    .chunks(batch_size.pow(2))
-                    .map(|training_pairs| training_pairs.into_iter().cloned().collect::<Vec<_>>())
-                    .collect();
-
-                (training_pairs, batch_size)
-            }
-            TrainBatchConfig::SingleBatch(batch_size) => {
-                let mut training_pairs = training_pairs;
-                self.rng.shuffle_vec(&mut training_pairs);
-                training_pairs.truncate(batch_size);
-
-                (vec![training_pairs], batch_size)
-            }
-        };
-
+        let batches = self.into_batches(phrases, batch_size);
         let mut costs = vec![];
 
         for training_pairs in batches {
             let rng = self.rng.clone();
-            let batch_sampling = BatchSamplingStrategy::Shuffle(batch_size, rng);
+            let batch_sampling = BatchSamplingStrategy::Shuffle(*batch_size, rng);
             let training_pairs_len = training_pairs.len();
 
             let cost = self
@@ -115,6 +89,54 @@ impl Embedding {
         let costs: LayerValues = costs.into_iter().flatten().collect();
         let ave_cost = costs.ave();
         Ok(ave_cost)
+    }
+
+    #[instrument(level = "info", skip_all)]
+    fn into_batches(&self, phrases: &Vec<Vec<String>>, batch_size: TrainBatchConfig) -> Vec<Vec<(LayerValues, LayerValues)>> {
+        // reduce phrase count for processing on small batches
+        let phrases: Box<dyn Iterator<Item = &Vec<String>>> = match &batch_size {
+            &TrainBatchConfig::SingleBatch(batch_size) => {
+                let ave_len = phrases.iter().map(|x| x.len()).sum::<usize>() / phrases.len();
+                let phrases = {
+                    let mut tokens = 0;
+                    let mut my_vec = vec![];
+                    while tokens < batch_size {
+                        let take = batch_size / ave_len.max(1);
+                        self.rng
+                            .take_rand(phrases, take.max(1))
+                            .into_iter()
+                            .for_each(|phrase| {
+                                tokens += phrase.len();
+                                my_vec.push(phrase);
+                            })
+                    }
+                    my_vec
+                };
+                Box::new(phrases.into_iter())
+            }
+            _ => Box::new(phrases.iter()),
+        };
+
+        let training_pairs = self.into_context_target_pairs(phrases);
+
+        match batch_size {
+            TrainBatchConfig::Batches(batch_size) => {
+                let available_parallelism = std::thread::available_parallelism();
+                let available_parallelism = available_parallelism.map_or(0, |x| x.get());
+
+                training_pairs
+                    .chunks(batch_size * available_parallelism)
+                    .map(|training_pairs| training_pairs.into_iter().cloned().collect::<Vec<_>>())
+                    .collect()
+            }
+            TrainBatchConfig::SingleBatch(batch_size) => {
+                let mut training_pairs = training_pairs;
+                self.rng.shuffle_vec(&mut training_pairs);
+                training_pairs.truncate(batch_size);
+
+                vec![training_pairs]
+            }
+        }
     }
 
     fn into_context_target_pairs<'a, P>(&self, phrases: P) -> Vec<(LayerValues, LayerValues)>
@@ -212,6 +234,11 @@ impl Embedding {
             .ln();
 
         Ok(-log_logits)
+    }
+
+    pub fn generate_sequence_string(&self, token_separator: &str) -> String {
+        let sequence: Vec<String> = self.predict_from_iter(&[CONTROL_VOCAB]).collect();
+        sequence.join(token_separator)
     }
 
     pub fn predict_iter<'a>(&'a self, seed_word: &str) -> impl Iterator<Item = String> + 'a {
@@ -470,7 +497,7 @@ pub mod builder {
         embedding_dimensions: usize,
         input_stride_width: usize,
         hidden_layer_shape: Vec<LayerShapeConfig>,
-        hidden_layer_init_stratergy: LayerInitStrategy,
+        hidden_layer_init_strategy: LayerInitStrategy,
         rng: RngStrategy,
     }
 
@@ -485,7 +512,7 @@ pub mod builder {
                 embedding_dimensions: 2,
                 input_stride_width: 1,
                 hidden_layer_shape: vec![10.into()],
-                hidden_layer_init_stratergy: LayerInitStrategy::ScaledFullRandom,
+                hidden_layer_init_strategy: LayerInitStrategy::ScaledFullRandom,
                 rng: Default::default(),
             }
         }
@@ -635,7 +662,7 @@ pub mod builder {
                         vocab.len(),
                         embedding_layer_shape,
                         self.hidden_layer_shape,
-                        self.hidden_layer_init_stratergy,
+                        self.hidden_layer_init_strategy,
                         self.activation_mode,
                     )?;
                     Network::new(network_shape)
@@ -734,11 +761,11 @@ pub mod builder {
             self
         }
 
-        pub fn with_hidden_layer_init_stratergy(
+        pub fn with_hidden_layer_init_strategy(
             mut self,
-            hidden_layer_init_stratergy: LayerInitStrategy,
+            hidden_layer_init_strategy: LayerInitStrategy,
         ) -> Self {
-            self.hidden_layer_init_stratergy = hidden_layer_init_stratergy;
+            self.hidden_layer_init_strategy = hidden_layer_init_strategy;
             self
         }
 
