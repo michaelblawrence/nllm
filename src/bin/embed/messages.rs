@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use std::{
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -265,9 +265,11 @@ impl TrainerHandleActions {
     }
 }
 
+pub type TrainerHandleSender<T> = mpsc::Sender<T>;
+
 pub struct TrainerHandle<Message: Send, F> {
-    pub tx: Sender<Message>,
-    pub rx: Receiver<Message>,
+    pub tx: TrainerHandleSender<Message>,
+    pub rx: mpsc::Receiver<Message>,
     pub handler: F,
 }
 
@@ -276,7 +278,7 @@ where
     Message: Send,
     F: Fn(&Embedding, Message) -> TrainerHandleActions,
 {
-    pub fn new(handler: F) -> (Sender<Message>, Self) {
+    pub fn new(handler: F) -> (TrainerHandleSender<Message>, Self) {
         let (tx, rx) = mpsc::channel();
 
         (tx.clone(), Self { tx, rx, handler })
@@ -286,12 +288,24 @@ where
         self.tx.send(t)
     }
 
+    #[cfg(feature = "thread")]
     pub fn try_recv(&self, timeout: Option<Duration>) -> Result<Message> {
         match timeout {
             Some(timeout) => self
                 .rx
                 .recv_timeout(timeout)
                 .context("failed to recv message"),
+            None => self.rx.try_recv().context("failed to recv message"),
+        }
+    }
+
+    #[cfg(not(feature = "thread"))]
+    pub fn try_recv(&self, timeout: Option<Duration>) -> Result<Message> {
+        match timeout {
+            Some(timeout) => {
+                std::thread::sleep(timeout);
+                self.rx.try_recv().context("failed to recv message")
+            }
             None => self.rx.try_recv().context("failed to recv message"),
         }
     }
@@ -311,6 +325,7 @@ pub struct TrainerStateMetadata {
     pub output_label: Option<String>,
     #[serde(default)]
     pub total_train_seconds: u64,
+    #[serde(default)]
     pub training_report: Option<TrainerReport>,
     #[serde(default)]
     pub training_error_history: Vec<(usize, f64)>,
@@ -325,5 +340,6 @@ pub struct TrainerReport {
     pub validation_error: NodeValue,
     pub nll: NodeValue,
     pub label: Option<String>,
+    #[serde(default)]
     pub generated_time: u128,
 }

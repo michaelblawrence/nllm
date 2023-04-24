@@ -1,16 +1,45 @@
-use std::{io::Write, sync::mpsc, thread};
+use std::{io::Write, thread};
 
 use anyhow::{anyhow, Result};
 use tracing::metadata::LevelFilter;
 
 use config::TrainEmbeddingConfig;
-use messages::TrainerMessage;
+use messages::{TrainerMessage, TrainerHandleSender};
 
 mod bounded;
 mod config;
 mod messages;
 mod training;
 
+#[cfg(not(feature = "thread"))]
+fn main() -> Result<()> {
+    use tracing::warn;
+
+    configure_logging();
+    let (config, resumed_state) = parse_cli_args()?;
+
+    let config_clone = config.clone();
+    let (tx, handle) = messages::TrainerHandle::new(move |embedding, msg: TrainerMessage| {
+        let handle_action = msg.apply(embedding, &config_clone);
+        handle_action
+    });
+
+    if let Some((snapshot, state)) = resumed_state {
+        tx.send(TrainerMessage::ReplaceEmbeddingState(snapshot, state))?;
+    }
+
+    if let Some(repl) = &config.repl {
+        for c in repl.chars() {
+            parse_repl_char(c, &tx, &config)
+                .expect("config repl character caused startup to halt");
+        }
+    }
+
+    training::setup_and_train_embeddings_v2(config, handle);
+    Ok(())
+}
+
+#[cfg(feature = "thread")]
 fn main() -> Result<()> {
     configure_logging();
     let (config, resumed_state) = parse_cli_args()?;
@@ -51,7 +80,7 @@ fn main() -> Result<()> {
 
 fn parse_repl_char(
     c: char,
-    tx: &mpsc::Sender<TrainerMessage>,
+    tx: &TrainerHandleSender<TrainerMessage>,
     config: &TrainEmbeddingConfig,
 ) -> Result<()> {
     match c {
@@ -113,7 +142,7 @@ fn parse_repl_char(
 #[cfg(feature = "cli")]
 fn block_on_key_press<F: Fn(char) -> Result<()>>(
     key_press_callback: F,
-    tx: &mpsc::Sender<TrainerMessage>,
+    tx: &TrainerHandleSender<TrainerMessage>,
 ) {
     use crossterm::event::{self, Event, KeyCode::Char, KeyEvent};
 
@@ -139,7 +168,7 @@ fn block_on_key_press<F: Fn(char) -> Result<()>>(
 #[cfg(not(feature = "cli"))]
 fn block_on_key_press<F: Fn(char) -> Result<()>>(
     key_press_callback: F,
-    tx: &mpsc::Sender<TrainerMessage>,
+    tx: &TrainerHandleSender<TrainerMessage>,
 ) {
     use std::io::{BufRead, Read};
 
@@ -158,7 +187,7 @@ fn block_on_key_press<F: Fn(char) -> Result<()>>(
         };
 
         let n = buffer.len();
-        
+
         let buffer: String = std::str::from_utf8(buffer).unwrap().to_string();
         stdin.consume(n);
         drop(stdin);
@@ -225,8 +254,6 @@ fn parse_cli_args() -> Result<(
     let cli = config::Cli::from_arg_matches(&matches)
         .map_err(|err| err.exit())
         .unwrap();
-
-    // let cli = config::Cli::parse();
 
     let (mut config, resumed_state) = match cli.command() {
         config::Command::TrainEmbedding(config) => (config, None),

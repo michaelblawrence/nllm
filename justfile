@@ -4,16 +4,37 @@ mongodb_host := env_var_or_default('MONGO_INITDB_HOST', 'localhost')
 model_output_label := "dev-model"
 
 build:
-  cargo build --features="cli thread threadpool" --release --bin embed
+  cargo build --features="multi_threaded" --release --bin embed
+
+build-wasi:
+  cargo +nightly wasi build --features="wasi" --release --bin embed 
 
 install:
-  cargo install --features="cli thread threadpool" --bin embed --path .
+  cargo install --features="multi_threaded" --bin embed --path .
 
 install-upload:
   cargo install --features="db" --bin upload --path .
 
+wasi-run:
+  wasmer run --dir ./out --dir ./res --enable-all ./embed.wasm -- \
+    --quit-on-complete --single-batch-iterations --char --train-rate 0.0016 --batch-size 32 \
+    --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 --hidden-layer-nodes 650  --embedding-size 16 --input-stride-width 64 \
+    --training-rounds 1000 -i ./res/imdb-train-pos.txt -o out -O imdb-model-pos-wasi
+
+wasi-testrun:
+  wasmer run --dir ./out --dir ./res --enable-all ./target/wasm32-wasi/release/embed.wasi.wasm -- \
+    --quit-on-complete --single-batch-iterations --char --training-rounds 100000 \
+    --batch-size 64 --phrase-test-set-max-tokens 5 \
+    -i ./res/tinyshakespeare.txt -o out -O dev-model-wasi 
+
+run-like-wasi-testrun:
+  cargo run --features="single_threaded" --release --bin embed -- \
+    --quit-on-complete --single-batch-iterations --char --training-rounds 100000 \
+    --batch-size 64 --phrase-test-set-max-tokens 5 \
+    -i ./res/tinyshakespeare.txt -o out -O dev-model-wasi 
+
 cargo-run input_file="./res/tinyshakespeare.txt" rounds="100000" output_label=(model_output_label):
-  cargo run --features="cli thread threadpool" --release --bin embed -- \
+  cargo run --features="multi_threaded" --release --bin embed -- \
     --single-batch-iterations --char --train-rate 0.0016 --batch-size 32 \
     --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
     --hidden-layer-nodes 650  --embedding-size 16 --input-stride-width 64 --repl "PR" \
@@ -21,12 +42,12 @@ cargo-run input_file="./res/tinyshakespeare.txt" rounds="100000" output_label=(m
     --output-label-append-details -o out/labelled/train -O {{model_output_label}}
 
 cargo-resume input_file repl="p" batch_size="32":
-  cargo run --features="cli thread threadpool" --release --bin embed -- \
+  cargo run --features="multi_threaded" --release --bin embed -- \
     load {{input_file}} \
-    --repl "{{repl}}" --batch-size {{batch_size}}
+    --repl "{{repl}}" --batch-size {{batch_size}} --force-continue
 
 cargo-respond input_file:
-  cargo run --features="thread" --release --bin respond -- \
+  cargo run --features="threadrng" --release --bin respond -- \
     {{input_file}}
 
 run input_file="./res/tinyshakespeare.txt" rounds="100000":
@@ -39,7 +60,7 @@ run input_file="./res/tinyshakespeare.txt" rounds="100000":
 
 resume input_file repl="p" batch_size="32":
   embed load {{input_file}} \
-    --repl "{{repl}}" --batch-size {{batch_size}}
+    --repl "{{repl}}" --batch-size {{batch_size}} --force-continue
 
 testrun-heavy:
   embed --quit-on-complete \
@@ -118,3 +139,7 @@ push-node node_ip version="v1" run_script="testrun-tinyshakespeare" script_args=
 pull-node node_ip version="v1" run_script="testrun-tinyshakespeare" script_args="":
   mkdir -p out/remote/{{run_script}}/{{version}}
   scp -p root@{{node_ip}}:/home/docker/code/{{version}}/out/script-{{run_script}} ./out/remote/{{run_script}}/{{version}}
+
+pull-aws-node node_ip version="v1" label="testrun-tinyshakespeare" script_args="":
+  mkdir -p out/remote/{{label}}/aws-{{version}}
+  scp -p -r ubuntu@{{node_ip}}:/home/ubuntu/code/out/{{label}} ./out/remote/{{label}}/aws-{{version}}

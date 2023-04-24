@@ -7,15 +7,11 @@ edition = "2021"
 
 [[bin]]
 name = "embed"
-required-features = ["args", "thread"]
+required-features = ["args", "threadrng"]
 
 [[bin]]
 name = "upload"
 required-features = ["db"]
-
-[[bin]]
-name = "derivate"
-required-features = ["thread"]
 
 [dependencies]
 anyhow = { version = "1.0.69", features = ["backtrace"] }
@@ -47,6 +43,11 @@ test-log = { version = "0.2.11", default-features = false, features = ["trace"] 
 db = ["mongodb"]
 cli = ["crossterm", "args"]
 args = ["clap"]
-thread = ["rand", "rand_distr"]
-threadpool = ["rayon"]
+thread = []
+threadpool = ["thread", "rayon"]
+threadrng = ["rand", "rand_distr"]
+wasi = ["args", "threadrng"]
+single_threaded = ["cli", "threadrng"]
+multi_threaded = ["cli", "threadrng", "threadpool"]
+include_res = []
 short_floats = []

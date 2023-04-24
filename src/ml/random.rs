@@ -82,21 +82,21 @@ where
     inner.serialize(serializer)
 }
 
-#[cfg(any(test, feature = "thread"))]
+#[cfg(any(test, feature = "threadrng"))]
 #[derive(Default)]
 pub struct JsRng(std::cell::RefCell<rand::rngs::ThreadRng>);
 
-#[cfg(not(any(test, feature = "thread")))]
+#[cfg(not(any(test, feature = "threadrng")))]
 #[derive(Default)]
 pub struct JsRng;
 
 impl RNG for JsRng {
-    #[cfg(any(test, feature = "thread"))]
+    #[cfg(any(test, feature = "threadrng"))]
     fn rand(&self) -> NodeValue {
         use rand::Rng;
         self.0.borrow_mut().gen()
     }
-    #[cfg(not(any(test, feature = "thread")))]
+    #[cfg(not(any(test, feature = "threadrng")))]
     fn rand(&self) -> NodeValue {
         js_sys::Math::random() as NodeValue
     }

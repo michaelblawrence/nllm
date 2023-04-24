@@ -2,7 +2,6 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     rc::Rc,
-    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -20,13 +19,13 @@ use crate::{
     bounded::BoundedValueLogger,
     config::TrainEmbeddingConfig,
     messages::{
-        TrainerHandle, TrainerHandleActions, TrainerMessage, TrainerReport, TrainerStateMetadata,
+        TrainerHandle, TrainerHandleActions, TrainerMessage, TrainerReport, TrainerStateMetadata, TrainerHandleSender,
     },
 };
 
 pub struct TrainerState {
     pub embedding: Embedding,
-    pub handle_tx: mpsc::Sender<TrainerMessage>,
+    pub handle_tx: TrainerHandleSender<TrainerMessage>,
     pub output_label: Option<String>,
     pub learn_rate: f64,
     pub training_rounds: usize,
@@ -51,7 +50,7 @@ impl TrainerState {
     fn new(
         embedding: Embedding,
         config: &TrainEmbeddingConfig,
-        handle_tx: &mpsc::Sender<TrainerMessage>,
+        handle_tx: &TrainerHandleSender<TrainerMessage>,
     ) -> Self {
         Self {
             embedding,
@@ -139,8 +138,8 @@ impl TrainerState {
         }
 
         let quit_on_complete = self.inital_config.quit_on_complete;
-        let complete_entire_run = self.round == self.training_rounds
-            || (quit_on_complete && self.round > self.training_rounds);
+        let complete_entire_run = self.round == self.training_rounds - 1
+            || (quit_on_complete && self.round >= self.training_rounds);
 
         if complete_entire_run && !self.paused {
             if self.inital_config.quit_on_complete {
@@ -315,7 +314,7 @@ impl TrainerState {
                 .send(msg)
                 .expect("failed to invoke model write to disk");
 
-            info!("Trigger action completed: save model to file");
+            info!("Triggered action: save model to file");
         }
 
         self.halt = true;
@@ -563,7 +562,8 @@ pub fn parse_phrases(config: &TrainEmbeddingConfig) -> Vec<Vec<String>> {
             use std::io::Read;
 
             // TODO: remove fallback when old config files archived
-            let mut file = File::open("../../../res/phrase_list.json").unwrap(); // TODO: error handling
+            let mut file =
+                File::open("res/phrase_list.json").expect("Failed to open fallback train set file"); // TODO: error handling
             let mut phrase_json = String::new();
             file.read_to_string(&mut phrase_json).unwrap();
             let phrase_json: Value = serde_json::from_str(&phrase_json).unwrap();
@@ -711,6 +711,8 @@ mod validate {
         let mut correct_first_word_predictions = 0;
         let mut total_first_word_predictions = 0;
 
+        // TODO: take batch_size num of phrases or of training pairs randomly to validate..
+        // once perf hit is ngligable, run on each train iter and save/plot data 
         for testing_phrase in testing_phrases.iter() {
             for testing_phrase_window in testing_phrase.windows(embedding.input_stride_width() + 1)
             {
@@ -745,7 +747,7 @@ mod validate {
     pub fn should_report_round(round: usize, training_rounds: usize) -> bool {
         let round_1based = round + 1;
 
-        round_1based <= 50
+        round_1based <= 3
             || (round_1based <= 1000 && round_1based % 100 == 0)
             || (round_1based <= 10000 && round_1based % 1000 == 0)
             || (round_1based <= 100000 && round_1based % 10000 == 0)
@@ -803,6 +805,7 @@ pub mod writer {
 
         plot.set_layout(plot.layout().clone().title(title));
 
+        #[cfg(feature = "cli")]
         plot.show();
     }
 

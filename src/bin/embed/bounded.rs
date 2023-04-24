@@ -37,11 +37,13 @@ impl<T> FromIterator<(usize, T)> for BoundedValueLogger<T> {
 }
 
 impl<T> BoundedValueLogger<T> {
+    const MIN_CAPACITY: usize = 16;
+
     pub fn new(capacity: usize) -> Self {
         Self {
             items: vec![],
             every_nth: 1,
-            capacity,
+            capacity: capacity.max(Self::MIN_CAPACITY),
             index: 0,
             counter: 0,
         }
@@ -57,7 +59,7 @@ impl<T> BoundedValueLogger<T> {
     }
 
     pub fn set_capacity(&mut self, capacity: usize) {
-        self.capacity = capacity;
+        self.capacity = capacity.max(Self::MIN_CAPACITY);
         let mut iter_left = 25;
         while iter_left > 0 {
             if !self.shrink_if_needed() {
