@@ -7,7 +7,7 @@ use yew_hooks::use_local_storage;
 
 #[function_component]
 fn App() -> Html {
-    use plane::components::{trainer::TrainEmbeddingConfig, EmbeddingTrainer, JsonEditor};
+    use plane::components::{trainer::TrainEmbeddingConfig, EmbeddingChat, EmbeddingTrainer, JsonEditor};
 
     let storage = use_local_storage::<TrainEmbeddingConfig>("embeddings_config".to_string());
     let json_is_valid = use_state(|| true);
@@ -53,6 +53,7 @@ fn App() -> Html {
 
     html! {
         <div>
+        <EmbeddingChat />
         <EmbeddingTrainer config={&*embedding_training_config}/>
         <JsonEditor json_input={json} on_json_change={on_json_change} input_invalid={!*json_is_valid}/>
         </div>
