@@ -12,6 +12,7 @@ pub use layer::{LayerValues, NodeValue};
 use super::RngStrategy;
 
 pub mod layer;
+pub mod transformer;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NetworkShape {
