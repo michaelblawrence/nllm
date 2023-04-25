@@ -473,7 +473,7 @@ impl Network {
                 .derivative(&state.layer_weighted_outputs);
 
             let dl_dz = dl_da.multiply_iter(&da_dz).collect();
-            let dl_dx = state.layer.multiply_weight_matrix(&dl_dz)?;
+            let dl_dz_next = state.layer.multiply_weight_matrix(&dl_dz)?;
 
             let strategy = LayerLearnAction::GradientDecent {
                 gradients: dl_dz,
@@ -481,7 +481,7 @@ impl Network {
             };
 
             layer_learn_actions.push((state.layer_id, strategy));
-            backprop_activation_gradients = Some(dl_dx);
+            backprop_activation_gradients = Some(dl_dz_next);
         }
 
         Ok(layer_learn_actions)
@@ -565,8 +565,9 @@ impl Network {
             .into_par_iter()
             .try_for_each(|(layer, layer_actions)| {
                 for layer_action in layer_actions.unwrap_or(&vec![]) {
-                    layer.learn(&layer_action, learn_rate)?;
+                    layer.learn(&layer_action)?;
                 }
+                layer.apply_gradients(learn_rate)?;
                 Ok::<(), anyhow::Error>(())
             })?;
 
@@ -586,7 +587,8 @@ impl Network {
                 .get_mut(*layer_idx)
                 .context("this layer index should be present")?;
 
-            layer.learn(&learn_strategy, learn_rate)?;
+            layer.learn(&learn_strategy)?;
+            layer.apply_gradients(learn_rate)?;
         }
 
         Ok(())

@@ -20,6 +20,14 @@ pub struct Layer {
     inputs_count: usize,
     size: usize,
     stride_count: Option<usize>,
+    #[serde(default)]
+    gradients: LayerGradients,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LayerGradients {
+    weights: Vec<NodeValue>,
+    bias: Option<Vec<NodeValue>>,
 }
 
 impl Layer {
@@ -29,8 +37,8 @@ impl Layer {
 
         let mut weights = vec![0.0; inputs_count * size];
         let mut bias = match &init_strategy {
-            LayerInitStrategy::NoBias => None,
-            _ => Some(vec![0.0; size]),
+            x if x.requires_bias() => Some(vec![0.0; size]),
+            _ => None,
         };
 
         init_strategy.apply(
@@ -46,6 +54,7 @@ impl Layer {
             inputs_count,
             size,
             stride_count: shape.stride(),
+            gradients: LayerGradients::default(),
         }
     }
 
@@ -106,7 +115,7 @@ impl Layer {
             .collect())
     }
 
-    pub fn learn(&mut self, strategy: &LayerLearnAction, learn_rate: NodeValue) -> Result<()> {
+    pub fn learn(&mut self, strategy: &LayerLearnAction) -> Result<()> {
         match strategy {
             LayerLearnAction::GradientDecent {
                 gradients,
@@ -114,30 +123,63 @@ impl Layer {
             } => {
                 let weights_gradients = self.weights_gradients_iter(&gradients, &layer_inputs)?;
 
-                for (x, grad) in self.weights.iter_mut().zip(weights_gradients.iter()) {
-                    let next_val = *x - (grad * learn_rate);
+                for (x, grad) in self
+                    .gradients
+                    .weights
+                    .iter_mut()
+                    .zip(weights_gradients.iter())
+                {
+                    let next_val = *x - grad;
                     *x = if next_val.is_finite() {
                         next_val
                     } else {
-                        // continue;
                         return Err(anyhow!(
-                            "failed to apply gradient (value={grad}) to optimise weights"
+                            "failed to increment gradient (value={grad}) to optimise weights"
                         ));
                     }
                 }
                 for (x, grad) in self.bias.iter_mut().flatten().zip(gradients.iter()) {
-                    let next_val = *x - (grad * learn_rate);
+                    let next_val = *x - grad;
                     *x = if next_val.is_finite() {
                         next_val
                     } else {
-                        // continue;
                         return Err(anyhow!(
-                            "failed to apply gradient (value={grad}) to optimise biases"
+                            "failed to increment gradient (value={grad}) to optimise biases"
                         ));
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn apply_gradients(&mut self, learn_rate: NodeValue) -> Result<()> {
+        let weights_gradients = self.gradients.weights.drain(..);
+        let bias_gradients = self.gradients.bias.iter_mut().flat_map(|x| x.drain(..));
+
+        for (x, grad) in self.weights.iter_mut().zip(weights_gradients) {
+            let next_val = *x - (grad * learn_rate);
+            *x = if next_val.is_finite() {
+                next_val
+            } else {
+                // continue;
+                return Err(anyhow!(
+                    "failed to apply gradient (value={grad}) to optimise weights"
+                ));
+            }
+        }
+        for (x, grad) in self.bias.iter_mut().flatten().zip(bias_gradients) {
+            let next_val = *x - (grad * learn_rate);
+            *x = if next_val.is_finite() {
+                next_val
+            } else {
+                // continue;
+                return Err(anyhow!(
+                    "failed to apply gradient (value={grad}) to optimise biases"
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -274,6 +316,10 @@ impl Layer {
 
     pub fn weights(&self) -> &[f64] {
         self.weights.as_ref()
+    }
+
+    pub fn gradients(&self) -> &LayerGradients {
+        &self.gradients
     }
 }
 
@@ -450,6 +496,20 @@ impl LayerInitStrategy {
         let u2 = rng.rand();
         let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
         return mu + sigma * z0;
+    }
+
+    pub fn requires_bias(&self) -> bool {
+        match self {
+            LayerInitStrategy::Zero
+            | LayerInitStrategy::PositiveRandom
+            | LayerInitStrategy::ScaledFullRandom
+            | LayerInitStrategy::ScaledFullRandomZeroBias
+            | LayerInitStrategy::Kaiming
+            | LayerInitStrategy::KaimingZeroBias
+            | LayerInitStrategy::FullRandom => true,
+
+            LayerInitStrategy::NoBias | LayerInitStrategy::NoBiasCopied(_) => false,
+        }
     }
 }
 
