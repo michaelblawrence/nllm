@@ -28,30 +28,17 @@ pub mod encoder {
         pub fn new(
             sequence_len: usize,
             embedding_dimension: usize,
-            head_count: usize,
             source_vocab_size: usize,
         ) -> Self {
-            Self::new_builder(
-                sequence_len,
-                embedding_dimension,
-                head_count,
-                source_vocab_size,
-            )
-            .build()
+            Self::new_builder(sequence_len, embedding_dimension, source_vocab_size).build()
         }
 
         pub fn new_builder(
             sequence_len: usize,
             embedding_dimension: usize,
-            head_count: usize,
             source_vocab_size: usize,
         ) -> builder::EncoderBuilder {
-            builder::EncoderBuilder::new(
-                sequence_len,
-                embedding_dimension,
-                head_count,
-                source_vocab_size,
-            )
+            builder::EncoderBuilder::new(sequence_len, embedding_dimension, source_vocab_size)
         }
 
         pub fn forward_training<T: AsRef<[usize]>>(&self, input_sequence: T) -> Result<Linear> {
@@ -91,7 +78,8 @@ pub mod encoder {
 
             let rng = RngStrategy::testable(1234);
 
-            let encoder = Encoder::new_builder(seq_len, embed_dim, head_count, vocab_size)
+            let encoder = Encoder::new_builder(seq_len, embed_dim, vocab_size)
+                .with_head_count(head_count)
                 .with_feed_forward_hidden_dimension(hidden_dim)
                 .with_rng(rng)
                 .build();
@@ -135,13 +123,12 @@ pub mod encoder {
             pub fn new(
                 sequence_len: usize,
                 model_dimension: usize,
-                head_count: usize,
                 source_vocab_size: usize,
             ) -> Self {
                 Self {
                     sequence_len,
                     model_dimension,
-                    head_count,
+                    head_count: 3,
                     source_vocab_size,
                     block_count: 6,
                     rng: Default::default(),
@@ -222,8 +209,13 @@ pub mod encoder {
                 self
             }
 
-            pub fn with_set_block_count(mut self, block_count: usize) -> Self {
+            pub fn with_block_count(mut self, block_count: usize) -> Self {
                 self.block_count = block_count;
+                self
+            }
+
+            pub fn with_head_count(mut self, head_count: usize) -> Self {
+                self.head_count = head_count;
                 self
             }
         }
@@ -405,10 +397,11 @@ pub mod blocks {
 
 pub mod layers {
     use anyhow::{Context, Result};
+    use itertools::Itertools;
 
     use crate::ml::NetworkActivationMode;
 
-    use super::{attention::SelfAttentionHead, *};
+    use super::{attention::SelfAttentionHead, gradients::LossGradients, *};
 
     pub struct MultiHeadSelfAttentionLayer {
         heads: Vec<SelfAttentionHead>,
@@ -456,28 +449,50 @@ pub mod layers {
 
             let mut dense_layer_outputs = vec![];
             for row in attention_output.rows_iter() {
-                let dense_output = self.dense_layer.forward(&LayerValues::new(row.to_vec()))?;
+                let dense_output = self.dense_layer.forward(&row.into())?;
                 dense_layer_outputs.push(dense_output);
             }
 
             Linear::from_values(&dense_layer_outputs)
         }
 
-        pub fn backward(&mut self, output_gradients: &Linear) -> Result<Linear> {
+        pub fn backward(&mut self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
             let mut dense_layer_input_gradients = vec![];
 
-            for row in output_gradients.rows_iter() {
-                // set inputs from forward pass? or from somewhere else.. investigate
-                let inputs = None;
+            for (row, inputs) in output_gradients.rows_iter().zip(inputs.rows_iter()) {
                 let dense_output = self
                     .dense_layer
-                    .backward(inputs, LayerValues::new(row.to_vec()))?;
+                    .backward(Some(&inputs.into()), row.into())?;
+
                 dense_layer_input_gradients.push(dense_output);
             }
 
-            let dense_layer_input_gradient = Linear::from_values(&dense_layer_input_gradients);
+            let dense_layer_input_gradient = Linear::from_values(&dense_layer_input_gradients)?;
+            let head_output_gradients = dense_layer_input_gradient.split(self.heads.len());
 
-            todo!()
+            let mut inputs_grads: Option<Linear> = None;
+
+            for (head, output_gradients) in self.heads.iter_mut().zip(&head_output_gradients) {
+                let (k, q, v) = head.backward(&inputs, &inputs, &inputs, &output_gradients)?;
+                let head_input_gradients = k.iter().add(q.iter()).add(v.iter());
+
+                inputs_grads = match &mut inputs_grads {
+                    Some(inputs_grads) => {
+                        Some(head_input_gradients.add(inputs_grads.iter()).collect())
+                    }
+                    _ => Some(head_input_gradients.collect()),
+                };
+            }
+
+            Ok(inputs_grads.unwrap())
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            self.dense_layer.apply_gradients(learn_rate);
+
+            for head in self.heads.iter_mut() {
+                head.apply_gradients(learn_rate);
+            }
         }
     }
 
@@ -507,19 +522,43 @@ pub mod layers {
             let mut dense_layer_outputs = vec![];
 
             for row in inputs.rows_iter() {
-                let layer_input = LayerValues::new(row.to_vec());
+                let layer_input = row.into();
                 let hidden_layer = self.hidden_layer.forward(&layer_input)?;
-                let dense_output = self.output_layer.forward(&hidden_layer)?;
-                dense_layer_outputs.push(dense_output);
+                let layer_output = self.output_layer.forward(&hidden_layer)?;
+                dense_layer_outputs.push(layer_output);
             }
 
             Linear::from_values(&dense_layer_outputs)
+        }
+
+        pub fn backward(&mut self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
+            let mut output_layer_input_gradients = vec![];
+
+            for (row, inputs) in output_gradients.rows_iter().zip(inputs.rows_iter()) {
+                let output_gradients = row.into();
+                let final_layer_gradients = self.output_layer.backward(None, output_gradients)?;
+
+                let dense_output = self
+                    .hidden_layer
+                    .backward(Some(&inputs.into()), final_layer_gradients)?;
+
+                output_layer_input_gradients.push(dense_output);
+            }
+
+            Linear::from_values(&output_layer_input_gradients)
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            self.hidden_layer.apply_gradients(learn_rate);
+            self.output_layer.apply_gradients(learn_rate);
         }
     }
 
     pub struct EmbeddingLayer {
         embeddings: Vec<Linear>,
         vocab_size: usize,
+        model_dimensions: usize,
+        gradients: Option<LossGradients>,
     }
 
     impl EmbeddingLayer {
@@ -540,6 +579,8 @@ pub mod layers {
             Self {
                 embeddings,
                 vocab_size,
+                model_dimensions,
+                gradients: None,
             }
         }
 
@@ -548,15 +589,15 @@ pub mod layers {
 
             for &token in token_sequence.as_ref() {
                 let embedding = self.embeddings.get(token).context("invalid token id")?;
-                let embedding_vector = embedding.rows_iter().next().unwrap().to_vec();
-                embedding_vectors.push(LayerValues::new(embedding_vector));
+                let embedding_vector = embedding.rows_iter().next().unwrap();
+                embedding_vectors.push(embedding_vector.into());
             }
 
             Linear::from_values(&embedding_vectors)
         }
 
         pub fn backward<T: AsRef<[usize]>>(
-            &self,
+            &mut self,
             token_sequence: T,
             output_gradients: &Linear,
         ) -> Result<()> {
@@ -568,22 +609,66 @@ pub mod layers {
                 .zip(output_gradients.rows_iter())
             {
                 let embedding = self.embeddings.get(token).context("invalid token id")?;
-                let weight_gradients = embedding.backward(&LayerValues::new(grad.to_vec()))?;
-                embedding_weight_gradients.push(weight_gradients);
+                let weight_gradients = embedding.backward(&grad.into())?;
+                embedding_weight_gradients.push((token, weight_gradients));
             }
 
             self.add_gradients(embedding_weight_gradients);
             Ok(())
         }
 
-        fn add_gradients(&self, embedding_weight_gradients: Vec<LayerValues>) {
-            todo!()
+        fn add_gradients(&mut self, embedding_weight_gradients: Vec<(usize, LayerValues)>) {
+            let gradients =
+                self.gradients
+                    .get_or_insert_with(|| gradients::LossGradients::Embedding {
+                        dweights: self
+                            .embeddings
+                            .iter()
+                            .map(|_| Linear::new(1, self.model_dimensions))
+                            .collect(),
+                    });
+
+            if let gradients::LossGradients::Embedding { dweights } = gradients {
+                for (token_idx, gradients) in &embedding_weight_gradients
+                    .into_iter()
+                    .map(|(idx, grads)| (idx, Linear::from_values(&[grads]).unwrap()))
+                    .group_by(|(idx, ..)| *idx)
+                {
+                    let dweights = &mut dweights[token_idx];
+                    let gradients = gradients.collect_vec();
+
+                    *dweights = gradients
+                        .iter()
+                        .fold(dweights.iter(), |iter, grads| iter.add(grads.1.iter()))
+                        .collect();
+                }
+            }
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            // could mutate in-place these values back to zero rather than take
+            let gradients = self.gradients.take();
+            if let Some(gradients::LossGradients::Embedding { dweights }) = gradients {
+                for (embedding, gradient) in self.embeddings.iter_mut().zip(&dweights) {
+                    gradient_descent(embedding, &gradient, learn_rate);
+                }
+            }
+
+            fn gradient_descent(target: &mut Linear, gradient: &Linear, learn_rate: NodeValue) {
+                *target = target
+                    .iter()
+                    .sub(gradient.iter().multiply_scalar(learn_rate))
+                    .collect();
+            }
+        }
+
+        pub fn vocab_size(&self) -> usize {
+            self.vocab_size
         }
     }
 
     pub struct PositionalEmbeddingLayer {
-        embeddings: Vec<Linear>,
-        max_sequence_len: usize,
+        embeddings: EmbeddingLayer,
     }
 
     impl PositionalEmbeddingLayer {
@@ -593,68 +678,42 @@ pub mod layers {
             strategy: &LayerInitStrategy,
             rng: &RngStrategy,
         ) -> Self {
-            let embeddings = iter::repeat_with(|| {
-                let mut linear = Linear::new(1, model_dimensions);
-                linear.initialize_as_layer(strategy, rng);
-                linear
-            })
-            .take(max_sequence_len)
-            .collect();
-
             Self {
-                embeddings,
-                max_sequence_len,
+                embeddings: EmbeddingLayer::new(model_dimensions, max_sequence_len, strategy, &rng),
             }
         }
 
         pub fn forward(&self, start_index: usize, count: usize) -> Result<Linear> {
             let end_index = start_index + count;
-            if end_index > self.max_sequence_len {
+            if end_index > self.embeddings.vocab_size() {
                 return Err(anyhow!("positional index out of range"))?;
             }
 
-            let mut embedding_vectors = vec![];
-
-            for position_idx in start_index..end_index {
-                let embedding = self.embeddings.get(position_idx);
-                let embedding = embedding.context("invalid positional index")?;
-
-                let embedding_vector = embedding.rows_iter().next().unwrap().to_vec();
-                embedding_vectors.push(LayerValues::new(embedding_vector));
-            }
-
-            Linear::from_values(&embedding_vectors)
+            let sequence = start_index..end_index;
+            self.embeddings.forward(&sequence.collect_vec())
         }
 
         pub fn backward<T: AsRef<[usize]>>(
-            &self,
+            &mut self,
             start_index: usize,
             count: usize,
             output_gradients: &Linear,
         ) -> Result<()> {
             let end_index = start_index + count;
-            if end_index > self.max_sequence_len {
+            if end_index > self.embeddings.vocab_size() {
                 return Err(anyhow!("positional index out of range"))?;
             }
             if output_gradients.count() != count {
                 return Err(anyhow!("mismatched gradient vector count"))?;
             }
 
-            let mut embedding_weight_gradients = vec![];
-
-            for (position_idx, grad) in (start_index..end_index).zip(output_gradients.rows_iter()) {
-                let embedding = self.embeddings.get(position_idx);
-                let embedding = embedding.context("invalid token id")?;
-                let weight_gradients = embedding.backward(&LayerValues::new(grad.to_vec()))?;
-                embedding_weight_gradients.push(weight_gradients);
-            }
-
-            self.add_gradients(embedding_weight_gradients);
-            Ok(())
+            let sequence = start_index..end_index;
+            self.embeddings
+                .backward(&sequence.collect_vec(), output_gradients)
         }
 
-        fn add_gradients(&self, embedding_weight_gradients: Vec<LayerValues>) {
-            todo!()
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            self.embeddings.apply_gradients(learn_rate);
         }
     }
 
@@ -857,7 +916,7 @@ pub mod attention {
             let dvalues = attention_weights.matrix_product_lhs_transposed(&output_gradients);
             let dattention_weights = output_gradients.matrix_product_rhs_transposed(&values);
             let dmasked_attention_scores = softmax_d_iter(dattention_weights, attention_weights)?;
-            // let dmasked_attention_scores = softmax_d_matrix(dattention_weights, attention_weights);
+            // let dmasked_attention_scores = dattention_weights.softmax_d(&attention_weights);
 
             let dscaled_attention_scores = dmasked_attention_scores;
             let dattention_scores = dscaled_attention_scores
@@ -953,21 +1012,6 @@ pub mod attention {
         Ok(Linear::from_iter(softmax.stride(), softmax_derivative)?)
     }
 
-    fn softmax_d_matrix(dloss_dsoftmax: Linear, softmax: Linear) -> Linear {
-        dloss_dsoftmax
-            .iter()
-            .sub(
-                softmax
-                    .iter()
-                    .dot_product(dloss_dsoftmax.iter())
-                    .flatten_sum()
-                    .iter()
-                    .grow(softmax.stride()),
-            )
-            .dot_product(softmax.iter())
-            .collect()
-    }
-
     #[cfg(test)]
     mod tests {
         use std::iter;
@@ -993,7 +1037,7 @@ pub mod attention {
         }
 
         #[test]
-        fn attention_can_compute_outputs_multi_head() {
+        fn attention_can_compute_outputs_multi_head_layer() {
             let seq_len = 3;
             let embed_dim = 12;
 
@@ -1178,13 +1222,18 @@ pub mod gradients {
             dvalues: Linear,
             dqueries: Linear,
         },
+        Embedding {
+            dweights: Vec<Linear>,
+        },
     }
 }
 
 pub mod dense {
     use anyhow::{anyhow, Context, Result};
 
-    use crate::ml::{layer::LayerInitStrategy, LayerValues, NetworkActivationMode, RngStrategy};
+    use crate::ml::{
+        layer::LayerInitStrategy, LayerValues, NetworkActivationMode, NodeValue, RngStrategy,
+    };
 
     use super::{
         gradients,
@@ -1245,6 +1294,7 @@ pub mod dense {
         }
 
         fn compute_weighted_inputs(&self, inputs: &LayerValues) -> Result<LayerValues> {
+            // use Linear/LinearIter matrix ops directly
             let mut weighted_inputs = self.weights.forward(&inputs)?;
             if let Some(bias) = &self.bias {
                 weighted_inputs
@@ -1274,6 +1324,7 @@ pub mod dense {
                 None => output_gradients,
             };
 
+            // TODO: fix impl. use matrix math with Linear/LinearIter directly
             let input_gradients = self.weights.backward(&weighted_inputs_gradients)?;
 
             let bias_gradients = Linear::from_values(&[weighted_inputs_gradients])?;
@@ -1304,6 +1355,29 @@ pub mod dense {
                 if let Some(bias) = bias {
                     *bias = bias.iter().add(bias_gradients).collect();
                 }
+            }
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            // could mutate in-place these values back to zero rather than take
+            let gradients = self.gradients.take();
+            if let Some(gradients::LossGradients::Dense { weights, bias }) = gradients {
+                match (bias, &mut self.bias) {
+                    (Some(bias_gradient), Some(bias)) => {
+                        gradient_descent(bias, &bias_gradient, learn_rate);
+                        gradient_descent(&mut self.weights, &weights, learn_rate);
+                    }
+                    _ => {
+                        gradient_descent(&mut self.weights, &weights, learn_rate);
+                    }
+                }
+            }
+
+            fn gradient_descent(target: &mut Linear, gradient: &Linear, learn_rate: NodeValue) {
+                *target = target
+                    .iter()
+                    .sub(gradient.iter().multiply_scalar(learn_rate))
+                    .collect();
             }
         }
     }
@@ -1375,6 +1449,7 @@ pub mod linear {
             strategy.apply(iter::empty(), self.inner.iter_mut(), self.count, &rng);
         }
 
+        // TODO remove in favour of Dense::forward
         pub fn forward(&self, inputs: &LayerValues) -> Result<LayerValues> {
             if inputs.len() != self.count {
                 Err(anyhow!("mismatched input vector size"))?;
@@ -1392,6 +1467,7 @@ pub mod linear {
             Ok(LayerValues::new(output))
         }
 
+        // TODO remove in favour of Dense::backward
         pub fn backward(&self, output_gradients: &LayerValues) -> Result<LayerValues> {
             if output_gradients.len() != self.stride {
                 Err(anyhow!("mismatched ouput vector size"))?;
@@ -1453,6 +1529,38 @@ pub mod linear {
             }
         }
 
+        pub fn split(&self, n: usize) -> Vec<Self> {
+            assert_eq!(self.stride % n, 0, "mismatched dimensions");
+            let stride = self.stride / n;
+            (0..n)
+                .map(|i| {
+                    let self_items = self.inner.chunks(self.stride);
+                    Self {
+                        inner: self_items
+                            .flat_map(|row| row.into_iter().skip(i * stride).take(stride))
+                            .copied()
+                            .collect(),
+                        stride,
+                        count: self.count,
+                    }
+                })
+                .collect()
+        }
+
+        pub fn softmax_d(&self, softmax_outputs: &Linear) -> Linear {
+            self.iter()
+                .sub(
+                    softmax_outputs
+                        .iter()
+                        .dot_product(self.iter())
+                        .flatten_sum()
+                        .iter()
+                        .grow(softmax_outputs.stride()),
+                )
+                .dot_product(softmax_outputs.iter())
+                .collect()
+        }
+
         pub fn matrix_product(&self, rhs: &Linear) -> Linear {
             assert_eq!(self.stride, rhs.count, "mismatched dimensions");
             self.iter().matrix_transpose_product(rhs.iter_transpose())
@@ -1485,6 +1593,10 @@ pub mod linear {
 
         pub fn rows_iter(&self) -> impl Iterator<Item = &[NodeValue]> {
             self.inner.chunks(self.stride)
+        }
+
+        pub fn rows_iter_mut(&mut self) -> impl Iterator<Item = &mut [NodeValue]> {
+            self.inner.chunks_mut(self.stride)
         }
 
         pub fn values_iter(&self) -> impl Iterator<Item = (&NodeValue, usize, usize)> {
