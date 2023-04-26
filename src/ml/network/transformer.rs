@@ -6,10 +6,12 @@ use crate::ml::RngStrategy;
 
 use self::{dense::Dense, linear::Linear};
 
-use super::{layer::LayerInitStrategy, LayerValues, NodeValue};
+use super::{layer::LayerInitStrategy, NodeValue};
 
 pub mod encoder {
     use anyhow::Result;
+
+    use crate::ml::NodeValue;
 
     use super::{
         blocks::EncoderBlock,
@@ -59,6 +61,18 @@ pub mod encoder {
             }
 
             Ok(block_output)
+        }
+
+        pub fn backward(&mut self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
+            todo!()
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            for block in self.blocks.iter_mut() {
+                block.apply_gradients(learn_rate);
+            }
+            self.token_embedding.apply_gradients(learn_rate);
+            self.position_embedding.apply_gradients(learn_rate);
         }
     }
 
@@ -225,6 +239,8 @@ pub mod encoder {
 pub mod blocks {
     use anyhow::Result;
 
+    use crate::ml::NodeValue;
+
     use super::{
         layers::{DropoutLayer, FeedForwardLayer, LayerNormalization, MultiHeadSelfAttentionLayer},
         linear::Linear,
@@ -255,17 +271,65 @@ pub mod blocks {
             let attention_output = self.dropout.0.forward(&attention_output)?;
 
             let skip_attention_output = attention_output.iter().add(inputs.iter()).collect();
-            let skip_attention_output = self.layer_norm.0.forward(&skip_attention_output)?;
+            let ff_network_inputs = self.layer_norm.0.forward(&skip_attention_output)?;
 
-            let network_inputs = &skip_attention_output;
-            let network_output = self.network.forward(&network_inputs)?;
-            let network_output = self.dropout.1.forward(&network_output)?;
+            let ff_network_output = self.network.forward(&ff_network_inputs)?;
+            let ff_network_output = self.dropout.1.forward(&ff_network_output)?;
 
-            let skip_network_output = network_output.iter().add(network_inputs.iter()).collect();
-            let skip_network_output = self.layer_norm.0.forward(&skip_network_output)?;
+            let skip_ff_output = ff_network_output
+                .iter()
+                .add(ff_network_inputs.iter())
+                .collect();
+            let encoder_output = self.layer_norm.1.forward(&skip_ff_output)?;
 
-            let encoder_output = self.layer_norm.1.forward(&skip_network_output)?;
             Ok(encoder_output)
+        }
+
+        pub fn backward(&mut self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
+            // forward pass
+            let attention_output = self.attention.forward(&inputs)?;
+            let skip_attention_output = attention_output.iter().add(inputs.iter()).collect();
+            let ff_network_inputs = self.layer_norm.0.forward(&skip_attention_output)?;
+
+            let ff_network_output = self.network.forward(&ff_network_inputs)?;
+            let skip_ff_output = ff_network_output
+                .iter()
+                .add(ff_network_inputs.iter())
+                .collect();
+
+            // backward pass
+            let d_skip_ff_output = self
+                .layer_norm
+                .1
+                .backward(&skip_ff_output, &output_gradients)?;
+            let d_ff_network_output = &d_skip_ff_output;
+
+            let ff_gradients = self
+                .network
+                .backward(&ff_network_inputs, &d_ff_network_output)?;
+
+            let d_ff_network_inputs = d_skip_ff_output.iter().add(ff_gradients.iter()).collect();
+            let d_skip_attention_output = self
+                .layer_norm
+                .0
+                .backward(&skip_attention_output, &d_ff_network_inputs)?;
+            let d_attention_output = &d_skip_attention_output;
+
+            let attention_gradients = self.attention.backward(&inputs, &d_attention_output)?;
+
+            let d_inputs = d_skip_attention_output
+                .iter()
+                .add(attention_gradients.iter())
+                .collect();
+
+            Ok(d_inputs)
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            self.attention.apply_gradients(learn_rate);
+            self.network.apply_gradients(learn_rate);
+            self.layer_norm.0.apply_gradients(learn_rate);
+            self.layer_norm.1.apply_gradients(learn_rate);
         }
     }
 
@@ -449,7 +513,7 @@ pub mod layers {
 
             let mut dense_layer_outputs = vec![];
             for row in attention_output.rows_iter() {
-                let dense_output = self.dense_layer.forward(&row.into())?;
+                let dense_output = self.dense_layer.forward(row.into())?;
                 dense_layer_outputs.push(dense_output);
             }
 
@@ -460,9 +524,7 @@ pub mod layers {
             let mut dense_layer_input_gradients = vec![];
 
             for (row, inputs) in output_gradients.rows_iter().zip(inputs.rows_iter()) {
-                let dense_output = self
-                    .dense_layer
-                    .backward(Some(&inputs.into()), row.into())?;
+                let dense_output = self.dense_layer.backward(inputs.into(), row.into())?;
 
                 dense_layer_input_gradients.push(dense_output);
             }
@@ -523,8 +585,8 @@ pub mod layers {
 
             for row in inputs.rows_iter() {
                 let layer_input = row.into();
-                let hidden_layer = self.hidden_layer.forward(&layer_input)?;
-                let layer_output = self.output_layer.forward(&hidden_layer)?;
+                let hidden_layer = self.hidden_layer.forward(layer_input)?;
+                let layer_output = self.output_layer.forward(hidden_layer)?;
                 dense_layer_outputs.push(layer_output);
             }
 
@@ -535,14 +597,18 @@ pub mod layers {
             let mut output_layer_input_gradients = vec![];
 
             for (row, inputs) in output_gradients.rows_iter().zip(inputs.rows_iter()) {
+                let final_layer_inputs = self.hidden_layer.forward(inputs.into())?;
                 let output_gradients = row.into();
-                let final_layer_gradients = self.output_layer.backward(None, output_gradients)?;
 
-                let dense_output = self
+                let final_layer_gradients = self
+                    .output_layer
+                    .backward(final_layer_inputs, output_gradients)?;
+
+                let dense_input_gradients = self
                     .hidden_layer
-                    .backward(Some(&inputs.into()), final_layer_gradients)?;
+                    .backward(inputs.into(), final_layer_gradients)?;
 
-                output_layer_input_gradients.push(dense_output);
+                output_layer_input_gradients.push(dense_input_gradients);
             }
 
             Linear::from_values(&output_layer_input_gradients)
@@ -608,16 +674,15 @@ pub mod layers {
                 .iter()
                 .zip(output_gradients.rows_iter())
             {
-                let embedding = self.embeddings.get(token).context("invalid token id")?;
-                let weight_gradients = embedding.backward(&grad.into())?;
-                embedding_weight_gradients.push((token, weight_gradients));
+                let grad = Linear::from_iter(grad.len(), grad.iter().copied()).unwrap();
+                embedding_weight_gradients.push((token, grad));
             }
 
             self.add_gradients(embedding_weight_gradients);
             Ok(())
         }
 
-        fn add_gradients(&mut self, embedding_weight_gradients: Vec<(usize, LayerValues)>) {
+        fn add_gradients(&mut self, embedding_weight_gradients: Vec<(usize, Linear)>) {
             let gradients =
                 self.gradients
                     .get_or_insert_with(|| gradients::LossGradients::Embedding {
@@ -631,7 +696,7 @@ pub mod layers {
             if let gradients::LossGradients::Embedding { dweights } = gradients {
                 for (token_idx, gradients) in &embedding_weight_gradients
                     .into_iter()
-                    .map(|(idx, grads)| (idx, Linear::from_values(&[grads]).unwrap()))
+                    .map(|(idx, grads)| (idx, grads))
                     .group_by(|(idx, ..)| *idx)
                 {
                     let dweights = &mut dweights[token_idx];
@@ -746,22 +811,35 @@ pub mod layers {
         pub fn forward(&self, input: &Linear) -> Result<Linear> {
             let mean = input.iter().flatten_mean();
             let std_dev = input.iter().flatten_stddev(mean.iter());
-
-            // TODO: optimise norm calc + add scale + shift params
-            let norm = input
+            let normalised_input = input
                 .iter()
                 .sub(mean.iter().grow(input.stride()))
-                .div(std_dev.iter().grow(input.stride()))
+                .div(std_dev.iter().grow(input.stride()), Some(1e-8))
                 .collect();
 
-            Ok(norm)
+            Ok(normalised_input)
         }
+
+        pub fn backward(&self, input: &Linear, output_gradients: &Linear) -> Result<Linear> {
+            // forward pass
+            let mean = input.iter().flatten_mean();
+            let std_dev = input.iter().flatten_stddev(mean.iter());
+            let normalised_input = input
+                .iter()
+                .sub(mean.iter().grow(input.stride()))
+                .div(std_dev.iter().grow(input.stride()), Some(1e-8))
+                .collect();
+
+            // backward pass
+            todo!()
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {}
     }
 }
 
 pub mod attention {
     use anyhow::{anyhow, Result};
-    use itertools::Itertools;
 
     use crate::ml::{layer::LayerInitStrategy, NodeValue, RngStrategy};
 
@@ -1110,7 +1188,7 @@ pub mod attention {
             // setup optimisation parameters
             let target = &new_linear(seq_len, embed_dim, &rng);
             let learn_rate = 0.001;
-            let total_iterations = 50;
+            let total_iterations = 25;
             let mut iteration = 0;
             let mut initial_mean_loss = None;
 
@@ -1133,6 +1211,82 @@ pub mod attention {
 
                 // apply grad descent
                 attention_head.apply_gradients(learn_rate);
+                let scaled_gradients = grads.iter().multiply_scalar(learn_rate);
+                inputs = inputs.iter().sub(scaled_gradients).collect();
+
+                // get gradients & loss for reporting
+                let abs_grads = grads.iter().abs();
+                let mean_grads = abs_grads.flatten_mean().iter_transpose().flatten_mean();
+                let mean_grads = *mean_grads.values_iter().next().unwrap().0;
+                let mean_loss = loss.flatten_mean().iter_transpose().flatten_mean();
+                let mean_loss = *mean_loss.values_iter().next().unwrap().0;
+                initial_mean_loss.get_or_insert(mean_loss);
+
+                // report optimisation iteration
+                if (iteration + 1) % (total_iterations / 10) == 0 || iteration == 0 {
+                    println!(
+                        "optimisation iter: {:<7} | loss: {:<10.5} | mean abs gradient: {:<5.2}",
+                        iteration + 1,
+                        mean_loss,
+                        mean_grads
+                    );
+                }
+
+                // progress iteration counter, or complete
+                iteration += 1;
+                if iteration > total_iterations {
+                    break (grads, output, mean_grads, mean_loss);
+                }
+            };
+
+            let grads = grads.to_values();
+            let output = output.to_values();
+            let initial_mean_loss = initial_mean_loss.unwrap();
+
+            assert_eq!(grads.len(), output.len());
+            assert_eq!(grads[0].len(), output[0].len());
+            assert!(mean_grads.is_finite(), "final gradient has invalid value");
+            assert!(mean_loss.is_finite(), "final loss has invalid value");
+
+            assert!(
+                initial_mean_loss > mean_loss,
+                "loss failed to optimise (start={:.2}, end={:.2})",
+                initial_mean_loss,
+                mean_loss
+            );
+        }
+
+        #[test]
+        fn attention_can_minimise_multi_head_layer() {
+            let seq_len = 3;
+            let embed_dim = 12;
+
+            // setup attention head
+            let rng = RngStrategy::testable(12345);
+            let seed_inputs = new_inputs(seq_len, embed_dim, &rng);
+            let mut inputs = Linear::from_values(&seed_inputs).unwrap();
+            let mut attention_layer = MultiHeadSelfAttentionLayer::new(seq_len, embed_dim, 3, &rng);
+
+            // setup optimisation parameters
+            let target = &new_linear(seq_len, embed_dim, &rng);
+            let learn_rate = 0.001;
+            let total_iterations = 25;
+            let mut iteration = 0;
+            let mut initial_mean_loss = None;
+
+            let (grads, output, mean_grads, mean_loss) = loop {
+                // compute forward pass
+                let output = attention_layer.forward(&inputs).unwrap();
+
+                // calculate simple rms loss and gradients compared to target values
+                let loss = output.iter().sub(target.iter()).powf_scalar(2.0);
+                let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
+
+                // compute backward pass and return input gradients
+                let grads = attention_layer.backward(&inputs, &dloss.collect()).unwrap();
+
+                // apply grad descent
+                attention_layer.apply_gradients(learn_rate);
                 let scaled_gradients = grads.iter().multiply_scalar(learn_rate);
                 inputs = inputs.iter().sub(scaled_gradients).collect();
 
@@ -1229,7 +1383,7 @@ pub mod gradients {
 }
 
 pub mod dense {
-    use anyhow::{anyhow, Context, Result};
+    use anyhow::{anyhow, Result};
 
     use crate::ml::{
         layer::LayerInitStrategy, LayerValues, NetworkActivationMode, NodeValue, RngStrategy,
@@ -1278,12 +1432,12 @@ pub mod dense {
             }
         }
 
-        pub fn forward(&self, inputs: &LayerValues) -> Result<LayerValues> {
+        pub fn forward(&self, inputs: LayerValues) -> Result<LayerValues> {
             if inputs.len() != self.inputs_count {
                 Err(anyhow!("mismatched input vector size"))?;
             }
-
-            let weighted_inputs = self.compute_weighted_inputs(inputs)?;
+            let inputs = Linear::from_values(&[inputs])?;
+            let weighted_inputs = self.compute_weighted_inputs(&inputs)?;
 
             let outputs = match &self.activation {
                 Some(activation) => activation.apply(&weighted_inputs),
@@ -1293,28 +1447,29 @@ pub mod dense {
             Ok(outputs)
         }
 
-        fn compute_weighted_inputs(&self, inputs: &LayerValues) -> Result<LayerValues> {
-            // use Linear/LinearIter matrix ops directly
-            let mut weighted_inputs = self.weights.forward(&inputs)?;
+        fn compute_weighted_inputs(&self, inputs: &Linear) -> Result<LayerValues> {
+            let weighted_inputs = inputs.matrix_product(&self.weights);
+            let mut output: LayerValues = weighted_inputs.values_iter().map(|(&x, ..)| x).collect();
+            // let mut weighted_inputs = self.weights.iter().apply_one(inputs);
             if let Some(bias) = &self.bias {
-                weighted_inputs
+                output
                     .iter_mut()
                     .zip(bias.values_iter())
                     .for_each(|(x, (b, ..))| *x += b);
             }
-            Ok(weighted_inputs)
+            Ok(output)
         }
 
         pub fn backward(
             &mut self,
-            inputs: Option<&LayerValues>,
+            inputs: LayerValues,
             output_gradients: LayerValues,
         ) -> Result<LayerValues> {
+            let inputs = Linear::from_values(&[inputs])?;
+
             let weighted_inputs_gradients = match &self.activation {
                 Some(activation) => {
-                    let inputs = inputs
-                        .context("require inputs to calculate gradients for layer activation")?;
-                    let weighted_inputs = self.compute_weighted_inputs(inputs)?;
+                    let weighted_inputs = self.compute_weighted_inputs(&inputs)?;
 
                     activation
                         .derivative(&weighted_inputs)
@@ -1324,12 +1479,15 @@ pub mod dense {
                 None => output_gradients,
             };
 
-            // TODO: fix impl. use matrix math with Linear/LinearIter directly
-            let input_gradients = self.weights.backward(&weighted_inputs_gradients)?;
+            let weighted_inputs_gradients = Linear::from_values(&[weighted_inputs_gradients])?;
+            let input_gradients_m =
+                weighted_inputs_gradients.matrix_product_rhs_transposed(&self.weights);
+            let input_gradients = input_gradients_m.rows_iter().next().unwrap().into();
 
-            let bias_gradients = Linear::from_values(&[weighted_inputs_gradients])?;
-            let weights_gradients = bias_gradients.iter().stack(self.weights.count());
-            self.add_gradients(weights_gradients, bias_gradients.iter());
+            let bias_gradients = &weighted_inputs_gradients;
+            let weights_gradients =
+                weighted_inputs_gradients.matrix_product_lhs_transposed(&inputs);
+            self.add_gradients(weights_gradients.iter(), bias_gradients.iter());
 
             Ok(input_gradients)
         }
@@ -1447,43 +1605,6 @@ pub mod linear {
             rng: &RngStrategy,
         ) {
             strategy.apply(iter::empty(), self.inner.iter_mut(), self.count, &rng);
-        }
-
-        // TODO remove in favour of Dense::forward
-        pub fn forward(&self, inputs: &LayerValues) -> Result<LayerValues> {
-            if inputs.len() != self.count {
-                Err(anyhow!("mismatched input vector size"))?;
-            }
-
-            let mut output = vec![0.0; self.stride];
-
-            self.inner
-                .chunks(self.stride)
-                .zip(inputs.iter())
-                .flat_map(|(w, input)| w.into_iter().map(|&w| w * *input))
-                .enumerate()
-                .for_each(|(i, x)| output[i % self.stride] += x);
-
-            Ok(LayerValues::new(output))
-        }
-
-        // TODO remove in favour of Dense::backward
-        pub fn backward(&self, output_gradients: &LayerValues) -> Result<LayerValues> {
-            if output_gradients.len() != self.stride {
-                Err(anyhow!("mismatched ouput vector size"))?;
-            }
-
-            let input_gradients = self
-                .inner
-                .chunks(self.stride)
-                .map(|w| {
-                    output_gradients
-                        .multiply_iter(&w.into_iter().copied().collect())
-                        .sum::<NodeValue>()
-                })
-                .collect();
-
-            Ok(input_gradients)
         }
 
         pub fn iter(&self) -> LinearIter {
@@ -1660,11 +1781,14 @@ pub mod linear {
                 count: self.count,
             }
         }
-        pub fn div(self, rhs: Self) -> Self {
+        pub fn div(self, rhs: Self, epsilon: Option<NodeValue>) -> Self {
             assert_eq!(self.stride, rhs.stride, "mismatched dimensions");
             assert_eq!(self.count, rhs.count, "mismatched dimensions");
             Self {
-                inner: Box::new(self.inner.zip(rhs.inner).map(|(x, y)| x / y)),
+                inner: match epsilon {
+                    Some(e) => Box::new(self.inner.zip(rhs.inner).map(move |(x, y)| x / (y + e))),
+                    None => Box::new(self.inner.zip(rhs.inner).map(move |(x, y)| x / y)),
+                },
                 stride: self.stride,
                 count: self.count,
             }
@@ -1767,6 +1891,16 @@ pub mod linear {
                 stride: self.stride,
                 count,
             }
+        }
+        pub fn apply_one(self, lhs_inputs: &[NodeValue]) -> LayerValues {
+            assert_eq!(self.count, lhs_inputs.len(), "mismatched dimensions");
+
+            self.inner
+                .chunks(self.stride)
+                .into_iter()
+                .zip(lhs_inputs)
+                .flat_map(|(row, input)| row.map(move |x| x * input))
+                .collect()
         }
         pub fn softmax(self) -> Linear {
             let strides = self
@@ -1889,7 +2023,7 @@ pub mod linear {
         fn can_linear_perform_div_pointwise() {
             let a = Linear::from_iter(2, [1.0, 2.0, 3.0, 4.0].into_iter()).unwrap();
             let b = Linear::from_iter(2, [5.0, 4.0, 3.0, 2.0].into_iter()).unwrap();
-            let y = a.iter().div(b.iter()).collect();
+            let y = a.iter().div(b.iter(), None).collect();
 
             let expected = Linear::from_iter(2, [0.2, 0.5, 1.0, 2.0].into_iter()).unwrap();
             assert_eq!(expected, y);
