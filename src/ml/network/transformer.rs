@@ -850,60 +850,13 @@ pub mod attention {
             let masked_attention_scores = scaled_attention_scores;
 
             let attention_weights = masked_attention_scores.softmax();
+            // let output = attention_weights.matrix_product(&values);
 
             let dvalues = attention_weights.matrix_product_lhs_transposed(&output_gradients);
             let dattention_weights = output_gradients.matrix_product_rhs_transposed(&values);
-
-            // w(x) = s(f(x)) => // dw/dx = f'(x) * s'(f(x)) => // dL/dx = dL/dw * dw/dx
-            // when f(x) = x, f'(x) = 1; and s(x) = s'(x)
-            // dL/dx = dL/dw * w(x)
-            // let binding = dattention_weights
-            //     .iter()
-            //     .dot_product(attention_weights.iter())
-            //     .collect();
-            // let dmasked_attention_scores = binding.values_iter().map(|x| *x.0);
-
-            // J(f(x)) * dL/dF
-            let attention_weights_jacobian = attention_weights
-                .rows_iter()
-                .map(|s| {
-                    Linear::from_iter(
-                        s.len(),
-                        s.iter().enumerate().flat_map(|(j, s_j)| {
-                            s.iter().enumerate().map(move |(i, s_i)| {
-                                if i == j {
-                                    s_i * (1.0 - s_i)
-                                } else {
-                                    -s_i * s_j
-                                }
-                            })
-                        }),
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            let dmasked_attention_scores = attention_weights_jacobian
-                .iter()
-                .zip(dattention_weights.rows_iter())
-                .map(|(jacobian, dattention_weights)| {
-                    jacobian.matrix_product_rhs_transposed(
-                        &Linear::from_iter(
-                            dattention_weights.len(),
-                            dattention_weights.into_iter().copied(),
-                        )
-                        .unwrap(),
-                    )
-                })
-                .collect_vec();
-
-            let dmasked_attention_scores = dmasked_attention_scores
-                .iter()
-                .flat_map(|score_gradients| score_gradients.rows_iter().flatten().collect_vec())
-                .copied();
-
-            let dscaled_attention_scores =
-                Linear::from_iter(attention_weights.stride(), dmasked_attention_scores)?;
-
+            let dmasked_attention_scores = softmax_d_iter(dattention_weights, attention_weights)?;
+            // let dmasked_attention_scores = softmax_d_matrix(dattention_weights, attention_weights);
+            let dscaled_attention_scores = dmasked_attention_scores;
             let dattention_scores = dscaled_attention_scores
                 .iter()
                 .multiply_scalar(keys.count() as NodeValue)
@@ -973,6 +926,43 @@ pub mod attention {
         pub fn set_mask(&mut self, mask: Option<Linear>) {
             self.mask = mask;
         }
+    }
+
+    fn softmax_d_iter(dloss_dsoftmax: Linear, softmax: Linear) -> Result<Linear> {
+        // let attention_weights = masked_attention_scores.softmax();
+        // dL/dx_i = sum(dL/dy_j * softmax(x_j) * (delta_ij - softmax(x_i)))   for i = 1, ..., n and j = 1, ..., n
+        let softmax_derivative = softmax
+            .rows_iter()
+            .zip(dloss_dsoftmax.rows_iter())
+            .flat_map(|(probs, grads)| {
+                let dot_product = probs
+                    .iter()
+                    .zip(grads)
+                    .map(|(prob_j, grad_j)| prob_j * grad_j)
+                    .sum::<f64>();
+
+                probs
+                    .iter()
+                    .zip(grads)
+                    .map(move |(prob_i, grad_i)| prob_i * (grad_i - dot_product))
+            });
+
+        Ok(Linear::from_iter(softmax.stride(), softmax_derivative)?)
+    }
+
+    fn softmax_d_matrix(dloss_dsoftmax: Linear, softmax: Linear) -> Linear {
+        dloss_dsoftmax
+            .iter()
+            .sub(
+                softmax
+                    .iter()
+                    .dot_product(dloss_dsoftmax.iter())
+                    .flatten_sum()
+                    .iter()
+                    .grow(softmax.stride()),
+            )
+            .dot_product(softmax.iter())
+            .collect()
     }
 
     #[cfg(test)]
