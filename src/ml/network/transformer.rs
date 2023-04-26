@@ -186,10 +186,10 @@ pub mod layers {
 
     use crate::ml::NetworkActivationMode;
 
-    use super::{*, attention::SelfAttention};
+    use super::{attention::SelfAttentionHead, *};
 
     pub struct MultiHeadSelfAttentionLayer {
-        heads: Vec<SelfAttention>,
+        heads: Vec<SelfAttentionHead>,
         dense_layer: Dense,
     }
 
@@ -201,7 +201,7 @@ pub mod layers {
             rng: &RngStrategy,
         ) -> Self {
             let heads = iter::repeat_with(|| {
-                SelfAttention::new_head(sequence_len, embedding_dimension, head_count, rng)
+                SelfAttentionHead::new_head(sequence_len, embedding_dimension, head_count, rng)
             })
             .take(head_count)
             .collect();
@@ -241,11 +241,15 @@ pub mod layers {
             Linear::from_values(&dense_layer_outputs)
         }
 
-        pub fn backward(&self, output_gradients: &Linear) -> Result<Linear> {
+        pub fn backward(&mut self, output_gradients: &Linear) -> Result<Linear> {
             let mut dense_layer_input_gradients = vec![];
 
             for row in output_gradients.rows_iter() {
-                let dense_output = self.dense_layer.backward(LayerValues::new(row.to_vec()))?;
+                // set inputs from forward pass? or from somewhere else.. investigate
+                let inputs = None;
+                let dense_output = self
+                    .dense_layer
+                    .backward(inputs, LayerValues::new(row.to_vec()))?;
                 dense_layer_input_gradients.push(dense_output);
             }
 
@@ -324,8 +328,8 @@ pub mod layers {
             // TODO: optimise norm calc + add scale + shift params
             let norm = input
                 .iter()
-                .add(mean.iter().multiply_scalar(-1.0).grow(input.stride()))
-                .dot_product(std_dev.iter().powf_scalar(-1.0).grow(input.stride()))
+                .sub(mean.iter().grow(input.stride()))
+                .div(std_dev.iter().grow(input.stride()))
                 .collect();
 
             Ok(norm)
@@ -335,21 +339,26 @@ pub mod layers {
 
 pub mod attention {
     use anyhow::{anyhow, Result};
-    
-    use crate::ml::{RngStrategy, NodeValue, layer::LayerInitStrategy};
+    use itertools::Itertools;
 
-    use super::linear::Linear;
+    use crate::ml::{layer::LayerInitStrategy, NodeValue, RngStrategy};
 
-    pub struct SelfAttention {
+    use super::{
+        gradients::{self, LossGradients},
+        linear::Linear,
+    };
+
+    pub struct SelfAttentionHead {
         keys: Linear,
         values: Linear,
         queries: Linear,
         mask: Option<Linear>,
         embedding_dimension: usize,
         sequence_len: usize,
+        gradients: Option<LossGradients>,
     }
 
-    impl SelfAttention {
+    impl SelfAttentionHead {
         pub fn new(sequence_len: usize, embedding_dimension: usize, rng: &RngStrategy) -> Self {
             Self::new_head(sequence_len, embedding_dimension, 1, rng)
         }
@@ -368,6 +377,7 @@ pub mod attention {
                 mask: None,
                 embedding_dimension,
                 sequence_len,
+                gradients: None,
             }
         }
 
@@ -396,23 +406,40 @@ pub mod attention {
             let queries = query_inputs.matrix_product(&self.queries);
             let mask = self.mask.as_ref();
 
-            let output = SelfAttention::scaled_self_attention(&queries, &keys, &values, mask);
+            let output = SelfAttentionHead::scaled_self_attention(&queries, &keys, &values, mask);
 
             Ok(output)
         }
 
-        pub fn backward(&self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
+        pub fn backward(
+            &mut self,
+            key_inputs: &Linear,
+            value_inputs: &Linear,
+            query_inputs: &Linear,
+            output_gradients: &Linear,
+        ) -> Result<(Linear, Linear, Linear)> {
             if output_gradients.stride() != self.values.stride() {
                 Err(anyhow!("mismatched ouput vector size"))?;
             }
 
-            let keys = inputs.matrix_product(&self.keys);
-            let values = inputs.matrix_product(&self.values);
-            let queries = inputs.matrix_product(&self.queries);
-            let (dkeys, dvalues, dqueries) =
-                Self::scaled_self_attention_d(&queries, &keys, &values, &output_gradients);
+            let keys = key_inputs.matrix_product(&self.keys);
+            let values = value_inputs.matrix_product(&self.values);
+            let queries = query_inputs.matrix_product(&self.queries);
 
-            todo!()
+            let (dkeys, dvalues, dqueries) =
+                Self::scaled_self_attention_d(&queries, &keys, &values, &output_gradients)?;
+
+            let dkey_weights = key_inputs.matrix_product_lhs_transposed(&dkeys);
+            let dvalue_weights = value_inputs.matrix_product_lhs_transposed(&dvalues);
+            let dquery_weights = query_inputs.matrix_product_lhs_transposed(&dqueries);
+
+            self.add_gradients((dkey_weights, dvalue_weights, dquery_weights));
+
+            let dkey_inputs = dkeys.matrix_product_rhs_transposed(&self.keys);
+            let dvalue_inputs = dvalues.matrix_product_rhs_transposed(&self.values);
+            let dquery_inputs = dqueries.matrix_product_rhs_transposed(&self.queries);
+
+            Ok((dkey_inputs, dvalue_inputs, dquery_inputs))
         }
 
         fn scaled_self_attention(
@@ -428,7 +455,9 @@ pub mod attention {
                 .multiply_scalar(1.0 / keys.count() as NodeValue);
 
             let masked_attention_scores = match mask {
-                Some(mask) => scaled_attention_scores.set_mask(mask.iter(), NodeValue::NEG_INFINITY),
+                Some(mask) => {
+                    scaled_attention_scores.set_mask(mask.iter(), NodeValue::NEG_INFINITY)
+                }
                 None => scaled_attention_scores,
             };
 
@@ -441,8 +470,131 @@ pub mod attention {
             queries: &Linear,
             keys: &Linear,
             values: &Linear,
-        ) -> (Linear, Linear, Linear) {
-            todo!();
+        ) -> Result<(Linear, Linear, Linear)> {
+            let attention_scores = queries.matrix_product_rhs_transposed(&keys);
+
+            let scaled_attention_scores = attention_scores
+                .iter()
+                .multiply_scalar(1.0 / keys.count() as NodeValue);
+
+            // TODO: figure out whats happening with the mask etc.
+            // let masked_attention_scores = match mask {
+            //     Some(mask) => {
+            //         scaled_attention_scores.set_mask(mask.iter(), NodeValue::NEG_INFINITY)
+            //     }
+            //     None => scaled_attention_scores,
+            // };
+            let masked_attention_scores = scaled_attention_scores;
+
+            let attention_weights = masked_attention_scores.softmax();
+
+            let dvalues = attention_weights.matrix_product_lhs_transposed(&output_gradients);
+            let dattention_weights = output_gradients.matrix_product_rhs_transposed(&values);
+
+            // w(x) = s(f(x)) => // dw/dx = f'(x) * s'(f(x)) => // dL/dx = dL/dw * dw/dx
+            // when f(x) = x, f'(x) = 1; and s(x) = s'(x)
+            // dL/dx = dL/dw * w(x)
+            // let binding = dattention_weights
+            //     .iter()
+            //     .dot_product(attention_weights.iter())
+            //     .collect();
+            // let dmasked_attention_scores = binding.values_iter().map(|x| *x.0);
+
+            // J(f(x)) * dL/dF
+            let attention_weights_jacobian = attention_weights
+                .rows_iter()
+                .map(|s| {
+                    Linear::from_iter(
+                        s.len(),
+                        s.iter().enumerate().flat_map(|(j, s_j)| {
+                            s.iter().enumerate().map(move |(i, s_i)| {
+                                if i == j {
+                                    s_i * (1.0 - s_i)
+                                } else {
+                                    -s_i * s_j
+                                }
+                            })
+                        }),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let dmasked_attention_scores = attention_weights_jacobian
+                .iter()
+                .zip(dattention_weights.rows_iter())
+                .map(|(jacobian, dattention_weights)| {
+                    jacobian.matrix_product_rhs_transposed(
+                        &Linear::from_iter(
+                            dattention_weights.len(),
+                            dattention_weights.into_iter().copied(),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect_vec();
+
+            let dmasked_attention_scores = dmasked_attention_scores
+                .iter()
+                .flat_map(|score_gradients| score_gradients.rows_iter().flatten().collect_vec())
+                .copied();
+
+            let dscaled_attention_scores =
+                Linear::from_iter(attention_weights.stride(), dmasked_attention_scores)?;
+
+            let dattention_scores = dscaled_attention_scores
+                .iter()
+                .multiply_scalar(keys.count() as NodeValue)
+                .collect();
+
+            let dqueries = dattention_scores.matrix_product(&keys);
+            let dkeys = dattention_scores.matrix_product_lhs_transposed(&queries);
+
+            Ok((dqueries, dkeys, dvalues))
+        }
+
+        fn add_gradients(&mut self, kvq_weight_gradients: (Linear, Linear, Linear)) {
+            let (dkey_weights, dvalue_weights, dquery_weights) = kvq_weight_gradients;
+
+            let gradients =
+                self.gradients
+                    .get_or_insert_with(|| gradients::LossGradients::AttentionHead {
+                        dkeys: Linear::with_dimensions(&dkey_weights),
+                        dvalues: Linear::with_dimensions(&dvalue_weights),
+                        dqueries: Linear::with_dimensions(&dquery_weights),
+                    });
+
+            if let gradients::LossGradients::AttentionHead {
+                dkeys,
+                dvalues,
+                dqueries,
+            } = gradients
+            {
+                *dkeys = dkeys.iter().add(dkey_weights.iter()).collect();
+                *dvalues = dvalues.iter().add(dvalue_weights.iter()).collect();
+                *dqueries = dqueries.iter().add(dquery_weights.iter()).collect();
+            }
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            // could mutate in-place these values back to zero rather than take
+            let gradients = self.gradients.take();
+            if let Some(gradients::LossGradients::AttentionHead {
+                dkeys,
+                dvalues,
+                dqueries,
+            }) = gradients
+            {
+                gradient_descent(&mut self.keys, &dkeys, learn_rate);
+                gradient_descent(&mut self.values, &dvalues, learn_rate);
+                gradient_descent(&mut self.queries, &dqueries, learn_rate);
+            }
+
+            fn gradient_descent(target: &mut Linear, gradient: &Linear, learn_rate: NodeValue) {
+                *target = target
+                    .iter()
+                    .sub(gradient.iter().multiply_scalar(learn_rate))
+                    .collect();
+            }
         }
 
         fn new_kvq_linear(
@@ -477,7 +629,7 @@ pub mod attention {
 
             let inputs = new_inputs(seq_len, embed_dim, &rng);
             let inputs = Linear::from_values(&inputs).unwrap();
-            let attention_layer = SelfAttention::new(seq_len, embed_dim, &rng);
+            let attention_layer = SelfAttentionHead::new(seq_len, embed_dim, &rng);
             let output = attention_layer.forward(&inputs).unwrap().to_values();
 
             assert_eq!(output.len(), seq_len);
@@ -511,14 +663,126 @@ pub mod attention {
             let keys = new_linear(seq_len, embed_dim, &rng);
             let values = new_linear(seq_len, embed_dim, &rng);
 
-            let output = SelfAttention::scaled_self_attention(&queries, &keys, &values, None);
+            let output = SelfAttentionHead::scaled_self_attention(&queries, &keys, &values, None);
 
             assert_eq!(output.count(), seq_len);
             assert_eq!(output.stride(), embed_dim);
         }
 
-        fn new_linear(token_count: usize, embedding_dimension: usize, rng: &RngStrategy) -> Linear {
-            let mut linear = Linear::new(token_count, embedding_dimension);
+        #[test]
+        fn attention_can_compute_gradients_single_head() {
+            let seq_len = 5;
+            let embed_dim = 12;
+
+            let rng = RngStrategy::testable(1234);
+
+            let inputs = new_inputs(seq_len, embed_dim, &rng);
+            let inputs = Linear::from_values(&inputs).unwrap();
+
+            let mut attention_layer = SelfAttentionHead::new(seq_len, embed_dim, &rng);
+            let output = attention_layer.forward(&inputs).unwrap().to_values();
+
+            let output_gradients = &new_linear(seq_len, embed_dim, &rng);
+            let output_gradients = output_gradients.iter().multiply_scalar(0.01).collect();
+
+            let grads = attention_layer
+                .backward(&inputs, &inputs, &inputs, &output_gradients)
+                .unwrap();
+
+            let grads = grads.0.iter().add(grads.1.iter()).add(grads.2.iter());
+            let grads = grads.collect().to_values();
+
+            assert_eq!(grads.len(), output.len());
+            assert_eq!(grads[0].len(), output[0].len());
+        }
+
+        #[test]
+        #[ignore = "SelfAttentionHead::backward(..) is a work in progress"]
+        fn attention_can_minimise_single_head() {
+            let seq_len = 3;
+            let embed_dim = 12;
+
+            // setup attention head
+            let rng = RngStrategy::testable(12345);
+            let seed_inputs = new_inputs(seq_len, embed_dim, &rng);
+            let mut inputs = Linear::from_values(&seed_inputs).unwrap();
+            let mut attention_head = SelfAttentionHead::new(seq_len, embed_dim, &rng);
+
+            // setup optimisation parameters
+            let target = &new_linear(seq_len, embed_dim, &rng);
+            let learn_rate = 0.0001;
+            let total_iterations = 5000;
+            let mut iteration = 0;
+            let mut initial_mean_loss = None;
+
+            let (grads, output, mean_grads, mean_loss) = loop {
+                // compute forward pass
+                let output = attention_head.forward(&inputs).unwrap();
+
+                // calculate simple rms loss and gradients compared to target values
+                let loss = output.iter().sub(target.iter()).powf_scalar(2.0);
+                let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
+
+                // compute backward pass and return kqv gradients
+                let grads = attention_head
+                    .backward(&inputs, &inputs, &inputs, &dloss.collect())
+                    .unwrap();
+
+                // sum gradients for each kqv 'inputs' value provided
+                let grads = grads.0.iter().add(grads.1.iter()).add(grads.2.iter());
+                let grads = grads.collect();
+
+                // apply grad descent
+                attention_head.apply_gradients(learn_rate);
+                let scaled_gradients = grads.iter().multiply_scalar(learn_rate);
+                inputs = inputs.iter().sub(scaled_gradients).collect();
+
+                // get gradients & loss for reporting
+                let abs_grads = grads.iter().abs();
+                let mean_grads = abs_grads.flatten_mean().iter_transpose().flatten_mean();
+                let mean_grads = *mean_grads.values_iter().next().unwrap().0;
+                let mean_loss = loss.flatten_mean().iter_transpose().flatten_mean();
+                let mean_loss = *mean_loss.values_iter().next().unwrap().0;
+                initial_mean_loss.get_or_insert(mean_loss);
+
+                // report optimisation iteration
+                if (iteration + 1) % 250 == 0 || iteration == 0 {
+                    println!(
+                        "optimisation iter: {:<7} | loss: {:<10.5} | mean abs gradient: {:<5.2}",
+                        iteration + 1,
+                        mean_loss,
+                        mean_grads
+                    );
+                }
+
+                // progress iteration counter, or complete
+                iteration += 1;
+                if iteration > total_iterations {
+                    break (grads, output, mean_grads, mean_loss);
+                }
+            };
+
+            // println!("target: {target:#}");
+            // println!("output: {output:#}");
+            let grads = grads.to_values();
+            let output = output.to_values();
+            let initial_mean_loss = initial_mean_loss.unwrap();
+
+            assert_eq!(grads.len(), output.len());
+            assert_eq!(grads[0].len(), output[0].len());
+            assert!(mean_grads.is_finite(), "final gradient has invalid value");
+            assert!(mean_loss.is_finite(), "final loss has invalid value");
+
+            assert!(
+                initial_mean_loss > mean_loss,
+                "loss failed to optimise (start={:.2}, end={:.2})",
+                initial_mean_loss,
+                mean_loss
+            );
+        }
+
+        fn new_linear(seq_len: usize, embedding_dimension: usize, rng: &RngStrategy) -> Linear {
+            let mut linear = Linear::new(seq_len, embedding_dimension);
             linear.initialize_as_layer(&LayerInitStrategy::Kaiming, &rng);
             linear
         }
@@ -547,20 +811,41 @@ pub mod attention {
     }
 }
 
-pub mod dense {
-    use anyhow::{anyhow, Result};
-
-    use crate::ml::{layer::LayerInitStrategy, LayerValues, NetworkActivationMode, RngStrategy};
-
+pub mod gradients {
     use super::linear::Linear;
 
     #[derive(Debug, PartialEq)]
+    pub enum LossGradients {
+        Dense {
+            weights: Linear,
+            bias: Option<Linear>,
+        },
+        AttentionHead {
+            dkeys: Linear,
+            dvalues: Linear,
+            dqueries: Linear,
+        },
+    }
+}
+
+pub mod dense {
+    use anyhow::{anyhow, Context, Result};
+
+    use crate::ml::{layer::LayerInitStrategy, LayerValues, NetworkActivationMode, RngStrategy};
+
+    use super::{
+        gradients,
+        linear::{Linear, LinearIter},
+    };
+
+    #[derive(Debug, PartialEq)]
     pub struct Dense {
-        weigths: Linear,
+        weights: Linear,
         bias: Option<Linear>,
         activation: Option<NetworkActivationMode>,
         inputs_count: usize,
         outputs_count: usize,
+        gradients: Option<gradients::LossGradients>,
     }
 
     impl Dense {
@@ -570,8 +855,8 @@ pub mod dense {
             strategy: &LayerInitStrategy,
             rng: &RngStrategy,
         ) -> Self {
-            let mut weigths = Linear::new(inputs_count, outputs_count);
-            weigths.initialize_as_layer(strategy, rng);
+            let mut weights = Linear::new(inputs_count, outputs_count);
+            weights.initialize_as_layer(strategy, rng);
 
             let bias = if strategy.requires_bias() {
                 let mut b = Linear::new(1, outputs_count);
@@ -582,11 +867,12 @@ pub mod dense {
             };
 
             Self {
-                weigths,
+                weights,
                 bias,
                 activation: None,
                 inputs_count,
                 outputs_count,
+                gradients: None,
             }
         }
 
@@ -595,14 +881,7 @@ pub mod dense {
                 Err(anyhow!("mismatched input vector size"))?;
             }
 
-            let mut weighted_inputs = self.weigths.forward(&inputs)?;
-
-            if let Some(bias) = &self.bias {
-                weighted_inputs
-                    .iter_mut()
-                    .zip(bias.values_iter())
-                    .for_each(|(x, (b, ..))| *x += b);
-            }
+            let weighted_inputs = self.compute_weighted_inputs(inputs)?;
 
             let outputs = match &self.activation {
                 Some(activation) => activation.apply(&weighted_inputs),
@@ -612,31 +891,78 @@ pub mod dense {
             Ok(outputs)
         }
 
-        pub fn backward(&self, output_gradients: LayerValues) -> Result<LayerValues> {
+        fn compute_weighted_inputs(&self, inputs: &LayerValues) -> Result<LayerValues> {
+            let mut weighted_inputs = self.weights.forward(&inputs)?;
+            if let Some(bias) = &self.bias {
+                weighted_inputs
+                    .iter_mut()
+                    .zip(bias.values_iter())
+                    .for_each(|(x, (b, ..))| *x += b);
+            }
+            Ok(weighted_inputs)
+        }
+
+        pub fn backward(
+            &mut self,
+            inputs: Option<&LayerValues>,
+            output_gradients: LayerValues,
+        ) -> Result<LayerValues> {
             let weighted_inputs_gradients = match &self.activation {
-                Some(activation) => activation
-                    .derivative(todo!(
-                        "need values fron foward pass to calc activation deriv"
-                    ))
-                    .multiply_iter(&output_gradients)
-                    .collect(),
+                Some(activation) => {
+                    let inputs = inputs
+                        .context("require inputs to calculate gradients for layer activation")?;
+                    let weighted_inputs = self.compute_weighted_inputs(inputs)?;
+
+                    activation
+                        .derivative(&weighted_inputs)
+                        .multiply_iter(&output_gradients)
+                        .collect()
+                }
                 None => output_gradients,
             };
-            let input_gradients = self.weigths.forward(&weighted_inputs_gradients)?;
-            // if let Some(bias) = &self.bias { bias.apply_grads(&output_gradients); }
+
+            let input_gradients = self.weights.backward(&weighted_inputs_gradients)?;
+
+            let bias_gradients = Linear::from_values(&[weighted_inputs_gradients])?;
+            let weights_gradients = bias_gradients.iter().stack(self.weights.count());
+            self.add_gradients(weights_gradients, bias_gradients.iter());
+
             Ok(input_gradients)
         }
 
         pub fn set_activation(&mut self, activation: NetworkActivationMode) {
             self.activation = Some(activation);
         }
+
+        fn add_gradients(&mut self, weight_gradients: LinearIter, bias_gradients: LinearIter) {
+            let gradients = self
+                .gradients
+                .get_or_insert_with(|| gradients::LossGradients::Dense {
+                    weights: Linear::with_dimensions(&self.weights),
+                    bias: self
+                        .bias
+                        .as_ref()
+                        .map(|bias| Linear::with_dimensions(&bias)),
+                });
+
+            if let gradients::LossGradients::Dense { weights, bias } = gradients {
+                *weights = weights.iter().add(weight_gradients).collect();
+
+                if let Some(bias) = bias {
+                    *bias = bias.iter().add(bias_gradients).collect();
+                }
+            }
+        }
     }
 }
 
 pub mod linear {
-    use anyhow::Context;
+    use std::iter;
 
-    use super::*;
+    use anyhow::{anyhow, Context, Result};
+    use itertools::Itertools;
+
+    use crate::ml::{layer::LayerInitStrategy, LayerValues, NodeValue, RngStrategy};
 
     #[derive(Debug, PartialEq)]
     pub struct Linear {
@@ -652,6 +978,14 @@ pub mod linear {
                 inner: LayerValues::new(vec![0.0; size]),
                 stride: outputs_count,
                 count: inputs_count,
+            }
+        }
+
+        pub fn with_dimensions(other: &Self) -> Self {
+            Self {
+                inner: LayerValues::new(vec![0.0; other.inner.len()]),
+                stride: other.stride,
+                count: other.count,
             }
         }
 
@@ -771,6 +1105,17 @@ pub mod linear {
             self.iter().matrix_transpose_product(rhs.iter_transpose())
         }
 
+        pub fn matrix_product_rhs_transposed(&self, rhs: &Linear) -> Linear {
+            assert_eq!(self.stride, rhs.stride, "mismatched dimensions");
+            self.iter().matrix_transpose_product(rhs.iter())
+        }
+
+        pub fn matrix_product_lhs_transposed(&self, rhs: &Linear) -> Linear {
+            assert_eq!(self.count, rhs.count, "mismatched dimensions");
+            self.iter_transpose()
+                .matrix_transpose_product(rhs.iter_transpose())
+        }
+
         pub fn stride(&self) -> usize {
             self.stride
         }
@@ -797,6 +1142,14 @@ pub mod linear {
         }
     }
 
+    impl std::fmt::Display for Linear {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.rows_iter()
+                .fold(&mut f.debug_list(), |list, row| list.entry(&row))
+                .finish()
+        }
+    }
+
     pub struct LinearIter<'a> {
         inner: Box<dyn Iterator<Item = NodeValue> + 'a>,
         stride: usize,
@@ -804,15 +1157,6 @@ pub mod linear {
     }
 
     impl<'a> LinearIter<'a> {
-        pub fn dot_product(self, other: Self) -> Self {
-            assert_eq!(self.stride, other.stride, "mismatched dimensions");
-            assert_eq!(self.count, other.count, "mismatched dimensions");
-            Self {
-                inner: Box::new(self.inner.zip(other.inner).map(|x| x.0 * x.1)),
-                stride: self.stride,
-                count: self.count,
-            }
-        }
         pub fn matrix_transpose_product(self, rhs_transpose: Self) -> Linear {
             assert_eq!(self.stride, rhs_transpose.stride, "mismatched dimensions");
             let self_strides = self.inner.chunks(self.stride);
@@ -842,37 +1186,42 @@ pub mod linear {
                 count: self.count,
             }
         }
-        pub fn add(self, other: Self) -> Self {
+        pub fn dot_product(self, other: Self) -> Self {
             assert_eq!(self.stride, other.stride, "mismatched dimensions");
             assert_eq!(self.count, other.count, "mismatched dimensions");
             Self {
-                inner: Box::new(self.inner.zip(other.inner).map(|x| x.0 + x.1)),
+                inner: Box::new(self.inner.zip(other.inner).map(|(x, y)| x * y)),
                 stride: self.stride,
                 count: self.count,
             }
         }
-        // pub fn broadcast_add(self, other: Self) -> Linear {
-        //     assert_eq!(self.count, other.count, "mismatched dimensions");
-        //     let stride = self.stride.max(other.stride);
-        //     Linear {
-        //         inner: self
-        //             .inner
-        //             .chunks(self.stride)
-        //             .into_iter()
-        //             .zip(other.inner.chunks(other.stride).into_iter())
-        //             .flat_map(|(x, y)| {
-        //                 x.collect_vec()
-        //                     .into_iter()
-        //                     .cycle()
-        //                     .take(stride)
-        //                     .zip(y.collect_vec().into_iter().cycle().take(stride))
-        //                     .map(|x| x.0 + x.1)
-        //             })
-        //             .collect(),
-        //         stride: self.stride,
-        //         count: self.count,
-        //     }
-        // }
+        pub fn div(self, rhs: Self) -> Self {
+            assert_eq!(self.stride, rhs.stride, "mismatched dimensions");
+            assert_eq!(self.count, rhs.count, "mismatched dimensions");
+            Self {
+                inner: Box::new(self.inner.zip(rhs.inner).map(|(x, y)| x / y)),
+                stride: self.stride,
+                count: self.count,
+            }
+        }
+        pub fn add(self, other: Self) -> Self {
+            assert_eq!(self.stride, other.stride, "mismatched dimensions");
+            assert_eq!(self.count, other.count, "mismatched dimensions");
+            Self {
+                inner: Box::new(self.inner.zip(other.inner).map(|(x, y)| x + y)),
+                stride: self.stride,
+                count: self.count,
+            }
+        }
+        pub fn sub(self, rhs: Self) -> Self {
+            assert_eq!(self.stride, rhs.stride, "mismatched dimensions");
+            assert_eq!(self.count, rhs.count, "mismatched dimensions");
+            Self {
+                inner: Box::new(self.inner.zip(rhs.inner).map(|(x, y)| x - y)),
+                stride: self.stride,
+                count: self.count,
+            }
+        }
         pub fn multiply_scalar(self, rhs: NodeValue) -> Self {
             Self {
                 inner: Box::new(self.inner.map(move |x| x * rhs)),
@@ -883,6 +1232,13 @@ pub mod linear {
         pub fn powf_scalar(self, n: NodeValue) -> Self {
             Self {
                 inner: Box::new(self.inner.map(move |x| x.powf(n))),
+                stride: self.stride,
+                count: self.count,
+            }
+        }
+        pub fn abs(self) -> Self {
+            Self {
+                inner: Box::new(self.inner.map(move |x| x.abs())),
                 stride: self.stride,
                 count: self.count,
             }
@@ -928,8 +1284,23 @@ pub mod linear {
             assert_ne!(stride, 0, "invalid stride dimension");
             Self {
                 inner: Box::new(self.inner.flat_map(move |x| iter::repeat(x).take(stride))),
-                stride: stride,
+                stride,
                 count: self.count,
+            }
+        }
+        pub fn stack(self, count: usize) -> Self {
+            assert_eq!(self.count, 1, "can only stack when count dimension = 1");
+            assert_ne!(count, 0, "invalid stride dimension");
+            Self {
+                inner: Box::new(
+                    self.inner
+                        .collect_vec()
+                        .into_iter()
+                        .cycle()
+                        .take(self.stride * count),
+                ),
+                stride: self.stride,
+                count,
             }
         }
         pub fn softmax(self) -> Linear {
@@ -1040,6 +1411,26 @@ pub mod linear {
         }
 
         #[test]
+        fn can_linear_perform_sub_pointwise() {
+            let a = Linear::from_iter(2, [1.0, 2.0, 3.0, 4.0].into_iter()).unwrap();
+            let b = Linear::from_iter(2, [5.0, 4.0, 3.0, 2.0].into_iter()).unwrap();
+            let y = a.iter().sub(b.iter()).collect();
+
+            let expected = Linear::from_iter(2, [-4.0, -2.0, 0.0, 2.0].into_iter()).unwrap();
+            assert_eq!(expected, y);
+        }
+
+        #[test]
+        fn can_linear_perform_div_pointwise() {
+            let a = Linear::from_iter(2, [1.0, 2.0, 3.0, 4.0].into_iter()).unwrap();
+            let b = Linear::from_iter(2, [5.0, 4.0, 3.0, 2.0].into_iter()).unwrap();
+            let y = a.iter().div(b.iter()).collect();
+
+            let expected = Linear::from_iter(2, [0.2, 0.5, 1.0, 2.0].into_iter()).unwrap();
+            assert_eq!(expected, y);
+        }
+
+        #[test]
         fn can_linear_perform_dot_product() {
             let a = Linear::from_iter(2, [1.0, 2.0, 3.0, 4.0].into_iter()).unwrap();
             let b = Linear::from_iter(2, [5.0, 6.0, 7.0, 8.0].into_iter()).unwrap();
@@ -1068,11 +1459,30 @@ pub mod linear {
         }
 
         #[test]
+        fn can_linear_sum_rows_and_keep_shape() {
+            let x = Linear::from_iter(2, [1.0, 2.0, 3.0, 4.0].into_iter()).unwrap();
+            let y = x.iter().flatten_sum().iter().grow(2).collect();
+
+            let expected = Linear::from_iter(2, [3.0, 3.0, 7.0, 7.0].into_iter()).unwrap();
+            assert_eq!(expected, y);
+        }
+
+        #[test]
         fn can_linear_perform_mean_stride_values() {
             let a = Linear::from_iter(2, [1.0, 2.0, 3.0, 4.0].into_iter()).unwrap();
             let y = a.iter().flatten_mean();
 
             let expected = Linear::from_iter(1, [1.5, 3.5].into_iter()).unwrap();
+            assert_eq!(expected, y);
+        }
+
+        #[test]
+        fn can_linear_perform_mean_all_values_and_keep_shape() {
+            let a = Linear::from_iter(2, [1.0, 2.0, 3.0, 4.0].into_iter()).unwrap();
+            let mean_a = a.iter().flatten_mean().iter_transpose().flatten_mean();
+            let y = mean_a.iter().grow(a.stride()).stack(a.count()).collect();
+
+            let expected = Linear::from_iter(2, [2.5, 2.5, 2.5, 2.5].into_iter()).unwrap();
             assert_eq!(expected, y);
         }
 
