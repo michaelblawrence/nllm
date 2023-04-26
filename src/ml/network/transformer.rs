@@ -712,9 +712,9 @@ pub mod attention {
     };
 
     pub struct SelfAttentionHead {
-        keys: Linear,
-        values: Linear,
-        queries: Linear,
+        key_weights: Linear,
+        query_weights: Linear,
+        value_weights: Linear,
         mask: Option<Linear>,
         embedding_dimension: usize,
         sequence_len: usize,
@@ -734,9 +734,9 @@ pub mod attention {
         ) -> Self {
             let head_dimension = embedding_dimension / head_count;
             Self {
-                keys: Self::new_kvq_linear(embedding_dimension, head_dimension, rng),
-                values: Self::new_kvq_linear(embedding_dimension, head_dimension, rng),
-                queries: Self::new_kvq_linear(embedding_dimension, head_dimension, rng),
+                key_weights: Self::new_kqv_linear(embedding_dimension, head_dimension, rng),
+                query_weights: Self::new_kqv_linear(embedding_dimension, head_dimension, rng),
+                value_weights: Self::new_kqv_linear(embedding_dimension, head_dimension, rng),
                 mask: None,
                 embedding_dimension,
                 sequence_len,
@@ -761,15 +761,15 @@ pub mod attention {
         pub fn forward_advanced(
             &self,
             key_inputs: &Linear,
-            value_inputs: &Linear,
             query_inputs: &Linear,
+            value_inputs: &Linear,
         ) -> Result<Linear> {
-            let keys = key_inputs.matrix_product(&self.keys);
-            let values = value_inputs.matrix_product(&self.values);
-            let queries = query_inputs.matrix_product(&self.queries);
+            let keys = key_inputs.matrix_product(&self.key_weights);
+            let queries = query_inputs.matrix_product(&self.query_weights);
+            let values = value_inputs.matrix_product(&self.value_weights);
             let mask = self.mask.as_ref();
 
-            let output = SelfAttentionHead::scaled_self_attention(&queries, &keys, &values, mask);
+            let output = SelfAttentionHead::scaled_self_attention(&keys, &queries, &values, mask);
 
             Ok(output)
         }
@@ -777,37 +777,37 @@ pub mod attention {
         pub fn backward(
             &mut self,
             key_inputs: &Linear,
-            value_inputs: &Linear,
             query_inputs: &Linear,
+            value_inputs: &Linear,
             output_gradients: &Linear,
         ) -> Result<(Linear, Linear, Linear)> {
-            if output_gradients.stride() != self.values.stride() {
+            if output_gradients.stride() != self.value_weights.stride() {
                 Err(anyhow!("mismatched ouput vector size"))?;
             }
 
-            let keys = key_inputs.matrix_product(&self.keys);
-            let values = value_inputs.matrix_product(&self.values);
-            let queries = query_inputs.matrix_product(&self.queries);
+            let keys = key_inputs.matrix_product(&self.key_weights);
+            let queries = query_inputs.matrix_product(&self.query_weights);
+            let values = value_inputs.matrix_product(&self.value_weights);
 
-            let (dkeys, dvalues, dqueries) =
-                Self::scaled_self_attention_d(&queries, &keys, &values, &output_gradients)?;
+            let (dkeys, dqueries, dvalues) =
+                Self::scaled_self_attention_d(&keys, &queries, &values, &output_gradients)?;
 
             let dkey_weights = key_inputs.matrix_product_lhs_transposed(&dkeys);
-            let dvalue_weights = value_inputs.matrix_product_lhs_transposed(&dvalues);
             let dquery_weights = query_inputs.matrix_product_lhs_transposed(&dqueries);
+            let dvalue_weights = value_inputs.matrix_product_lhs_transposed(&dvalues);
 
-            self.add_gradients((dkey_weights, dvalue_weights, dquery_weights));
+            self.add_gradients((dkey_weights, dquery_weights, dvalue_weights));
 
-            let dkey_inputs = dkeys.matrix_product_rhs_transposed(&self.keys);
-            let dvalue_inputs = dvalues.matrix_product_rhs_transposed(&self.values);
-            let dquery_inputs = dqueries.matrix_product_rhs_transposed(&self.queries);
+            let dkey_inputs = dkeys.matrix_product_rhs_transposed(&self.key_weights);
+            let dquery_inputs = dqueries.matrix_product_rhs_transposed(&self.query_weights);
+            let dvalue_inputs = dvalues.matrix_product_rhs_transposed(&self.value_weights);
 
             Ok((dkey_inputs, dvalue_inputs, dquery_inputs))
         }
 
         fn scaled_self_attention(
-            queries: &Linear,
             keys: &Linear,
+            queries: &Linear,
             values: &Linear,
             mask: Option<&Linear>,
         ) -> Linear {
@@ -829,11 +829,12 @@ pub mod attention {
         }
 
         fn scaled_self_attention_d(
-            output_gradients: &Linear,
-            queries: &Linear,
             keys: &Linear,
+            queries: &Linear,
             values: &Linear,
+            output_gradients: &Linear,
         ) -> Result<(Linear, Linear, Linear)> {
+            // forward pass
             let attention_scores = queries.matrix_product_rhs_transposed(&keys);
 
             let scaled_attention_scores = attention_scores
@@ -852,10 +853,12 @@ pub mod attention {
             let attention_weights = masked_attention_scores.softmax();
             // let output = attention_weights.matrix_product(&values);
 
+            // backward pass
             let dvalues = attention_weights.matrix_product_lhs_transposed(&output_gradients);
             let dattention_weights = output_gradients.matrix_product_rhs_transposed(&values);
             let dmasked_attention_scores = softmax_d_iter(dattention_weights, attention_weights)?;
             // let dmasked_attention_scores = softmax_d_matrix(dattention_weights, attention_weights);
+
             let dscaled_attention_scores = dmasked_attention_scores;
             let dattention_scores = dscaled_attention_scores
                 .iter()
@@ -865,29 +868,29 @@ pub mod attention {
             let dqueries = dattention_scores.matrix_product(&keys);
             let dkeys = dattention_scores.matrix_product_lhs_transposed(&queries);
 
-            Ok((dqueries, dkeys, dvalues))
+            Ok((dkeys, dqueries, dvalues))
         }
 
-        fn add_gradients(&mut self, kvq_weight_gradients: (Linear, Linear, Linear)) {
-            let (dkey_weights, dvalue_weights, dquery_weights) = kvq_weight_gradients;
+        fn add_gradients(&mut self, kqv_weight_gradients: (Linear, Linear, Linear)) {
+            let (dkey_weights, dquery_weights, dvalue_weights) = kqv_weight_gradients;
 
             let gradients =
                 self.gradients
                     .get_or_insert_with(|| gradients::LossGradients::AttentionHead {
                         dkeys: Linear::with_dimensions(&dkey_weights),
-                        dvalues: Linear::with_dimensions(&dvalue_weights),
                         dqueries: Linear::with_dimensions(&dquery_weights),
+                        dvalues: Linear::with_dimensions(&dvalue_weights),
                     });
 
             if let gradients::LossGradients::AttentionHead {
                 dkeys,
-                dvalues,
                 dqueries,
+                dvalues,
             } = gradients
             {
                 *dkeys = dkeys.iter().add(dkey_weights.iter()).collect();
-                *dvalues = dvalues.iter().add(dvalue_weights.iter()).collect();
                 *dqueries = dqueries.iter().add(dquery_weights.iter()).collect();
+                *dvalues = dvalues.iter().add(dvalue_weights.iter()).collect();
             }
         }
 
@@ -896,13 +899,13 @@ pub mod attention {
             let gradients = self.gradients.take();
             if let Some(gradients::LossGradients::AttentionHead {
                 dkeys,
-                dvalues,
                 dqueries,
+                dvalues,
             }) = gradients
             {
-                gradient_descent(&mut self.keys, &dkeys, learn_rate);
-                gradient_descent(&mut self.values, &dvalues, learn_rate);
-                gradient_descent(&mut self.queries, &dqueries, learn_rate);
+                gradient_descent(&mut self.key_weights, &dkeys, learn_rate);
+                gradient_descent(&mut self.query_weights, &dqueries, learn_rate);
+                gradient_descent(&mut self.value_weights, &dvalues, learn_rate);
             }
 
             fn gradient_descent(target: &mut Linear, gradient: &Linear, learn_rate: NodeValue) {
@@ -913,7 +916,7 @@ pub mod attention {
             }
         }
 
-        fn new_kvq_linear(
+        fn new_kqv_linear(
             embedding_dimension: usize,
             head_dimension: usize,
             rng: &RngStrategy,
@@ -1050,7 +1053,6 @@ pub mod attention {
         }
 
         #[test]
-        #[ignore = "SelfAttentionHead::backward(..) is a work in progress"]
         fn attention_can_minimise_single_head() {
             let seq_len = 3;
             let embed_dim = 12;
@@ -1063,8 +1065,8 @@ pub mod attention {
 
             // setup optimisation parameters
             let target = &new_linear(seq_len, embed_dim, &rng);
-            let learn_rate = 0.0001;
-            let total_iterations = 5000;
+            let learn_rate = 0.001;
+            let total_iterations = 50;
             let mut iteration = 0;
             let mut initial_mean_loss = None;
 
@@ -1099,7 +1101,7 @@ pub mod attention {
                 initial_mean_loss.get_or_insert(mean_loss);
 
                 // report optimisation iteration
-                if (iteration + 1) % 250 == 0 || iteration == 0 {
+                if (iteration + 1) % (total_iterations / 10) == 0 || iteration == 0 {
                     println!(
                         "optimisation iter: {:<7} | loss: {:<10.5} | mean abs gradient: {:<5.2}",
                         iteration + 1,
@@ -1115,8 +1117,6 @@ pub mod attention {
                 }
             };
 
-            // println!("target: {target:#}");
-            // println!("output: {output:#}");
             let grads = grads.to_values();
             let output = output.to_values();
             let initial_mean_loss = initial_mean_loss.unwrap();
