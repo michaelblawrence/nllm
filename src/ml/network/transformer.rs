@@ -1,13 +1,234 @@
 use std::iter;
 
-use anyhow::{anyhow, Result};
-use itertools::Itertools;
+use anyhow::anyhow;
 
 use crate::ml::RngStrategy;
 
 use self::{dense::Dense, linear::Linear};
 
 use super::{layer::LayerInitStrategy, LayerValues, NodeValue};
+
+pub mod encoder {
+    use anyhow::Result;
+
+    use super::{
+        blocks::EncoderBlock,
+        layers::{DropoutLayer, EmbeddingLayer, PositionalEmbeddingLayer},
+        linear::Linear,
+    };
+
+    pub struct Encoder {
+        blocks: Vec<EncoderBlock>,
+        token_embedding: EmbeddingLayer,
+        position_embedding: PositionalEmbeddingLayer,
+        dropout: DropoutLayer,
+    }
+
+    impl Encoder {
+        pub fn new(
+            sequence_len: usize,
+            embedding_dimension: usize,
+            head_count: usize,
+            source_vocab_size: usize,
+        ) -> Self {
+            Self::new_builder(
+                sequence_len,
+                embedding_dimension,
+                head_count,
+                source_vocab_size,
+            )
+            .build()
+        }
+
+        pub fn new_builder(
+            sequence_len: usize,
+            embedding_dimension: usize,
+            head_count: usize,
+            source_vocab_size: usize,
+        ) -> builder::EncoderBuilder {
+            builder::EncoderBuilder::new(
+                sequence_len,
+                embedding_dimension,
+                head_count,
+                source_vocab_size,
+            )
+        }
+
+        pub fn forward_training<T: AsRef<[usize]>>(&self, input_sequence: T) -> Result<Linear> {
+            let input_sequence = input_sequence.as_ref();
+            let token_embeddings = self.token_embedding.forward(&input_sequence)?;
+            let position_embeddings = self.position_embedding.forward(0, input_sequence.len())?;
+
+            let embeddings = token_embeddings
+                .iter()
+                .add(position_embeddings.iter())
+                .collect();
+            let block_input = self.dropout.forward(&embeddings)?;
+
+            let mut block_output = block_input;
+            for block in &self.blocks {
+                let block_input = &block_output;
+                block_output = block.forward_training(&block_input)?;
+            }
+
+            Ok(block_output)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::ml::RngStrategy;
+
+        use super::*;
+
+        #[test]
+        fn encoder_can_process_inputs() {
+            let seq_len = 3;
+            let embed_dim = 12;
+            let head_count = 3;
+            let hidden_dim = 48;
+            let vocab_size = 10;
+
+            let rng = RngStrategy::testable(1234);
+
+            let encoder = Encoder::new_builder(seq_len, embed_dim, head_count, vocab_size)
+                .with_feed_forward_hidden_dimension(hidden_dim)
+                .with_rng(rng)
+                .build();
+
+            let inputs = [3, 6, 9];
+            let output = encoder.forward_training(&inputs).unwrap();
+            println!("outputs -> {output:#}");
+
+            let output = output.to_values();
+            assert_eq!(output.len(), seq_len);
+            assert_eq!(output[0].len(), embed_dim);
+        }
+    }
+
+    pub mod builder {
+        use super::{super::layers::DropoutLayer, Encoder};
+
+        use crate::ml::{
+            layer::LayerInitStrategy,
+            transformer::{
+                blocks::EncoderBlock,
+                layers::{EmbeddingLayer, PositionalEmbeddingLayer},
+            },
+            NodeValue, RngStrategy,
+        };
+
+        pub struct EncoderBuilder {
+            pub(crate) sequence_len: usize,
+            pub(crate) model_dimension: usize,
+            pub(crate) head_count: usize,
+            pub(crate) source_vocab_size: usize,
+            pub(crate) block_count: usize,
+            pub(crate) rng: RngStrategy,
+            pub(crate) embedding_init_strategy: LayerInitStrategy,
+            pub(crate) feed_forward_init_strategy: LayerInitStrategy,
+            pub(crate) feed_forward_hidden_dimension: usize,
+            pub(crate) dropout_rate: NodeValue,
+        }
+
+        impl EncoderBuilder {
+            pub fn new(
+                sequence_len: usize,
+                model_dimension: usize,
+                head_count: usize,
+                source_vocab_size: usize,
+            ) -> Self {
+                Self {
+                    sequence_len,
+                    model_dimension,
+                    head_count,
+                    source_vocab_size,
+                    block_count: 6,
+                    rng: Default::default(),
+                    embedding_init_strategy: LayerInitStrategy::KaimingZeroBias,
+                    feed_forward_init_strategy: LayerInitStrategy::KaimingZeroBias,
+                    feed_forward_hidden_dimension: 64,
+                    dropout_rate: 0.1,
+                }
+            }
+
+            pub fn build(self) -> Encoder {
+                let block_builder = EncoderBlock::new_builder(
+                    self.sequence_len,
+                    self.model_dimension,
+                    self.head_count,
+                );
+                let block_builder = block_builder
+                    .with_rng(self.rng.clone())
+                    .with_dropout_rate(self.dropout_rate)
+                    .with_feed_forward_hidden_dimension(self.feed_forward_hidden_dimension)
+                    .with_feed_forward_init_strategy(self.feed_forward_init_strategy);
+
+                let mut blocks = vec![];
+                for _ in 0..self.block_count {
+                    let block = block_builder.clone().build();
+                    blocks.push(block);
+                }
+                let token_embedding = EmbeddingLayer::new(
+                    self.model_dimension,
+                    self.source_vocab_size,
+                    &self.embedding_init_strategy,
+                    &self.rng,
+                );
+                let position_embedding = PositionalEmbeddingLayer::new(
+                    self.model_dimension,
+                    self.sequence_len,
+                    &self.embedding_init_strategy,
+                    &self.rng,
+                );
+                let dropout = DropoutLayer::new(self.dropout_rate, &self.rng);
+
+                Encoder {
+                    blocks,
+                    token_embedding,
+                    position_embedding,
+                    dropout,
+                }
+            }
+
+            pub fn with_rng(mut self, rng: RngStrategy) -> Self {
+                self.rng = rng;
+                self
+            }
+
+            pub fn with_embedding_init_strategy(
+                mut self,
+                init_strategy: LayerInitStrategy,
+            ) -> Self {
+                self.embedding_init_strategy = init_strategy;
+                self
+            }
+
+            pub fn with_feed_forward_init_strategy(
+                mut self,
+                init_strategy: LayerInitStrategy,
+            ) -> Self {
+                self.feed_forward_init_strategy = init_strategy;
+                self
+            }
+
+            pub fn with_feed_forward_hidden_dimension(mut self, hidden_dimension: usize) -> Self {
+                self.feed_forward_hidden_dimension = hidden_dimension;
+                self
+            }
+
+            pub fn with_dropout_rate(mut self, dropout_rate: NodeValue) -> Self {
+                self.dropout_rate = dropout_rate;
+                self
+            }
+
+            pub fn with_set_block_count(mut self, block_count: usize) -> Self {
+                self.block_count = block_count;
+                self
+            }
+        }
+    }
+}
 
 pub mod blocks {
     use anyhow::Result;
@@ -17,15 +238,15 @@ pub mod blocks {
         linear::Linear,
     };
 
-    pub struct Encoder {
+    pub struct EncoderBlock {
         attention: MultiHeadSelfAttentionLayer,
         network: FeedForwardLayer,
         dropout: (DropoutLayer, DropoutLayer),
         layer_norm: (LayerNormalization, LayerNormalization),
     }
 
-    impl Encoder {
-        pub fn new(sequence_len: usize, embedding_dimension: usize, head_count: usize) -> Encoder {
+    impl EncoderBlock {
+        pub fn new(sequence_len: usize, embedding_dimension: usize, head_count: usize) -> Self {
             Self::new_builder(sequence_len, embedding_dimension, head_count).build()
         }
 
@@ -33,8 +254,8 @@ pub mod blocks {
             sequence_len: usize,
             embedding_dimension: usize,
             head_count: usize,
-        ) -> builder::EncoderBuilder {
-            builder::EncoderBuilder::new(sequence_len, embedding_dimension, head_count)
+        ) -> builder::EncoderBlockBuilder {
+            builder::EncoderBlockBuilder::new(sequence_len, embedding_dimension, head_count)
         }
 
         pub fn forward_training(&self, inputs: &Linear) -> Result<Linear> {
@@ -63,7 +284,7 @@ pub mod blocks {
         use super::*;
 
         #[test]
-        fn encoder_can_process_inputs() {
+        fn encoder_block_can_process_inputs() {
             let seq_len = 3;
             let embed_dim = 12;
             let head_count = 3;
@@ -71,12 +292,12 @@ pub mod blocks {
 
             let rng = RngStrategy::testable(1234);
 
-            let inputs = new_inputs(seq_len, embed_dim, &rng);
-            let encoder_block = Encoder::new_builder(seq_len, embed_dim, head_count)
+            let encoder_block = EncoderBlock::new_builder(seq_len, embed_dim, head_count)
                 .with_feed_forward_hidden_dimension(hidden_dim)
-                .with_rng(rng)
+                .with_rng(rng.clone())
                 .build();
 
+            let inputs = new_inputs(seq_len, embed_dim, &rng);
             let output = encoder_block.forward_training(&inputs).unwrap().to_values();
 
             assert_eq!(output.len(), seq_len);
@@ -98,7 +319,7 @@ pub mod blocks {
     mod builder {
         use super::{
             super::layers::{DropoutLayer, FeedForwardLayer, LayerNormalization},
-            Encoder,
+            EncoderBlock,
         };
 
         use crate::ml::{
@@ -106,7 +327,8 @@ pub mod blocks {
             RngStrategy,
         };
 
-        pub struct EncoderBuilder {
+        #[derive(Debug, Clone)]
+        pub struct EncoderBlockBuilder {
             pub(crate) sequence_len: usize,
             pub(crate) model_dimension: usize,
             pub(crate) head_count: usize,
@@ -116,7 +338,7 @@ pub mod blocks {
             pub(crate) dropout_rate: NodeValue,
         }
 
-        impl EncoderBuilder {
+        impl EncoderBlockBuilder {
             pub fn new(sequence_len: usize, model_dimension: usize, head_count: usize) -> Self {
                 Self {
                     sequence_len,
@@ -129,7 +351,7 @@ pub mod blocks {
                 }
             }
 
-            pub fn build(self) -> Encoder {
+            pub fn build(self) -> EncoderBlock {
                 let attention = MultiHeadSelfAttentionLayer::new(
                     self.sequence_len,
                     self.model_dimension,
@@ -147,7 +369,7 @@ pub mod blocks {
                 let layer_norm1 = LayerNormalization::new();
                 let layer_norm2 = LayerNormalization::new();
 
-                Encoder {
+                EncoderBlock {
                     attention,
                     network,
                     dropout: (dropout1, dropout2),
@@ -182,7 +404,7 @@ pub mod blocks {
 }
 
 pub mod layers {
-    use anyhow::Result;
+    use anyhow::{Context, Result};
 
     use crate::ml::NetworkActivationMode;
 
@@ -292,6 +514,147 @@ pub mod layers {
             }
 
             Linear::from_values(&dense_layer_outputs)
+        }
+    }
+
+    pub struct EmbeddingLayer {
+        embeddings: Vec<Linear>,
+        vocab_size: usize,
+    }
+
+    impl EmbeddingLayer {
+        pub fn new(
+            model_dimensions: usize,
+            vocab_size: usize,
+            strategy: &LayerInitStrategy,
+            rng: &RngStrategy,
+        ) -> Self {
+            let embeddings = iter::repeat_with(|| {
+                let mut linear = Linear::new(1, model_dimensions);
+                linear.initialize_as_layer(strategy, rng);
+                linear
+            })
+            .take(vocab_size)
+            .collect();
+
+            Self {
+                embeddings,
+                vocab_size,
+            }
+        }
+
+        pub fn forward<T: AsRef<[usize]>>(&self, token_sequence: T) -> Result<Linear> {
+            let mut embedding_vectors = vec![];
+
+            for &token in token_sequence.as_ref() {
+                let embedding = self.embeddings.get(token).context("invalid token id")?;
+                let embedding_vector = embedding.rows_iter().next().unwrap().to_vec();
+                embedding_vectors.push(LayerValues::new(embedding_vector));
+            }
+
+            Linear::from_values(&embedding_vectors)
+        }
+
+        pub fn backward<T: AsRef<[usize]>>(
+            &self,
+            token_sequence: T,
+            output_gradients: &Linear,
+        ) -> Result<()> {
+            let mut embedding_weight_gradients = vec![];
+
+            for (&token, grad) in token_sequence
+                .as_ref()
+                .iter()
+                .zip(output_gradients.rows_iter())
+            {
+                let embedding = self.embeddings.get(token).context("invalid token id")?;
+                let weight_gradients = embedding.backward(&LayerValues::new(grad.to_vec()))?;
+                embedding_weight_gradients.push(weight_gradients);
+            }
+
+            self.add_gradients(embedding_weight_gradients);
+            Ok(())
+        }
+
+        fn add_gradients(&self, embedding_weight_gradients: Vec<LayerValues>) {
+            todo!()
+        }
+    }
+
+    pub struct PositionalEmbeddingLayer {
+        embeddings: Vec<Linear>,
+        max_sequence_len: usize,
+    }
+
+    impl PositionalEmbeddingLayer {
+        pub fn new(
+            model_dimensions: usize,
+            max_sequence_len: usize,
+            strategy: &LayerInitStrategy,
+            rng: &RngStrategy,
+        ) -> Self {
+            let embeddings = iter::repeat_with(|| {
+                let mut linear = Linear::new(1, model_dimensions);
+                linear.initialize_as_layer(strategy, rng);
+                linear
+            })
+            .take(max_sequence_len)
+            .collect();
+
+            Self {
+                embeddings,
+                max_sequence_len,
+            }
+        }
+
+        pub fn forward(&self, start_index: usize, count: usize) -> Result<Linear> {
+            let end_index = start_index + count;
+            if end_index > self.max_sequence_len {
+                return Err(anyhow!("positional index out of range"))?;
+            }
+
+            let mut embedding_vectors = vec![];
+
+            for position_idx in start_index..end_index {
+                let embedding = self.embeddings.get(position_idx);
+                let embedding = embedding.context("invalid positional index")?;
+
+                let embedding_vector = embedding.rows_iter().next().unwrap().to_vec();
+                embedding_vectors.push(LayerValues::new(embedding_vector));
+            }
+
+            Linear::from_values(&embedding_vectors)
+        }
+
+        pub fn backward<T: AsRef<[usize]>>(
+            &self,
+            start_index: usize,
+            count: usize,
+            output_gradients: &Linear,
+        ) -> Result<()> {
+            let end_index = start_index + count;
+            if end_index > self.max_sequence_len {
+                return Err(anyhow!("positional index out of range"))?;
+            }
+            if output_gradients.count() != count {
+                return Err(anyhow!("mismatched gradient vector count"))?;
+            }
+
+            let mut embedding_weight_gradients = vec![];
+
+            for (position_idx, grad) in (start_index..end_index).zip(output_gradients.rows_iter()) {
+                let embedding = self.embeddings.get(position_idx);
+                let embedding = embedding.context("invalid token id")?;
+                let weight_gradients = embedding.backward(&LayerValues::new(grad.to_vec()))?;
+                embedding_weight_gradients.push(weight_gradients);
+            }
+
+            self.add_gradients(embedding_weight_gradients);
+            Ok(())
+        }
+
+        fn add_gradients(&self, embedding_weight_gradients: Vec<LayerValues>) {
+            todo!()
         }
     }
 
@@ -972,12 +1335,12 @@ pub mod linear {
     }
 
     impl Linear {
-        pub fn new(inputs_count: usize, outputs_count: usize) -> Self {
-            let size = inputs_count * outputs_count;
+        pub fn new(count: usize, stride: usize) -> Self {
+            let size = count * stride;
             Self {
                 inner: LayerValues::new(vec![0.0; size]),
-                stride: outputs_count,
-                count: inputs_count,
+                stride,
+                count,
             }
         }
 
