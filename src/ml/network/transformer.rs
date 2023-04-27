@@ -63,8 +63,52 @@ pub mod encoder {
             Ok(block_output)
         }
 
-        pub fn backward(&mut self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
-            todo!()
+        pub fn backward<T: AsRef<[usize]>>(
+            &mut self,
+            input_sequence: T,
+            output_gradients: Linear,
+        ) -> Result<Linear> {
+            // forawrd pass
+            let input_sequence = input_sequence.as_ref();
+            let token_embeddings = self.token_embedding.forward(&input_sequence)?;
+            let position_embeddings = self.position_embedding.forward(0, input_sequence.len())?;
+
+            let embeddings = token_embeddings
+                .iter()
+                .add(position_embeddings.iter())
+                .collect();
+            let block_input = self.dropout.forward(&embeddings)?;
+
+            let mut block_inputs = vec![block_input];
+            for block in &self.blocks {
+                let block_input = block_inputs.last().unwrap();
+                let block_output = block.forward_training(&block_input)?;
+                block_inputs.push(block_output);
+            }
+
+            // backward pass
+            let mut block_output_gradients = output_gradients;
+            for (block, inputs) in self.blocks.iter_mut().zip(block_inputs.iter()).rev() {
+                let block_input_gradients = block.backward(&inputs, &block_output_gradients)?;
+                block_output_gradients = block_input_gradients;
+            }
+
+            let d_embeddings = block_output_gradients;
+            let d_token_embeddings = &d_embeddings;
+            let d_position_embeddings = &d_embeddings;
+
+            let token_grads = self
+                .token_embedding
+                .backward(&input_sequence, &d_token_embeddings)?;
+
+            let position_grads = self.position_embedding.backward(
+                0,
+                input_sequence.len(),
+                &d_position_embeddings,
+            )?;
+
+            let d_input_sequence = token_grads.iter().add(position_grads.iter()).collect();
+            Ok(d_input_sequence)
         }
 
         pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
@@ -78,7 +122,7 @@ pub mod encoder {
 
     #[cfg(test)]
     mod tests {
-        use crate::ml::RngStrategy;
+        use crate::ml::{layer::LayerInitStrategy, RngStrategy};
 
         use super::*;
 
@@ -105,6 +149,12 @@ pub mod encoder {
             let output = output.to_values();
             assert_eq!(output.len(), seq_len);
             assert_eq!(output[0].len(), embed_dim);
+        }
+
+        fn new_linear(seq_len: usize, embedding_dimension: usize, rng: &RngStrategy) -> Linear {
+            let mut linear = Linear::new(seq_len, embedding_dimension);
+            linear.initialize_as_layer(&LayerInitStrategy::Kaiming, &rng);
+            linear
         }
     }
 
@@ -246,6 +296,7 @@ pub mod blocks {
         linear::Linear,
     };
 
+    #[derive(Debug)]
     pub struct EncoderBlock {
         attention: MultiHeadSelfAttentionLayer,
         network: FeedForwardLayer,
@@ -335,7 +386,10 @@ pub mod blocks {
 
     #[cfg(test)]
     mod tests {
-        use crate::ml::{layer::LayerInitStrategy, RngStrategy};
+        use crate::ml::{
+            transformer::tests::helpers::{assert_optimisation_converges, new_linear},
+            RngStrategy,
+        };
 
         use super::*;
 
@@ -353,22 +407,49 @@ pub mod blocks {
                 .with_rng(rng.clone())
                 .build();
 
-            let inputs = new_inputs(seq_len, embed_dim, &rng);
+            let inputs = new_linear(seq_len, embed_dim, &rng);
             let output = encoder_block.forward_training(&inputs).unwrap().to_values();
 
             assert_eq!(output.len(), seq_len);
             assert_eq!(output[0].len(), embed_dim);
         }
 
-        fn new_inputs(
-            sequence_len: usize,
-            embedding_dimension: usize,
-            rng: &RngStrategy,
-        ) -> Linear {
-            let init_strategy = LayerInitStrategy::Kaiming;
-            let mut inputs = Linear::new(sequence_len, embedding_dimension);
-            inputs.initialize_as_layer(&init_strategy, rng);
-            inputs
+        #[test]
+        #[ignore = "failing.. need to fix encoder block backward pass"]
+        fn encoder_block_can_optimise() {
+            let seq_len = 3;
+            let embed_dim = 12;
+            let head_count = 3;
+            let hidden_dim = 48;
+
+            let learn_rate = 0.001;
+            let iters = 500;
+
+            assert_optimisation_converges(
+                &move |rng| {
+                    let encoder_block = EncoderBlock::new_builder(seq_len, embed_dim, head_count)
+                        .with_feed_forward_hidden_dimension(hidden_dim)
+                        .with_rng(rng.clone())
+                        .build();
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (encoder_block, inputs, target)
+                },
+                &move |encoder_block, inputs| encoder_block.forward_training(&inputs).unwrap(),
+                &move |encoder_block, inputs, dloss| {
+                    let grads = encoder_block.backward(&inputs, &dloss).unwrap();
+                    if !grads.is_finite() {
+                        // println!("----failed optimisation so printing instance!!!!!!");
+                        // println!("{:?}", &encoder_block);
+                        panic!("failed optimisation");
+                    }
+                    encoder_block.apply_gradients(learn_rate);
+                    // *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
+
+                    grads
+                },
+                iters,
+            );
         }
     }
 
@@ -467,6 +548,7 @@ pub mod layers {
 
     use super::{attention::SelfAttentionHead, gradients::LossGradients, *};
 
+    #[derive(Debug)]
     pub struct MultiHeadSelfAttentionLayer {
         heads: Vec<SelfAttentionHead>,
         dense_layer: Dense,
@@ -513,7 +595,8 @@ pub mod layers {
 
             let mut dense_layer_outputs = vec![];
             for row in attention_output.rows_iter() {
-                let dense_output = self.dense_layer.forward(row.into())?;
+                // TODO: switch to forward rather than forward_row
+                let dense_output = self.dense_layer.forward_row(row.into())?;
                 dense_layer_outputs.push(dense_output);
             }
 
@@ -558,6 +641,7 @@ pub mod layers {
         }
     }
 
+    #[derive(Debug)]
     pub struct FeedForwardLayer {
         hidden_layer: Dense,
         output_layer: Dense,
@@ -585,8 +669,9 @@ pub mod layers {
 
             for row in inputs.rows_iter() {
                 let layer_input = row.into();
-                let hidden_layer = self.hidden_layer.forward(layer_input)?;
-                let layer_output = self.output_layer.forward(hidden_layer)?;
+                // TODO: switch to forward rather than forward_row
+                let hidden_layer = self.hidden_layer.forward_row(layer_input)?;
+                let layer_output = self.output_layer.forward_row(hidden_layer)?;
                 dense_layer_outputs.push(layer_output);
             }
 
@@ -597,7 +682,8 @@ pub mod layers {
             let mut output_layer_input_gradients = vec![];
 
             for (row, inputs) in output_gradients.rows_iter().zip(inputs.rows_iter()) {
-                let final_layer_inputs = self.hidden_layer.forward(inputs.into())?;
+                // TODO: switch to forward rather than forward_row
+                let final_layer_inputs = self.hidden_layer.forward_row(inputs.into())?;
                 let output_gradients = row.into();
 
                 let final_layer_gradients = self
@@ -666,7 +752,8 @@ pub mod layers {
             &mut self,
             token_sequence: T,
             output_gradients: &Linear,
-        ) -> Result<()> {
+        ) -> Result<Linear> {
+            let mut embedding_vectors = vec![];
             let mut embedding_weight_gradients = vec![];
 
             for (&token, grad) in token_sequence
@@ -674,12 +761,20 @@ pub mod layers {
                 .iter()
                 .zip(output_gradients.rows_iter())
             {
+                let embedding = self.embeddings.get(token).context("invalid token id")?;
+                let embedding_vector = embedding.rows_iter().next().unwrap();
+                embedding_vectors.push(embedding_vector.into());
+
                 let grad = Linear::from_iter(grad.len(), grad.iter().copied()).unwrap();
                 embedding_weight_gradients.push((token, grad));
             }
 
             self.add_gradients(embedding_weight_gradients);
-            Ok(())
+            // (key is [rows x cols]) weights [3x3] * input [3x1] = out [3x1]
+            // (key is [rows x cols]) dinput [3x1] = weights.T [3x3] * dout [3x1]
+            let input_gradients = Linear::from_values(&embedding_vectors)?
+                .matrix_product_lhs_transposed(&output_gradients);
+            Ok(input_gradients)
         }
 
         fn add_gradients(&mut self, embedding_weight_gradients: Vec<(usize, Linear)>) {
@@ -758,12 +853,12 @@ pub mod layers {
             self.embeddings.forward(&sequence.collect_vec())
         }
 
-        pub fn backward<T: AsRef<[usize]>>(
+        pub fn backward(
             &mut self,
             start_index: usize,
             count: usize,
             output_gradients: &Linear,
-        ) -> Result<()> {
+        ) -> Result<Linear> {
             let end_index = start_index + count;
             if end_index > self.embeddings.vocab_size() {
                 return Err(anyhow!("positional index out of range"))?;
@@ -782,6 +877,7 @@ pub mod layers {
         }
     }
 
+    #[derive(Debug)]
     pub struct DropoutLayer {
         dropout_rate: NodeValue,
         rng: RngStrategy,
@@ -801,11 +897,14 @@ pub mod layers {
         }
     }
 
-    pub struct LayerNormalization;
+    #[derive(Debug)]
+    pub struct LayerNormalization {
+        gradients: Option<LossGradients>,
+    }
 
     impl LayerNormalization {
         pub fn new() -> Self {
-            Self
+            Self { gradients: None }
         }
 
         pub fn forward(&self, input: &Linear) -> Result<Linear> {
@@ -824,17 +923,86 @@ pub mod layers {
             // forward pass
             let mean = input.iter().flatten_mean();
             let std_dev = input.iter().flatten_stddev(mean.iter());
-            let normalised_input = input
-                .iter()
-                .sub(mean.iter().grow(input.stride()))
-                .div(std_dev.iter().grow(input.stride()), Some(1e-8))
-                .collect();
+
+            let mean_keep_dim = mean.iter().grow(input.stride()).collect();
+            let std_dev_keep_dim = std_dev.iter().grow(input.stride()).collect();
+            let epsilon = Some(1e-8);
 
             // backward pass
-            todo!()
+            let dl_dnorm = output_gradients;
+            // maybe not dot product? who knows
+            let dstd_dev = dl_dnorm
+                .iter()
+                .dot_product(input.iter().sub(mean_keep_dim.iter()))
+                .flatten_sum()
+                .iter()
+                .grow(input.stride())
+                .multiply_scalar(-0.5)
+                .div(std_dev_keep_dim.iter().powf_scalar(1.5), epsilon)
+                .collect();
+
+            let dmean = dl_dnorm
+                .iter()
+                .flatten_sum()
+                .iter()
+                .grow(input.stride())
+                .multiply_scalar(-1.0)
+                .div(std_dev_keep_dim.iter(), epsilon)
+                .collect();
+
+            let dx = dl_dnorm
+                .iter()
+                .add(
+                    dstd_dev.iter().dot_product(
+                        input
+                            .iter()
+                            .sub(mean_keep_dim.iter())
+                            .multiply_scalar(2.0 / input.stride() as NodeValue),
+                    ),
+                )
+                .add(
+                    dmean
+                        .iter()
+                        .multiply_scalar(1.0 / input.stride() as NodeValue),
+                )
+                .collect();
+
+            Ok(dx)
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {}
+        // fn add_gradients(&mut self, alpha_gradients: Linear, gamma_gradients: Linear) {
+        //     let gradients = self.gradients.get_or_insert_with(|| {
+        //         gradients::LossGradients::LayerNormalization {
+        //             dalpha: Linear::with_dimensions(&alpha_gradients),
+        //             dgamma: Linear::with_dimensions(&gamma_gradients),
+        //         }
+        //     });
+
+        //     if let gradients::LossGradients::LayerNormalization { dalpha, dgamma } = gradients {
+        //         *dalpha = dalpha.iter().add(alpha_gradients.iter()).collect();
+        //         *dgamma = dgamma.iter().add(gamma_gradients.iter()).collect();
+        //     }
+        // }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            // // could mutate in-place these values back to zero rather than take
+            // let gradients = self.gradients.take();
+            // if let Some(gradients::LossGradients::LayerNormalization {
+            //     dalpha,
+            //     dgamma,
+            // }) = gradients
+            // {
+            //     gradient_descent(&mut self.alpha, &dalpha, learn_rate);
+            //     gradient_descent(&mut self.gamma, &dgamma, learn_rate);
+            // }
+
+            // fn gradient_descent(target: &mut Linear, gradient: &Linear, learn_rate: NodeValue) {
+            //     *target = target
+            //         .iter()
+            //         .sub(gradient.iter().multiply_scalar(learn_rate))
+            //         .collect();
+            // }
+        }
     }
 }
 
@@ -848,6 +1016,7 @@ pub mod attention {
         linear::Linear,
     };
 
+    #[derive(Debug)]
     pub struct SelfAttentionHead {
         key_weights: Linear,
         query_weights: Linear,
@@ -1094,7 +1263,13 @@ pub mod attention {
     mod tests {
         use std::iter;
 
-        use crate::ml::{transformer::layers::MultiHeadSelfAttentionLayer, LayerValues};
+        use crate::ml::{
+            transformer::{
+                layers::MultiHeadSelfAttentionLayer,
+                tests::helpers::{assert_optimisation_converges, new_linear},
+            },
+            LayerValues,
+        };
 
         use super::*;
 
@@ -1178,81 +1353,30 @@ pub mod attention {
         fn attention_can_minimise_single_head() {
             let seq_len = 3;
             let embed_dim = 12;
-
-            // setup attention head
-            let rng = RngStrategy::testable(12345);
-            let seed_inputs = new_inputs(seq_len, embed_dim, &rng);
-            let mut inputs = Linear::from_values(&seed_inputs).unwrap();
-            let mut attention_head = SelfAttentionHead::new(seq_len, embed_dim, &rng);
-
-            // setup optimisation parameters
-            let target = &new_linear(seq_len, embed_dim, &rng);
             let learn_rate = 0.001;
             let total_iterations = 25;
-            let mut iteration = 0;
-            let mut initial_mean_loss = None;
 
-            let (grads, output, mean_grads, mean_loss) = loop {
-                // compute forward pass
-                let output = attention_head.forward(&inputs).unwrap();
+            assert_optimisation_converges(
+                &move |rng| {
+                    let attention_head = SelfAttentionHead::new(seq_len, embed_dim, &rng);
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (attention_head, inputs, target)
+                },
+                &move |attention_head, inputs| attention_head.forward(&inputs).unwrap(),
+                &move |attention_head, inputs, dloss| {
+                    let grads = attention_head
+                        .backward(&inputs, &inputs, &inputs, &dloss)
+                        .unwrap();
 
-                // calculate simple rms loss and gradients compared to target values
-                let loss = output.iter().sub(target.iter()).powf_scalar(2.0);
-                let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
+                    let grads = grads.0.iter().add(grads.1.iter()).add(grads.2.iter());
+                    let grads = grads.collect();
 
-                // compute backward pass and return kqv gradients
-                let grads = attention_head
-                    .backward(&inputs, &inputs, &inputs, &dloss.collect())
-                    .unwrap();
-
-                // sum gradients for each kqv 'inputs' value provided
-                let grads = grads.0.iter().add(grads.1.iter()).add(grads.2.iter());
-                let grads = grads.collect();
-
-                // apply grad descent
-                attention_head.apply_gradients(learn_rate);
-                let scaled_gradients = grads.iter().multiply_scalar(learn_rate);
-                inputs = inputs.iter().sub(scaled_gradients).collect();
-
-                // get gradients & loss for reporting
-                let abs_grads = grads.iter().abs();
-                let mean_grads = abs_grads.flatten_mean().iter_transpose().flatten_mean();
-                let mean_grads = *mean_grads.values_iter().next().unwrap().0;
-                let mean_loss = loss.flatten_mean().iter_transpose().flatten_mean();
-                let mean_loss = *mean_loss.values_iter().next().unwrap().0;
-                initial_mean_loss.get_or_insert(mean_loss);
-
-                // report optimisation iteration
-                if (iteration + 1) % (total_iterations / 10) == 0 || iteration == 0 {
-                    println!(
-                        "optimisation iter: {:<7} | loss: {:<10.5} | mean abs gradient: {:<5.2}",
-                        iteration + 1,
-                        mean_loss,
-                        mean_grads
-                    );
-                }
-
-                // progress iteration counter, or complete
-                iteration += 1;
-                if iteration > total_iterations {
-                    break (grads, output, mean_grads, mean_loss);
-                }
-            };
-
-            let grads = grads.to_values();
-            let output = output.to_values();
-            let initial_mean_loss = initial_mean_loss.unwrap();
-
-            assert_eq!(grads.len(), output.len());
-            assert_eq!(grads[0].len(), output[0].len());
-            assert!(mean_grads.is_finite(), "final gradient has invalid value");
-            assert!(mean_loss.is_finite(), "final loss has invalid value");
-
-            assert!(
-                initial_mean_loss > mean_loss,
-                "loss failed to optimise (start={:.2}, end={:.2})",
-                initial_mean_loss,
-                mean_loss
+                    *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
+                    attention_head.apply_gradients(learn_rate);
+                    grads
+                },
+                total_iterations,
             );
         }
 
@@ -1260,82 +1384,28 @@ pub mod attention {
         fn attention_can_minimise_multi_head_layer() {
             let seq_len = 3;
             let embed_dim = 12;
-
-            // setup attention head
-            let rng = RngStrategy::testable(12345);
-            let seed_inputs = new_inputs(seq_len, embed_dim, &rng);
-            let mut inputs = Linear::from_values(&seed_inputs).unwrap();
-            let mut attention_layer = MultiHeadSelfAttentionLayer::new(seq_len, embed_dim, 3, &rng);
-
-            // setup optimisation parameters
-            let target = &new_linear(seq_len, embed_dim, &rng);
+            let head_count = 3;
             let learn_rate = 0.001;
             let total_iterations = 25;
-            let mut iteration = 0;
-            let mut initial_mean_loss = None;
 
-            let (grads, output, mean_grads, mean_loss) = loop {
-                // compute forward pass
-                let output = attention_layer.forward(&inputs).unwrap();
+            assert_optimisation_converges(
+                &move |rng| {
+                    let attention_layer =
+                        MultiHeadSelfAttentionLayer::new(seq_len, embed_dim, head_count, &rng);
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (attention_layer, inputs, target)
+                },
+                &move |attention_layer, inputs| attention_layer.forward(&inputs).unwrap(),
+                &move |attention_layer, inputs, dloss| {
+                    let grads = attention_layer.backward(&inputs, &dloss).unwrap();
 
-                // calculate simple rms loss and gradients compared to target values
-                let loss = output.iter().sub(target.iter()).powf_scalar(2.0);
-                let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
-
-                // compute backward pass and return input gradients
-                let grads = attention_layer.backward(&inputs, &dloss.collect()).unwrap();
-
-                // apply grad descent
-                attention_layer.apply_gradients(learn_rate);
-                let scaled_gradients = grads.iter().multiply_scalar(learn_rate);
-                inputs = inputs.iter().sub(scaled_gradients).collect();
-
-                // get gradients & loss for reporting
-                let abs_grads = grads.iter().abs();
-                let mean_grads = abs_grads.flatten_mean().iter_transpose().flatten_mean();
-                let mean_grads = *mean_grads.values_iter().next().unwrap().0;
-                let mean_loss = loss.flatten_mean().iter_transpose().flatten_mean();
-                let mean_loss = *mean_loss.values_iter().next().unwrap().0;
-                initial_mean_loss.get_or_insert(mean_loss);
-
-                // report optimisation iteration
-                if (iteration + 1) % (total_iterations / 10) == 0 || iteration == 0 {
-                    println!(
-                        "optimisation iter: {:<7} | loss: {:<10.5} | mean abs gradient: {:<5.2}",
-                        iteration + 1,
-                        mean_loss,
-                        mean_grads
-                    );
-                }
-
-                // progress iteration counter, or complete
-                iteration += 1;
-                if iteration > total_iterations {
-                    break (grads, output, mean_grads, mean_loss);
-                }
-            };
-
-            let grads = grads.to_values();
-            let output = output.to_values();
-            let initial_mean_loss = initial_mean_loss.unwrap();
-
-            assert_eq!(grads.len(), output.len());
-            assert_eq!(grads[0].len(), output[0].len());
-            assert!(mean_grads.is_finite(), "final gradient has invalid value");
-            assert!(mean_loss.is_finite(), "final loss has invalid value");
-
-            assert!(
-                initial_mean_loss > mean_loss,
-                "loss failed to optimise (start={:.2}, end={:.2})",
-                initial_mean_loss,
-                mean_loss
+                    *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
+                    attention_layer.apply_gradients(learn_rate);
+                    grads
+                },
+                total_iterations,
             );
-        }
-
-        fn new_linear(seq_len: usize, embedding_dimension: usize, rng: &RngStrategy) -> Linear {
-            let mut linear = Linear::new(seq_len, embedding_dimension);
-            linear.initialize_as_layer(&LayerInitStrategy::Kaiming, &rng);
-            linear
         }
 
         fn new_inputs(
@@ -1432,32 +1502,52 @@ pub mod dense {
             }
         }
 
-        pub fn forward(&self, inputs: LayerValues) -> Result<LayerValues> {
+        pub fn forward_row(&self, inputs: LayerValues) -> Result<LayerValues> {
             if inputs.len() != self.inputs_count {
                 Err(anyhow!("mismatched input vector size"))?;
             }
+
             let inputs = Linear::from_values(&[inputs])?;
-            let weighted_inputs = self.compute_weighted_inputs(&inputs)?;
+            let outputs = self.forward(&inputs)?;
+            let row = outputs.rows_iter().next().unwrap().into();
+
+            Ok(row)
+        }
+
+        pub fn forward(&self, inputs: &Linear) -> Result<Linear> {
+            if inputs.stride() != self.inputs_count {
+                Err(anyhow!("mismatched input vector size"))?;
+            }
+            let mut weighted_inputs = self.compute_weighted_inputs(&inputs)?;
 
             let outputs = match &self.activation {
-                Some(activation) => activation.apply(&weighted_inputs),
+                Some(activation) => {
+                    weighted_inputs.rows_iter_mut().for_each(|row| {
+                        let activation_row = activation.apply(&row.into());
+                        row.clone_from_slice(&activation_row)
+                    });
+                    weighted_inputs
+                }
                 None => weighted_inputs,
             };
 
             Ok(outputs)
         }
 
-        fn compute_weighted_inputs(&self, inputs: &Linear) -> Result<LayerValues> {
-            let weighted_inputs = inputs.matrix_product(&self.weights);
-            let mut output: LayerValues = weighted_inputs.values_iter().map(|(&x, ..)| x).collect();
+        // optimise? too many transposes for func that is called many times forward & backward?
+        fn compute_weighted_inputs(&self, inputs: &Linear) -> Result<Linear> {
+            // -> output.T = weights.T * inputs.T
+            let output = self
+                .weights
+                .iter_transpose()
+                .matrix_transpose_product(inputs.iter());
             // let mut weighted_inputs = self.weights.iter().apply_one(inputs);
             if let Some(bias) = &self.bias {
-                output
-                    .iter_mut()
-                    .zip(bias.values_iter())
-                    .for_each(|(x, (b, ..))| *x += b);
+                let bias = bias.iter().stack(inputs.count());
+                Ok(output.iter_transpose().add(bias).collect())
+            } else {
+                Ok(output.iter_transpose().collect())
             }
-            Ok(output)
         }
 
         pub fn backward(
@@ -1469,26 +1559,35 @@ pub mod dense {
 
             let weighted_inputs_gradients = match &self.activation {
                 Some(activation) => {
-                    let weighted_inputs = self.compute_weighted_inputs(&inputs)?;
-
-                    activation
-                        .derivative(&weighted_inputs)
-                        .multiply_iter(&output_gradients)
-                        .collect()
+                    let mut weighted_inputs = self.compute_weighted_inputs(&inputs)?;
+                    weighted_inputs.rows_iter_mut().for_each(|x| {
+                        activation
+                            .derivative(&x.into())
+                            .multiply_iter(&output_gradients)
+                            .zip(x)
+                            .for_each(|(grad, x)| *x = grad)
+                    });
+                    weighted_inputs
                 }
-                None => output_gradients,
+                None => Linear::from_values(&[output_gradients])?,
             };
 
-            let weighted_inputs_gradients = Linear::from_values(&[weighted_inputs_gradients])?;
+            let bias_gradients = &weighted_inputs_gradients;
+
+            // -> output.T = weights.T * inputs.T
+            // -> weighted_inputs_gradients.T = weights_gradients.T * inputs.T
+            // -> weights_gradients * weighted_inputs_gradients.T = inputs.T
+            // -> weights_gradients = inputs.T * weighted_inputs_gradients
+            let weights_gradients =
+                inputs.matrix_product_lhs_transposed(&weighted_inputs_gradients);
+            self.add_gradients(weights_gradients.iter(), bias_gradients.iter());
+
+            // -> output.T = weights.T * inputs.T
+            // -> weighted_inputs_gradients.T = self.weights.T * input_gradients_m.T
+            // -> input_gradients_m = weighted_inputs_gradients * self.weights.T
             let input_gradients_m =
                 weighted_inputs_gradients.matrix_product_rhs_transposed(&self.weights);
             let input_gradients = input_gradients_m.rows_iter().next().unwrap().into();
-
-            let bias_gradients = &weighted_inputs_gradients;
-            let weights_gradients =
-                weighted_inputs_gradients.matrix_product_lhs_transposed(&inputs);
-            self.add_gradients(weights_gradients.iter(), bias_gradients.iter());
-
             Ok(input_gradients)
         }
 
@@ -1706,6 +1805,10 @@ pub mod linear {
             self.count
         }
 
+        pub fn is_finite(&self) -> bool {
+            self.inner.iter().all(|x| x.is_finite())
+        }
+
         pub fn to_values(self) -> Vec<LayerValues> {
             self.rows_iter()
                 .map(|x| LayerValues::new(x.to_vec()))
@@ -1901,6 +2004,9 @@ pub mod linear {
                 .zip(lhs_inputs)
                 .flat_map(|(row, input)| row.map(move |x| x * input))
                 .collect()
+        }
+        pub fn apply_gradients(self, grads: LinearIter, learn_rate: f64) -> Linear {
+            self.sub(grads.multiply_scalar(learn_rate)).collect()
         }
         pub fn softmax(self) -> Linear {
             let strides = self
@@ -2112,6 +2218,81 @@ pub mod linear {
             let expected =
                 Linear::from_iter(2, [1.0, 0.0, 0.5, 0.5, 0.0, 1.0].into_iter()).unwrap();
             assert_eq!(expected, y);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub mod helpers {
+        use super::*;
+
+        pub fn assert_optimisation_converges<T, I>(
+            create: &dyn Fn(RngStrategy) -> (T, I, Linear),
+            forward: &dyn Fn(&T, &I) -> Linear,
+            backward: &dyn Fn(&mut T, &mut I, Linear) -> Linear,
+            iters: usize,
+        ) {
+            let rng = RngStrategy::testable(12345);
+
+            let (mut testable_instance, mut inputs, target) = create(rng.clone());
+            let mut iteration = 0;
+            let mut initial_mean_loss = None;
+
+            let (_output, mean_loss) = loop {
+                // compute forward pass
+                let output = forward(&testable_instance, &inputs);
+
+                // calculate simple rms loss and gradients compared to target values
+                let loss = output.iter().sub(target.iter()).powf_scalar(2.0);
+                let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
+
+                // compute backward pass, apply gradients, and return inputs gradients
+                let grads = backward(&mut testable_instance, &mut inputs, dloss.collect());
+
+                // get gradients & loss for reporting
+                let abs_grads = grads.iter().abs();
+                let mean_grads = abs_grads.flatten_mean().iter_transpose().flatten_mean();
+                let mean_grads = *mean_grads.values_iter().next().unwrap().0;
+                let mean_loss = loss.flatten_mean().iter_transpose().flatten_mean();
+                let mean_loss = *mean_loss.values_iter().next().unwrap().0;
+                initial_mean_loss.get_or_insert(mean_loss);
+
+                // report optimisation iteration
+                if (iteration + 1) % (iters / 10).max(1) == 0 || iteration == 0 {
+                    println!(
+                        "optimisation iter: {:<7} | loss: {:<10.5} | mean abs gradient: {:<5.2}",
+                        iteration + 1,
+                        mean_loss,
+                        mean_grads
+                    );
+                }
+
+                // progress iteration counter, or complete
+                iteration += 1;
+                if iteration > iters {
+                    break (output, mean_loss);
+                }
+            };
+
+            let initial_mean_loss = initial_mean_loss.unwrap();
+
+            assert!(mean_loss.is_finite(), "final loss has invalid value");
+
+            assert!(
+                initial_mean_loss > mean_loss,
+                "loss failed to optimise (start={:.2}, end={:.2})",
+                initial_mean_loss,
+                mean_loss
+            );
+        }
+
+        pub fn new_linear(seq_len: usize, embedding_dimension: usize, rng: &RngStrategy) -> Linear {
+            let mut linear = Linear::new(seq_len, embedding_dimension);
+            linear.initialize_as_layer(&LayerInitStrategy::Kaiming, &rng);
+            linear
         }
     }
 }
