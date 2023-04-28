@@ -40,7 +40,7 @@ impl RngStrategy {
     pub fn testable(seed: u32) -> Self {
         RngStrategy::Debug { seed }.upgrade()
     }
-    
+
     pub fn to_rc(&self) -> Rc<dyn RNG> {
         match self {
             RngStrategy::Cached(instance, _) => instance.clone(),
@@ -80,6 +80,16 @@ where
     S: serde::Serializer,
 {
     inner.serialize(serializer)
+}
+
+impl std::fmt::Debug for RngStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => write!(f, "Default"),
+            Self::Debug { seed } => f.debug_struct("Debug").field("seed", seed).finish(),
+            Self::Cached (_, inner) => f.debug_struct("Cached").field("inner", inner).finish(),
+        }
+    }
 }
 
 #[cfg(any(test, feature = "threadrng"))]
