@@ -67,7 +67,7 @@ pub mod encoder {
             &mut self,
             input_sequence: T,
             output_gradients: Linear,
-        ) -> Result<Linear> {
+        ) -> Result<()> {
             // forawrd pass
             let input_sequence = input_sequence.as_ref();
             let token_embeddings = self.token_embedding.forward(&input_sequence)?;
@@ -97,18 +97,13 @@ pub mod encoder {
             let d_token_embeddings = &d_embeddings;
             let d_position_embeddings = &d_embeddings;
 
-            let token_grads = self
-                .token_embedding
+            self.token_embedding
                 .backward(&input_sequence, &d_token_embeddings)?;
 
-            let position_grads = self.position_embedding.backward(
-                0,
-                input_sequence.len(),
-                &d_position_embeddings,
-            )?;
+            self.position_embedding
+                .backward(0, input_sequence.len(), &d_position_embeddings)?;
 
-            let d_input_sequence = token_grads.iter().add(position_grads.iter()).collect();
-            Ok(d_input_sequence)
+            Ok(())
         }
 
         pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
@@ -122,7 +117,10 @@ pub mod encoder {
 
     #[cfg(test)]
     mod tests {
-        use crate::ml::{layer::LayerInitStrategy, RngStrategy};
+        use crate::ml::{
+            transformer::tests::helpers::{assert_optimisation_converges, new_linear},
+            RngStrategy,
+        };
 
         use super::*;
 
@@ -151,10 +149,39 @@ pub mod encoder {
             assert_eq!(output[0].len(), embed_dim);
         }
 
-        fn new_linear(seq_len: usize, embedding_dimension: usize, rng: &RngStrategy) -> Linear {
-            let mut linear = Linear::new(seq_len, embedding_dimension);
-            linear.initialize_as_layer(&LayerInitStrategy::Kaiming, &rng);
-            linear
+        #[test]
+        fn encoder_can_minimise() {
+            let seq_len = 3;
+            let embed_dim = 12;
+            let head_count = 3;
+            let hidden_dim = 48;
+            let vocab_size = 10;
+            let block_count = 2;
+
+            let learn_rate = 0.01;
+            let iters = 50;
+            let dummy_grads = Linear::new(1, 1);
+
+            assert_optimisation_converges(
+                &move |rng| {
+                    let encoder = Encoder::new_builder(seq_len, embed_dim, vocab_size)
+                        .with_head_count(head_count)
+                        .with_block_count(block_count)
+                        .with_feed_forward_hidden_dimension(hidden_dim)
+                        .with_rng(rng.clone())
+                        .build();
+                    let inputs = [3, 6, 9];
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (encoder, inputs, target)
+                },
+                &move |encoder, inputs| encoder.forward_training(&inputs).unwrap(),
+                &move |encoder, inputs, dloss| {
+                    encoder.backward(&inputs, dloss).unwrap();
+                    encoder.apply_gradients(learn_rate);
+                    dummy_grads.clone()
+                },
+                iters,
+            );
         }
     }
 
@@ -422,8 +449,8 @@ pub mod blocks {
             let head_count = 3;
             let hidden_dim = 48;
 
-            let learn_rate = 0.001;
-            let iters = 500;
+            let learn_rate = 0.01;
+            let iters = 50;
 
             assert_optimisation_converges(
                 &move |rng| {
@@ -438,13 +465,8 @@ pub mod blocks {
                 &move |encoder_block, inputs| encoder_block.forward_training(&inputs).unwrap(),
                 &move |encoder_block, inputs, dloss| {
                     let grads = encoder_block.backward(&inputs, &dloss).unwrap();
-                    if !grads.is_finite() {
-                        // println!("----failed optimisation so printing instance!!!!!!");
-                        // println!("{:?}", &encoder_block);
-                        panic!("failed optimisation");
-                    }
                     encoder_block.apply_gradients(learn_rate);
-                    // *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
+                    *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
 
                     grads
                 },
@@ -503,8 +525,8 @@ pub mod blocks {
                 );
                 let dropout1 = DropoutLayer::new(self.dropout_rate, &self.rng);
                 let dropout2 = DropoutLayer::new(self.dropout_rate, &self.rng);
-                let layer_norm1 = LayerNormalization::new();
-                let layer_norm2 = LayerNormalization::new();
+                let layer_norm1 = LayerNormalization::new(self.sequence_len);
+                let layer_norm2 = LayerNormalization::new(self.sequence_len);
 
                 EncoderBlock {
                     attention,
@@ -752,8 +774,7 @@ pub mod layers {
             &mut self,
             token_sequence: T,
             output_gradients: &Linear,
-        ) -> Result<Linear> {
-            let mut embedding_vectors = vec![];
+        ) -> Result<()> {
             let mut embedding_weight_gradients = vec![];
 
             for (&token, grad) in token_sequence
@@ -761,20 +782,12 @@ pub mod layers {
                 .iter()
                 .zip(output_gradients.rows_iter())
             {
-                let embedding = self.embeddings.get(token).context("invalid token id")?;
-                let embedding_vector = embedding.rows_iter().next().unwrap();
-                embedding_vectors.push(embedding_vector.into());
-
                 let grad = Linear::from_iter(grad.len(), grad.iter().copied()).unwrap();
                 embedding_weight_gradients.push((token, grad));
             }
 
             self.add_gradients(embedding_weight_gradients);
-            // (key is [rows x cols]) weights [3x3] * input [3x1] = out [3x1]
-            // (key is [rows x cols]) dinput [3x1] = weights.T [3x3] * dout [3x1]
-            let input_gradients = Linear::from_values(&embedding_vectors)?
-                .matrix_product_lhs_transposed(&output_gradients);
-            Ok(input_gradients)
+            Ok(())
         }
 
         fn add_gradients(&mut self, embedding_weight_gradients: Vec<(usize, Linear)>) {
@@ -858,7 +871,7 @@ pub mod layers {
             start_index: usize,
             count: usize,
             output_gradients: &Linear,
-        ) -> Result<Linear> {
+        ) -> Result<()> {
             let end_index = start_index + count;
             if end_index > self.embeddings.vocab_size() {
                 return Err(anyhow!("positional index out of range"))?;
@@ -899,109 +912,243 @@ pub mod layers {
 
     #[derive(Debug)]
     pub struct LayerNormalization {
+        beta: Linear,
+        gamma: Linear,
         gradients: Option<LossGradients>,
     }
 
     impl LayerNormalization {
-        pub fn new() -> Self {
-            Self { gradients: None }
+        pub fn new(seq_len: usize) -> Self {
+            Self {
+                beta: Linear::with_value(seq_len, 1, 0.0),
+                gamma: Linear::with_value(seq_len, 1, 1.0),
+                gradients: None,
+            }
         }
 
         pub fn forward(&self, input: &Linear) -> Result<Linear> {
+            let stride = input.stride();
             let mean = input.iter().flatten_mean();
             let std_dev = input.iter().flatten_stddev(mean.iter());
+
             let normalised_input = input
                 .iter()
-                .sub(mean.iter().grow(input.stride()))
-                .div(std_dev.iter().grow(input.stride()), Some(1e-8))
+                .sub(mean.iter().grow(stride))
+                .div(std_dev.iter().grow(stride), Some(1e-8))
                 .collect();
 
-            Ok(normalised_input)
+            let norm_scaled_shifted = normalised_input
+                .iter()
+                .dot_product(self.gamma.iter().grow(stride))
+                .add(self.beta.iter().grow(stride))
+                .collect();
+
+            Ok(norm_scaled_shifted)
         }
 
-        pub fn backward(&self, input: &Linear, output_gradients: &Linear) -> Result<Linear> {
+        pub fn backward(&mut self, input: &Linear, output_gradients: &Linear) -> Result<Linear> {
             // forward pass
             let mean = input.iter().flatten_mean();
             let std_dev = input.iter().flatten_stddev(mean.iter());
 
-            let mean_keep_dim = mean.iter().grow(input.stride()).collect();
-            let std_dev_keep_dim = std_dev.iter().grow(input.stride()).collect();
+            let stride = input.stride();
+            let mean_keep_dim = mean.iter().grow(stride).collect();
+            let std_dev_keep_dim = std_dev.iter().grow(stride).collect();
             let epsilon = Some(1e-8);
 
-            // backward pass
-            let dl_dnorm = output_gradients;
-            // maybe not dot product? who knows
-            let dstd_dev = dl_dnorm
+            let normalised_input = input
                 .iter()
-                .dot_product(input.iter().sub(mean_keep_dim.iter()))
-                .flatten_sum()
-                .iter()
-                .grow(input.stride())
-                .multiply_scalar(-0.5)
-                .div(std_dev_keep_dim.iter().powf_scalar(1.5), epsilon)
+                .sub(mean_keep_dim.iter())
+                .div(std_dev_keep_dim.iter(), epsilon)
                 .collect();
 
+            // backward pass
+            let dbeta = output_gradients.iter().flatten_sum();
+            let dgamma = output_gradients
+                .iter()
+                .dot_product(normalised_input.iter())
+                .flatten_sum();
+            self.add_gradients(dbeta, dgamma);
+
+            // dl/dnorm(X) = dl/dY * gamma
+            let dl_dnorm = output_gradients
+                .iter()
+                .dot_product(self.gamma.iter().grow(stride))
+                .collect();
+
+            let stride_inv = 1.0 / stride as NodeValue;
+
+            // dl/dmean(X) = sum(dl/dY * gamma / (std(X) + eps), axis=1) / -sqrt(N)
             let dmean = dl_dnorm
                 .iter()
                 .flatten_sum()
                 .iter()
-                .grow(input.stride())
-                .multiply_scalar(-1.0)
-                .div(std_dev_keep_dim.iter(), epsilon)
-                .collect();
+                .div(std_dev.iter(), epsilon)
+                .multiply_scalar(-stride_inv.sqrt())
+                .collect(); // not needed?
 
+            // dl/dstd(X) = sum(dl/dY * gamma * (X - mean(X))
+            //     / (N * (std(X) + eps)^2), axis=1)
+            //     * (-0.5 * (std(X) + eps)^-3)
+            let dstd_dev = dl_dnorm
+                .iter()
+                .multiply_scalar(-1.0)
+                .dot_product(normalised_input.iter())
+                .flatten_sum()
+                .iter()
+                .div(std_dev.iter().powf_scalar(4.0), epsilon)
+                .multiply_scalar(-0.5 * stride_inv)
+                .collect(); // not needed?
+
+            // dl/dX = (dl/dY * gamma) / (std(X) + eps)
+            //     - (dl/dmean(X) / N)
+            //     - (dl/dstd(X) * (X - mean(X)) / (N * (std(X) + eps)))
             let dx = dl_dnorm
                 .iter()
-                .add(
-                    dstd_dev.iter().dot_product(
-                        input
-                            .iter()
-                            .sub(mean_keep_dim.iter())
-                            .multiply_scalar(2.0 / input.stride() as NodeValue),
-                    ),
-                )
-                .add(
-                    dmean
+                .div(std_dev_keep_dim.iter(), epsilon)
+                .sub(dmean.iter().multiply_scalar(stride_inv).grow(stride))
+                .sub(
+                    dstd_dev
                         .iter()
-                        .multiply_scalar(1.0 / input.stride() as NodeValue),
+                        .div(std_dev.iter(), epsilon)
+                        .multiply_scalar(stride_inv)
+                        .grow(stride)
+                        .dot_product(input.iter().sub(mean_keep_dim.iter())),
                 )
                 .collect();
 
             Ok(dx)
         }
 
-        // fn add_gradients(&mut self, alpha_gradients: Linear, gamma_gradients: Linear) {
-        //     let gradients = self.gradients.get_or_insert_with(|| {
-        //         gradients::LossGradients::LayerNormalization {
-        //             dalpha: Linear::with_dimensions(&alpha_gradients),
-        //             dgamma: Linear::with_dimensions(&gamma_gradients),
-        //         }
-        //     });
+        fn add_gradients(&mut self, beta_gradients: Linear, gamma_gradients: Linear) {
+            let gradients = self.gradients.get_or_insert_with(|| {
+                gradients::LossGradients::LayerNormalization {
+                    dbeta: Linear::with_dimensions(&beta_gradients),
+                    dgamma: Linear::with_dimensions(&gamma_gradients),
+                }
+            });
 
-        //     if let gradients::LossGradients::LayerNormalization { dalpha, dgamma } = gradients {
-        //         *dalpha = dalpha.iter().add(alpha_gradients.iter()).collect();
-        //         *dgamma = dgamma.iter().add(gamma_gradients.iter()).collect();
-        //     }
-        // }
+            if let gradients::LossGradients::LayerNormalization { dbeta, dgamma } = gradients {
+                *dbeta = dbeta.iter().add(beta_gradients.iter()).collect();
+                *dgamma = dgamma.iter().add(gamma_gradients.iter()).collect();
+            }
+        }
 
         pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
-            // // could mutate in-place these values back to zero rather than take
-            // let gradients = self.gradients.take();
-            // if let Some(gradients::LossGradients::LayerNormalization {
-            //     dalpha,
-            //     dgamma,
-            // }) = gradients
-            // {
-            //     gradient_descent(&mut self.alpha, &dalpha, learn_rate);
-            //     gradient_descent(&mut self.gamma, &dgamma, learn_rate);
-            // }
+            // could mutate in-place these values back to zero rather than take
+            let gradients = self.gradients.take();
+            if let Some(gradients::LossGradients::LayerNormalization { dbeta, dgamma }) = gradients
+            {
+                gradient_descent(&mut self.beta, &dbeta, learn_rate);
+                gradient_descent(&mut self.gamma, &dgamma, learn_rate);
+            }
 
-            // fn gradient_descent(target: &mut Linear, gradient: &Linear, learn_rate: NodeValue) {
-            //     *target = target
-            //         .iter()
-            //         .sub(gradient.iter().multiply_scalar(learn_rate))
-            //         .collect();
-            // }
+            fn gradient_descent(target: &mut Linear, gradient: &Linear, learn_rate: NodeValue) {
+                *target = target
+                    .iter()
+                    .sub(gradient.iter().multiply_scalar(learn_rate))
+                    .collect();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::ml::{
+            transformer::tests::helpers::{assert_optimisation_converges, new_linear},
+            RngStrategy,
+        };
+
+        use super::*;
+
+        #[test]
+        fn feed_forward_layer_can_process_inputs() {
+            let seq_len = 3;
+            let embed_dim = 12;
+            let hidden_dim = 48;
+
+            let rng = RngStrategy::testable(1234);
+            let strategy = LayerInitStrategy::KaimingZeroBias;
+
+            let feed_forward_layer = FeedForwardLayer::new(embed_dim, hidden_dim, &strategy, &rng);
+
+            let inputs = new_linear(seq_len, embed_dim, &rng);
+            let output = feed_forward_layer.forward(&inputs).unwrap().to_values();
+
+            assert_eq!(output.len(), seq_len);
+            assert_eq!(output[0].len(), embed_dim);
+        }
+
+        #[test]
+        fn layer_normalization_layer_can_process_inputs() {
+            let seq_len = 3;
+            let embed_dim = 12;
+
+            let rng = RngStrategy::testable(1234);
+
+            let layer_norm = LayerNormalization::new(seq_len);
+
+            let inputs = new_linear(seq_len, embed_dim, &rng);
+            let output = layer_norm.forward(&inputs).unwrap().to_values();
+
+            assert_eq!(output.len(), seq_len);
+            assert_eq!(output[0].len(), embed_dim);
+        }
+
+        #[test]
+        fn feed_forward_layer_can_optimise() {
+            let seq_len = 3;
+            let embed_dim = 12;
+            let hidden_dim = 48;
+            let strategy = LayerInitStrategy::KaimingZeroBias;
+
+            let learn_rate = 0.001;
+            let iters = 500;
+
+            assert_optimisation_converges(
+                &move |rng| {
+                    let ff_layer = FeedForwardLayer::new(embed_dim, hidden_dim, &strategy, &rng);
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (ff_layer, inputs, target)
+                },
+                &move |ff_layer, inputs| ff_layer.forward(&inputs).unwrap(),
+                &move |ff_layer, inputs, dloss| {
+                    let grads = ff_layer.backward(&inputs, &dloss).unwrap();
+                    ff_layer.apply_gradients(learn_rate);
+                    *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
+
+                    grads
+                },
+                iters,
+            );
+        }
+
+        #[test]
+        fn layer_normalization_layer_can_optimise_inputs() {
+            let seq_len = 3;
+            let embed_dim = 12;
+
+            let learn_rate = 0.001;
+            let iters = 500;
+
+            assert_optimisation_converges(
+                &move |rng| {
+                    let layer_norm = LayerNormalization::new(seq_len);
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (layer_norm, inputs, target)
+                },
+                &move |layer_norm, inputs| layer_norm.forward(&inputs).unwrap(),
+                &move |layer_norm, inputs, dloss| {
+                    let grads = layer_norm.backward(&inputs, &dloss).unwrap();
+                    layer_norm.apply_gradients(learn_rate);
+                    *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
+
+                    grads
+                },
+                iters,
+            );
         }
     }
 }
@@ -1449,6 +1596,10 @@ pub mod gradients {
         Embedding {
             dweights: Vec<Linear>,
         },
+        LayerNormalization {
+            dbeta: Linear,
+            dgamma: Linear,
+        },
     }
 }
 
@@ -1641,14 +1792,14 @@ pub mod dense {
 }
 
 pub mod linear {
-    use std::iter;
+    use std::{cmp::Ordering, iter};
 
     use anyhow::{anyhow, Context, Result};
     use itertools::Itertools;
 
     use crate::ml::{layer::LayerInitStrategy, LayerValues, NodeValue, RngStrategy};
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, Clone, PartialEq)]
     pub struct Linear {
         inner: LayerValues,
         stride: usize,
@@ -1657,19 +1808,19 @@ pub mod linear {
 
     impl Linear {
         pub fn new(count: usize, stride: usize) -> Self {
-            let size = count * stride;
-            Self {
-                inner: LayerValues::new(vec![0.0; size]),
-                stride,
-                count,
-            }
+            Self::with_value(count, stride, 0.0)
         }
 
         pub fn with_dimensions(other: &Self) -> Self {
+            Self::with_value(other.count, other.stride, 0.0)
+        }
+
+        pub fn with_value(count: usize, stride: usize, value: NodeValue) -> Self {
+            let size = count * stride;
             Self {
-                inner: LayerValues::new(vec![0.0; other.inner.len()]),
-                stride: other.stride,
-                count: other.count,
+                inner: LayerValues::new(vec![value; size]),
+                stride,
+                count,
             }
         }
 
@@ -2057,7 +2208,10 @@ pub mod linear {
             }
         }
         pub fn flatten_stddev(self, mean: Self) -> Linear {
-            let factor = (self.stride as NodeValue).powf(-0.5);
+            assert_eq!(self.count, mean.count, "mismatched dimensions");
+            assert_eq!(mean.stride, 1, "invalid mean stride dimension");
+            assert!(self.stride > 1, "invalid stride dimension");
+            let factor = ((self.stride - 1) as NodeValue).powf(-0.5);
             Linear {
                 inner: self
                     .inner
@@ -2241,7 +2395,7 @@ mod tests {
             let mut iteration = 0;
             let mut initial_mean_loss = None;
 
-            let (_output, mean_loss) = loop {
+            let (output, mean_loss) = loop {
                 // compute forward pass
                 let output = forward(&testable_instance, &inputs);
 
@@ -2251,6 +2405,10 @@ mod tests {
 
                 // compute backward pass, apply gradients, and return inputs gradients
                 let grads = backward(&mut testable_instance, &mut inputs, dloss.collect());
+                if !grads.is_finite() {
+                    println!("{:?}", &output);
+                    panic!("failed optimisation: grad value is non-finite");
+                }
 
                 // get gradients & loss for reporting
                 let abs_grads = grads.iter().abs();
@@ -2276,6 +2434,7 @@ mod tests {
                     break (output, mean_loss);
                 }
             };
+            dbg!((target.to_string(), output.to_string()));
 
             let initial_mean_loss = initial_mean_loss.unwrap();
 
