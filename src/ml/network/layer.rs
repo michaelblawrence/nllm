@@ -24,12 +24,6 @@ pub struct Layer {
     gradients: LayerGradients,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LayerGradients {
-    weights: Vec<NodeValue>,
-    bias: Option<Vec<NodeValue>>,
-}
-
 impl Layer {
     pub fn new(inputs_count: usize, shape: &LayerShape, rng: &RngStrategy) -> Self {
         let size = shape.node_count();
@@ -122,14 +116,14 @@ impl Layer {
                 layer_inputs,
             } => {
                 let weights_gradients = self.weights_gradients_iter(&gradients, &layer_inputs)?;
+                let layer_gradients = self.gradients.get_or_insert(&self.weights, &self.bias);
 
-                for (x, grad) in self
-                    .gradients
+                for (x, grad) in layer_gradients
                     .weights
                     .iter_mut()
                     .zip(weights_gradients.iter())
                 {
-                    let next_val = *x - grad;
+                    let next_val = *x + grad;
                     *x = if next_val.is_finite() {
                         next_val
                     } else {
@@ -138,8 +132,13 @@ impl Layer {
                         ));
                     }
                 }
-                for (x, grad) in self.bias.iter_mut().flatten().zip(gradients.iter()) {
-                    let next_val = *x - grad;
+                for (x, grad) in layer_gradients
+                    .bias
+                    .iter_mut()
+                    .flatten()
+                    .zip(gradients.iter())
+                {
+                    let next_val = *x + grad;
                     *x = if next_val.is_finite() {
                         next_val
                     } else {
@@ -154,11 +153,12 @@ impl Layer {
     }
 
     pub fn apply_gradients(&mut self, learn_rate: NodeValue) -> Result<()> {
-        let weights_gradients = self.gradients.weights.drain(..);
-        let bias_gradients = self.gradients.bias.iter_mut().flat_map(|x| x.drain(..));
+        let weights_gradients = self.gradients.weights.iter_mut();
+        let bias_gradients = self.gradients.bias.iter_mut().flat_map(|x| x.iter_mut());
 
         for (x, grad) in self.weights.iter_mut().zip(weights_gradients) {
-            let next_val = *x - (grad * learn_rate);
+            let next_val = *x - (*grad * learn_rate);
+            *grad = 0.0;
             *x = if next_val.is_finite() {
                 next_val
             } else {
@@ -169,7 +169,8 @@ impl Layer {
             }
         }
         for (x, grad) in self.bias.iter_mut().flatten().zip(bias_gradients) {
-            let next_val = *x - (grad * learn_rate);
+            let next_val = *x - (*grad * learn_rate);
+            *grad = 0.0;
             *x = if next_val.is_finite() {
                 next_val
             } else {
@@ -323,15 +324,37 @@ impl Layer {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LayerGradients {
+    weights: Vec<NodeValue>,
+    bias: Option<Vec<NodeValue>>,
+}
+
+impl LayerGradients {
+    fn get_or_insert(
+        &mut self,
+        weights: &Vec<NodeValue>,
+        bias: &Option<Vec<NodeValue>>,
+    ) -> &mut Self {
+        if self.weights.len() == 0 {
+            self.weights = vec![0.0; weights.len()];
+        }
+        if self.bias.is_none() && bias.is_some() {
+            self.bias = Some(vec![0.0; bias.as_ref().unwrap().len()]);
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayerValues(Vec<NodeValue>);
 
-impl<'a, T> From<T> for LayerValues
+impl<T> From<T> for LayerValues
 where
-    T: Iterator<Item = &'a NodeValue>,
+    T: AsRef<[NodeValue]>,
 {
     fn from(value: T) -> Self {
-        Self(value.cloned().collect())
+        Self(value.as_ref().to_vec())
     }
 }
 
