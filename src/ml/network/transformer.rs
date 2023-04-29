@@ -1268,7 +1268,7 @@ pub mod layers {
 pub mod attention {
     use anyhow::{anyhow, Result};
 
-    use crate::ml::{layer::LayerInitStrategy, NodeValue, RngStrategy};
+    use crate::ml::{layer::LayerInitStrategy, NetworkActivationMode, NodeValue, RngStrategy};
 
     use super::{
         gradients::{self, LossGradients},
@@ -1513,26 +1513,16 @@ pub mod attention {
         }
     }
 
+    // TODO: benchmark against LinearIter::softmax_d, delete loser!
     fn softmax_d_iter(dloss_dsoftmax: Linear, softmax: Linear) -> Result<Linear> {
         // let attention_weights = masked_attention_scores.softmax();
-        // dL/dx_i = sum(dL/dy_j * softmax(x_j) * (delta_ij - softmax(x_i)))   for i = 1, ..., n and j = 1, ..., n
-        let softmax_derivative = softmax
-            .rows_iter()
-            .zip(dloss_dsoftmax.rows_iter())
-            .flat_map(|(probs, grads)| {
-                let dot_product = probs
-                    .iter()
-                    .zip(grads)
-                    .map(|(prob_j, grad_j)| prob_j * grad_j)
-                    .sum::<f64>();
-
-                probs
-                    .iter()
-                    .zip(grads)
-                    .map(move |(prob_i, grad_i)| prob_i * (grad_i - dot_product))
-            });
-
-        Ok(Linear::from_iter(softmax.stride(), softmax_derivative)?)
+        Linear::from_iter(
+            softmax.stride(),
+            dloss_dsoftmax
+                .rows_iter()
+                .zip(softmax.rows_iter())
+                .flat_map(|(grads, probs)| NetworkActivationMode::softmax_d(grads, probs)),
+        )
     }
 
     #[cfg(test)]
@@ -1835,8 +1825,10 @@ pub mod dense {
                 Some(activation) => {
                     let mut weighted_inputs = self.compute_weighted_inputs(&inputs)?;
                     weighted_inputs.rows_iter_mut().for_each(|x| {
+                        let outputs = x.into();
+                        let activated_inputs = activation.apply(&outputs);
                         activation
-                            .derivative(&x.into())
+                            .derivative(&output_gradients, &activated_inputs)
                             .multiply_iter(&output_gradients)
                             .zip(x)
                             .for_each(|(grad, x)| *x = grad)

@@ -173,8 +173,8 @@ impl Embedding {
     fn compute_probabilities(&self, output: &LayerValues) -> Result<LayerValues> {
         let last_layer_shape = self.last_layer_shape()?;
         let post_apply_mode = match last_layer_shape.mode_override() {
-            Some(NetworkActivationMode::SoftMax) => NetworkActivationMode::Linear,
-            _ => NetworkActivationMode::SoftMax,
+            Some(NetworkActivationMode::SoftMaxCrossEntropy) => NetworkActivationMode::Linear,
+            _ => NetworkActivationMode::SoftMaxCrossEntropy,
         };
         let probabilities = post_apply_mode.apply(&output);
         Ok(probabilities)
@@ -700,7 +700,7 @@ pub mod builder {
             let output_layer = (token_count, LayerInitStrategy::KaimingZeroBias);
             let output_layer: LayerShape = output_layer.into();
             let output_layer_shape =
-                output_layer.with_activation_mode(NetworkActivationMode::SoftMax);
+                output_layer.with_activation_mode(NetworkActivationMode::SoftMaxCrossEntropy);
 
             let layers_shape = [Ok(embedding_layer_shape)]
                 .into_iter()

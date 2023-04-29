@@ -1,4 +1,4 @@
-use clap::{command, Args, Parser, Subcommand};
+use clap::{command, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use plane::ml::{NetworkActivationMode, NodeValue};
@@ -78,8 +78,8 @@ pub struct TrainEmbeddingConfig {
     #[serde(default)]
     pub phrase_test_set_max_tokens: Option<usize>,
 
-    #[arg(short = 'm', long, default_value_t = NetworkActivationMode::Tanh)]
-    pub activation_mode: NetworkActivationMode,
+    #[arg(short = 'm', long, value_enum, default_value_t = LayerActivationConfig::Tanh)]
+    pub activation_mode: LayerActivationConfig,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -136,6 +136,28 @@ pub enum Command {
 
     #[command(name = "load", arg_required_else_help = true)]
     LoadEmbedding(LoadEmbeddingConfig),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
+pub enum LayerActivationConfig {
+    Linear,
+    SoftMax,
+    Sigmoid,
+    Tanh,
+    RelU,
+}
+
+impl Into<NetworkActivationMode> for LayerActivationConfig {
+    fn into(self) -> NetworkActivationMode {
+        use NetworkActivationMode::*;
+        match self {
+            Self::Linear => Linear,
+            Self::SoftMax => SoftMaxCrossEntropy,
+            Self::Sigmoid => Sigmoid,
+            Self::Tanh => Tanh,
+            Self::RelU => RelU,
+        }
+    }
 }
 
 fn parse_range<T>(

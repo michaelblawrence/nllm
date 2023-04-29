@@ -220,10 +220,7 @@ impl Network {
         Ok(network_output)
     }
 
-    fn compute_all_layers_activations(
-        &self,
-        inputs: LayerValues,
-    ) -> Result<Vec<(LayerValues, LayerValues)>> {
+    fn compute_all_layers_activations(&self, inputs: LayerValues) -> Result<Vec<LayerValues>> {
         let (_, layers_activations) = self.compute_inner(inputs, false)?;
         Ok(layers_activations)
     }
@@ -245,11 +242,11 @@ impl Network {
 
     fn compute_error_precomputed(
         &self,
-        layers_activations: &Vec<(LayerValues, LayerValues)>,
+        layers_activations: &Vec<LayerValues>,
         target_outputs: &LayerValues,
     ) -> Result<f64> {
         let last = layers_activations.last();
-        let (_, layer_output) = last.expect("should have a final layer");
+        let layer_output = last.expect("should have a final layer");
 
         let output_layer_error = self
             .layers
@@ -381,14 +378,14 @@ impl Network {
         &self,
         inputs: LayerValues,
         disable_alloc: bool,
-    ) -> Result<(LayerValues, Vec<(LayerValues, LayerValues)>)> {
+    ) -> Result<(LayerValues, Vec<LayerValues>)> {
         let (last_layer, layers) = self.layers.split_last().expect("should have final layer");
 
         let (mut layers_activations, output) = if disable_alloc {
             (Vec::new(), Some(&inputs))
         } else {
             let mut vec = Vec::with_capacity(self.layers.len());
-            vec.push((LayerValues::new(Vec::new()), inputs));
+            vec.push(inputs);
             (vec, None)
         };
 
@@ -396,7 +393,6 @@ impl Network {
         let mut _last_cache = None;
         let mut output = layers_activations
             .first()
-            .map(|(_x, z)| z)
             .or(output)
             .expect("missing input values");
 
@@ -405,10 +401,9 @@ impl Network {
             let z = self.layer_activation(layer_idx)?.apply(&x);
 
             output = if !disable_alloc {
-                layers_activations.push((x, z));
+                layers_activations.push(z);
                 layers_activations
                     .last()
-                    .map(|(_x, z)| z)
                     .expect("missing latest pushed layer")
             } else {
                 _last_cache = Some(z);
@@ -420,14 +415,14 @@ impl Network {
         let z = self.final_layer_activation()?.apply(&x);
 
         if !disable_alloc {
-            layers_activations.push((x, z.clone()));
+            layers_activations.push(z.clone());
         }
         Ok((z, layers_activations))
     }
 
     fn perform_gradient_decent_step(
         &self,
-        layers_activations: &Vec<(LayerValues, LayerValues)>,
+        layers_activations: &Vec<LayerValues>,
         target_outputs: &LayerValues,
     ) -> Result<Vec<(usize, LayerLearnAction)>> {
         let layer_states = self.to_intermediate_states(&layers_activations)?;
@@ -461,7 +456,7 @@ impl Network {
                     let layer = &state.layer;
 
                     match state.activation_mode {
-                        NetworkActivationMode::SoftMax => {
+                        NetworkActivationMode::SoftMaxCrossEntropy => {
                             layer.cross_entropy_error_d(&layer_activations, &target_outputs)?
                         }
                         _ => layer.msd_error_d(&layer_activations, &target_outputs)?,
@@ -471,7 +466,7 @@ impl Network {
 
             let da_dz = state
                 .activation_mode
-                .derivative(&state.layer_weighted_outputs);
+                .derivative(&dl_da, &state.layer_activations);
 
             let dl_dz = dl_da.multiply_iter(&da_dz).collect();
             let dl_dz_next = state.layer.multiply_weight_matrix(&dl_dz)?;
@@ -510,11 +505,11 @@ impl Network {
 
     fn to_intermediate_states<'a>(
         &'a self,
-        layers_activations: &'a Vec<(LayerValues, LayerValues)>,
+        layers_activations: &'a Vec<LayerValues>,
     ) -> Result<Vec<LayerIntermediate>> {
         let layer_io_iter = layers_activations
             .windows(2)
-            .map(|pair| (&pair[0].1, &pair[1].0, &pair[1].1));
+            .map(|pair| (&pair[0], &pair[1]));
 
         let activations_iter = self
             .layers
@@ -523,12 +518,11 @@ impl Network {
             .map(|(i, layer)| (layer, i, self.layer_activation(i)));
 
         let layer_states = activations_iter.zip(layer_io_iter).map(
-            |((layer, idx, mode), (l_input, l_output, l_activation))| {
+            |((layer, idx, mode), (l_input, l_activation))| {
                 Ok(LayerIntermediate {
                     layer,
                     layer_id: idx,
                     layer_input: l_input,
-                    layer_weighted_outputs: l_output,
                     layer_activations: l_activation,
                     activation_mode: mode?,
                 })
@@ -545,9 +539,9 @@ impl Network {
         learn_actions: I,
         learn_rate: f64,
     ) -> Result<()> {
-        use std::collections::HashMap;
         use itertools::Itertools;
         use rayon::prelude::*;
+        use std::collections::HashMap;
 
         let layer_actions: HashMap<usize, Vec<&LayerLearnAction>> = learn_actions
             .group_by(|x| x.0)
@@ -622,7 +616,6 @@ struct LayerIntermediate<'a> {
     layer: &'a Layer,
     layer_id: usize,
     layer_input: &'a LayerValues,
-    layer_weighted_outputs: &'a LayerValues,
     layer_activations: &'a LayerValues,
     activation_mode: NetworkActivationMode,
 }
@@ -645,7 +638,9 @@ pub enum BatchSamplingStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum NetworkActivationMode {
     Linear,
-    SoftMax,
+    #[serde(alias = "SoftMax")]
+    SoftMaxCrossEntropy,
+    SoftMaxCounts,
     Sigmoid,
     Tanh,
     RelU,
@@ -659,29 +654,11 @@ impl std::fmt::Display for NetworkActivationMode {
     }
 }
 
-impl FromStr for NetworkActivationMode {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        use NetworkActivationMode::*;
-        let mut s = s.to_uppercase();
-        s.retain(char::is_alphabetic);
-        match s.as_str() {
-            "LINEAR" => Ok(Linear),
-            "SOFTMAX" => Ok(SoftMax),
-            "SIGMOID" => Ok(Sigmoid),
-            "TANH" => Ok(Tanh),
-            "RELU" => Ok(RelU),
-            _ => Err(anyhow!("Could not match activation mode type")),
-        }
-    }
-}
-
 impl NetworkActivationMode {
     pub fn apply(&self, output: &LayerValues) -> LayerValues {
         match self {
             NetworkActivationMode::Linear => output.clone(),
-            NetworkActivationMode::SoftMax => {
+            NetworkActivationMode::SoftMaxCounts | NetworkActivationMode::SoftMaxCrossEntropy => {
                 let max = output
                     .iter()
                     .copied()
@@ -703,37 +680,59 @@ impl NetworkActivationMode {
             }
         }
     }
-    pub fn derivative(&self, output: &LayerValues) -> LayerValues {
+    pub fn derivative(&self, activation_d: &LayerValues, activation: &LayerValues) -> LayerValues {
         match self {
-            NetworkActivationMode::Linear => output.iter().map(|_| 1.0).collect(),
-            // TODO: cross-entroy loss derivative is calculate elsewhere for FINAL layer only.
-            // can improve api?
-            NetworkActivationMode::SoftMax => output.iter().map(|_| 1.0).collect(),
+            NetworkActivationMode::Linear | NetworkActivationMode::SoftMaxCrossEntropy => {
+                activation.iter().map(|_| 1.0).collect()
+            }
+            NetworkActivationMode::SoftMaxCounts => {
+                Self::softmax_d(activation_d, activation).collect()
+            }
             NetworkActivationMode::Sigmoid => {
-                let mut sigmoid = self.apply(output);
+                let mut sigmoid = activation.clone();
                 sigmoid.iter_mut().for_each(|x| *x = *x * (1.0 - *x));
                 sigmoid
             }
             NetworkActivationMode::Tanh => {
-                let mut sigmoid = self.apply(output);
-                sigmoid.iter_mut().for_each(|x| *x = 1.0 - x.powi(2));
-                sigmoid
+                let mut tanh = activation.clone();
+                tanh.iter_mut().for_each(|x| *x = 1.0 - x.powi(2));
+                tanh
             }
-            NetworkActivationMode::RelU => output.iter().map(|x| x.signum().max(0.0)).collect(),
+            NetworkActivationMode::RelU => activation
+                .iter()
+                .map(|&x| if x == 0.0 { 0.0 } else { 1.0 })
+                .collect(),
         }
     }
 
     pub fn is_softmax(&self) -> bool {
         match self {
-            NetworkActivationMode::SoftMax => true,
+            NetworkActivationMode::SoftMaxCrossEntropy => true,
             _ => false,
         }
+    }
+
+    pub fn softmax_d<'a>(
+        softmax_d: &'a [f64],
+        softmax: &'a [f64],
+    ) -> impl Iterator<Item = f64> + 'a {
+        // dL/dx_i = sum(dL/dy_j * softmax(x_j) * (delta_ij - softmax(x_i)))   for i = 1, ..., n and j = 1, ..., n
+        let dot_product = softmax
+            .iter()
+            .zip(softmax_d)
+            .map(|(prob_j, grad_j)| prob_j * grad_j)
+            .sum::<f64>();
+
+        softmax
+            .iter()
+            .zip(softmax_d)
+            .map(move |(prob_i, grad_i)| prob_i * (grad_i - dot_product))
     }
 }
 
 impl Default for NetworkActivationMode {
     fn default() -> Self {
-        Self::SoftMax
+        Self::SoftMaxCrossEntropy
     }
 }
 
@@ -778,7 +777,7 @@ mod tests {
     #[test]
     fn can_compute_hidden_layer_network_zeros() {
         let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::Zero);
-        shape.set_activation_mode(NetworkActivationMode::SoftMax);
+        shape.set_activation_mode(NetworkActivationMode::SoftMaxCrossEntropy);
         let rng = RngStrategy::testable(12345);
         let network = Network::new_with_rng(shape, rng);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();
@@ -790,7 +789,7 @@ mod tests {
     #[test]
     fn can_compute_hidden_layer_network_rands() {
         let mut shape = NetworkShape::new(2, 2, vec![8], LayerInitStrategy::PositiveRandom);
-        shape.set_activation_mode(NetworkActivationMode::SoftMax);
+        shape.set_activation_mode(NetworkActivationMode::SoftMaxCrossEntropy);
         let rng = RngStrategy::testable(12345);
         let network = Network::new_with_rng(shape, rng);
         let output = network.compute([2.0, 2.0].iter().into()).unwrap();

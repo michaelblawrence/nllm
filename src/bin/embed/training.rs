@@ -409,7 +409,7 @@ where
         .with_embedding_dimensions(config.embedding_size)
         .with_hidden_layer_custom_shape(hidden_layer_shape)
         .with_input_stride_width(config.input_stride_width)
-        .with_activation_mode(config.activation_mode)
+        .with_activation_mode(config.activation_mode.into())
         .with_rng(rng)
         .build()
         .unwrap();
