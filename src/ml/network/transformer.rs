@@ -1,5 +1,3 @@
-use std::iter;
-
 use anyhow::anyhow;
 
 use crate::ml::RngStrategy;
@@ -3537,6 +3535,229 @@ pub mod linear {
             let expected =
                 Linear::from_iter(2, [1.0, 0.0, 0.5, 0.5, 0.0, 1.0, 0.0, 0.0].into_iter()).unwrap();
             assert_eq!(expected, y);
+        }
+    }
+}
+
+pub mod solver {
+    use anyhow::{anyhow, Result};
+
+    use crate::ml::NodeValue;
+
+    use super::linear::Linear;
+
+    pub struct AdamOptimizer {
+        momentum: Linear,
+        rms: Linear,
+        beta: (NodeValue, NodeValue),
+        epsilon: NodeValue,
+        eta: NodeValue,
+        t: u64,
+    }
+
+    impl AdamOptimizer {
+        pub fn new(param_count: usize, param_dimension: usize, learn_rate: NodeValue) -> Self {
+            Self::new_builder(param_count, param_dimension)
+                .with_eta(learn_rate)
+                .build()
+        }
+
+        pub fn new_builder(
+            param_count: usize,
+            param_dimension: usize,
+        ) -> builder::AdamOptimizerBuilder {
+            builder::AdamOptimizerBuilder::new(param_count, param_dimension)
+        }
+
+        pub fn update(&mut self, target: &mut Linear, dloss_dtarget: &Linear) -> Result<()> {
+            let beta1 = self.beta.0;
+            let beta2 = self.beta.1;
+            let t = self.t as NodeValue;
+
+            let gradient_squared = dloss_dtarget.iter().powf_scalar(2.0);
+
+            self.momentum = self
+                .momentum
+                .iter()
+                .multiply_scalar(beta1)
+                .add(dloss_dtarget.iter().multiply_scalar(1.0 - beta1))
+                .collect();
+
+            self.rms = self
+                .rms
+                .iter()
+                .multiply_scalar(beta2)
+                .add(gradient_squared.multiply_scalar(1.0 - beta2))
+                .collect();
+
+            let momentum_corrected = &self
+                .momentum
+                .iter()
+                .multiply_scalar(1.0 / (1.0 - beta1.powf(t)))
+                .collect();
+
+            let rms_corrected = &self
+                .rms
+                .iter()
+                .multiply_scalar(1.0 / (1.0 - beta2.powf(t)))
+                .collect();
+
+            let epsilon = Some(self.epsilon);
+            let eta_correction = momentum_corrected
+                .iter()
+                .div(rms_corrected.iter().powf_scalar(0.5), epsilon)
+                .multiply_scalar(-self.eta);
+
+            let next_value = target.iter().add(eta_correction).collect();
+            if !next_value.is_finite() {
+                Err(anyhow!("failed to update target: invalid gradients"))?;
+            }
+
+            self.t += 1;
+            *target = next_value;
+            Ok(())
+        }
+    }
+
+    pub struct SGDOptimizer {
+        learn_rate: NodeValue,
+    }
+
+    impl SGDOptimizer {
+        pub fn new(learn_rate: NodeValue) -> Self {
+            Self { learn_rate }
+        }
+
+        pub fn update(&mut self, target: &mut Linear, dloss_dtarget: &Linear) -> Result<()> {
+            let next_value = target
+                .iter()
+                .apply_gradients(dloss_dtarget.iter(), self.learn_rate);
+            if !next_value.is_finite() {
+                Err(anyhow!("failed to update target: invalid gradients"))?;
+            }
+
+            *target = next_value;
+            Ok(())
+        }
+    }
+
+    pub mod builder {
+        use super::*;
+
+        pub struct AdamOptimizerBuilder {
+            momentum: Linear,
+            rms: Linear,
+            beta: (f64, f64),
+            epsilon: f64,
+            eta: f64,
+        }
+
+        impl AdamOptimizerBuilder {
+            pub fn new(param_count: usize, param_dimension: usize) -> Self {
+                Self {
+                    momentum: Linear::new(param_count, param_dimension),
+                    rms: Linear::new(param_count, param_dimension),
+                    beta: (0.9, 0.999),
+                    epsilon: 1e-8,
+                    eta: 0.001,
+                }
+            }
+
+            pub fn with_beta(mut self, beta: (f64, f64)) -> Self {
+                self.beta = beta;
+                self
+            }
+
+            pub fn with_epsilon(mut self, epsilon: f64) -> Self {
+                self.epsilon = epsilon;
+                self
+            }
+
+            pub fn with_eta(mut self, eta: f64) -> Self {
+                self.eta = eta;
+                self
+            }
+
+            pub fn build(self) -> AdamOptimizer {
+                AdamOptimizer {
+                    momentum: self.momentum,
+                    rms: self.rms,
+                    beta: self.beta,
+                    epsilon: self.epsilon,
+                    eta: self.eta,
+                    t: 1,
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::cell::RefCell;
+
+        use crate::ml::transformer::tests::helpers::{assert_optimisation_converges, new_linear};
+
+        use super::*;
+
+        #[test]
+        fn adam_can_optimise_linear() {
+            let batch_count = 12;
+            let input_dimension = 48;
+            let output_dimension = 8;
+
+            let iters = 100;
+
+            let optimizer = AdamOptimizer::new_builder(output_dimension, input_dimension)
+                .with_eta(0.1)
+                .build();
+            let optimizer = RefCell::new(optimizer);
+
+            assert_optimisation_converges(
+                &move |rng| {
+                    let weights = new_linear(output_dimension, input_dimension, &rng);
+                    let inputs = new_linear(batch_count, input_dimension, &rng);
+                    let target = new_linear(batch_count, output_dimension, &rng);
+                    (weights, inputs, target)
+                },
+                &move |weights, inputs| inputs.matrix_product_rhs_transposed(&weights),
+                &move |weights, inputs, dloss| {
+                    let dweights = dloss.matrix_product_lhs_transposed(&inputs);
+                    let dinputs = dloss.matrix_product(&weights);
+                    optimizer.borrow_mut().update(weights, &dweights).unwrap();
+                    dinputs
+                },
+                iters,
+            );
+        }
+
+        #[test]
+        fn sgd_can_optimise_linear() {
+            let batch_count = 12;
+            let input_dimension = 48;
+            let output_dimension = 8;
+
+            let iters = 100;
+            let learn_rate = 0.01;
+
+            let optimizer = SGDOptimizer::new(learn_rate);
+            let optimizer = RefCell::new(optimizer);
+
+            assert_optimisation_converges(
+                &move |rng| {
+                    let weights = new_linear(output_dimension, input_dimension, &rng);
+                    let inputs = new_linear(batch_count, input_dimension, &rng);
+                    let target = new_linear(batch_count, output_dimension, &rng);
+                    (weights, inputs, target)
+                },
+                &move |weights, inputs| inputs.matrix_product_rhs_transposed(&weights),
+                &move |weights, inputs, dloss| {
+                    let dweights = dloss.matrix_product_lhs_transposed(&inputs);
+                    let dinputs = dloss.matrix_product(&weights);
+                    optimizer.borrow_mut().update(weights, &dweights).unwrap();
+                    dinputs
+                },
+                iters,
+            );
         }
     }
 }
