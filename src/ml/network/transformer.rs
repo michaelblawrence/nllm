@@ -218,15 +218,18 @@ pub mod decoder {
             assert_eq!(outputs.len(), seq_len);
             assert_eq!(outputs[0].len(), vocab_size);
             assert!(output.is_finite());
+
+            let max_output_value = outputs
+                .iter()
+                .flat_map(|x| x.iter())
+                .map(|x| x.abs())
+                .reduce(NodeValue::max)
+                .unwrap();
+            let max_expected_output_value = 3.2;
+
             assert_eq!(
-                outputs
-                    .iter()
-                    .flat_map(|x| x.iter())
-                    .map(|x| x.abs())
-                    .reduce(NodeValue::max)
-                    .unwrap()
-                    .max(3.0),
-                3.0,
+                max_output_value.max(max_expected_output_value),
+                max_expected_output_value,
                 "initial state is not diffuse"
             );
         }
@@ -324,11 +327,20 @@ pub mod decoder {
                     let encoder_outputs = new_linear(seq_len, embed_dim, &rng);
                     (decoder, (inputs, encoder_outputs), target)
                 },
-                &move |decoder, (inputs, encoder_outputs)| decoder.forward_training(&inputs, Some(encoder_outputs), None).unwrap(),
+                &move |decoder, (inputs, encoder_outputs)| {
+                    decoder
+                        .forward_training(&inputs, Some(encoder_outputs), None)
+                        .unwrap()
+                },
                 &move |decoder, (inputs, encoder_outputs), dloss| {
-                    let encoder_grads = decoder.backward(&inputs, Some(encoder_outputs), None, dloss).unwrap().unwrap();
+                    let encoder_grads = decoder
+                        .backward(&inputs, Some(encoder_outputs), None, dloss)
+                        .unwrap()
+                        .unwrap();
                     decoder.apply_gradients(learn_rate);
-                    *encoder_outputs = encoder_outputs.iter().apply_gradients(encoder_grads.iter(), learn_rate);
+                    *encoder_outputs = encoder_outputs
+                        .iter()
+                        .apply_gradients(encoder_grads.iter(), learn_rate);
                     encoder_grads
                 },
                 iters,
@@ -352,18 +364,18 @@ pub mod decoder {
         };
 
         pub struct DecoderBuilder {
-            pub(crate) sequence_len: usize,
-            pub(crate) model_dimension: usize,
-            pub(crate) head_count: usize,
-            pub(crate) target_vocab_size: usize,
-            pub(crate) block_count: usize,
-            pub(crate) padding_token: usize,
-            pub(crate) rng: RngStrategy,
-            pub(crate) embedding_init_strategy: LayerInitStrategy,
-            pub(crate) output_dense_init_strategy: LayerInitStrategy,
-            pub(crate) feed_forward_init_strategy: LayerInitStrategy,
-            pub(crate) feed_forward_hidden_dimension: usize,
-            pub(crate) dropout_rate: NodeValue,
+            sequence_len: usize,
+            model_dimension: usize,
+            head_count: usize,
+            target_vocab_size: usize,
+            block_count: usize,
+            padding_token: usize,
+            rng: RngStrategy,
+            embedding_init_strategy: LayerInitStrategy,
+            output_dense_init_strategy: LayerInitStrategy,
+            feed_forward_init_strategy: LayerInitStrategy,
+            feed_forward_hidden_dimension: usize,
+            dropout_rate: NodeValue,
         }
 
         impl DecoderBuilder {
@@ -652,8 +664,22 @@ pub mod encoder {
 
             let outputs = output.clone().to_values();
             assert_eq!(outputs.len(), seq_len);
-            assert_eq!(outputs[0].len(), vocab_size);
+            assert_eq!(outputs[0].len(), embed_dim);
             assert!(output.is_finite());
+
+            let max_output_value = outputs
+                .iter()
+                .flat_map(|x| x.iter())
+                .map(|x| x.abs())
+                .reduce(NodeValue::max)
+                .unwrap();
+            let max_expected_output_value = 3.2;
+
+            assert_eq!(
+                max_output_value.max(max_expected_output_value),
+                max_expected_output_value,
+                "initial state is not diffuse"
+            );
         }
 
         #[test]
@@ -681,7 +707,7 @@ pub mod encoder {
 
             let outputs = output.clone().to_values();
             assert_eq!(outputs.len(), seq_len);
-            assert_eq!(outputs[0].len(), vocab_size);
+            assert_eq!(outputs[0].len(), embed_dim);
             assert!(output.is_finite());
         }
 
@@ -738,17 +764,17 @@ pub mod encoder {
         };
 
         pub struct EncoderBuilder {
-            pub(crate) sequence_len: usize,
-            pub(crate) model_dimension: usize,
-            pub(crate) head_count: usize,
-            pub(crate) source_vocab_size: usize,
-            pub(crate) block_count: usize,
-            pub(crate) padding_token: usize,
-            pub(crate) rng: RngStrategy,
-            pub(crate) embedding_init_strategy: LayerInitStrategy,
-            pub(crate) feed_forward_init_strategy: LayerInitStrategy,
-            pub(crate) feed_forward_hidden_dimension: usize,
-            pub(crate) dropout_rate: NodeValue,
+            sequence_len: usize,
+            model_dimension: usize,
+            head_count: usize,
+            source_vocab_size: usize,
+            block_count: usize,
+            padding_token: usize,
+            rng: RngStrategy,
+            embedding_init_strategy: LayerInitStrategy,
+            feed_forward_init_strategy: LayerInitStrategy,
+            feed_forward_hidden_dimension: usize,
+            dropout_rate: NodeValue,
         }
 
         impl EncoderBuilder {
@@ -1284,14 +1310,15 @@ pub mod blocks {
 
         #[derive(Debug, Clone)]
         pub struct DecoderBlockBuilder {
-            pub(crate) sequence_len: usize,
-            pub(crate) model_dimension: usize,
-            pub(crate) head_count: usize,
-            pub(crate) cross_attention_head_count: usize,
-            pub(crate) rng: RngStrategy,
-            pub(crate) feed_forward_init_strategy: LayerInitStrategy,
-            pub(crate) feed_forward_hidden_dimension: usize,
-            pub(crate) dropout_rate: NodeValue,
+            sequence_len: usize,
+            model_dimension: usize,
+            head_count: usize,
+            cross_attention_head_count: usize,
+            rng: RngStrategy,
+            attention_dense_layer_init_strategy: LayerInitStrategy,
+            feed_forward_init_strategy: LayerInitStrategy,
+            feed_forward_hidden_dimension: usize,
+            dropout_rate: NodeValue,
         }
 
         impl DecoderBlockBuilder {
@@ -1307,6 +1334,7 @@ pub mod blocks {
                     head_count,
                     cross_attention_head_count,
                     rng: Default::default(),
+                    attention_dense_layer_init_strategy: LayerInitStrategy::KaimingZeroBias,
                     feed_forward_init_strategy: LayerInitStrategy::KaimingZeroBias,
                     feed_forward_hidden_dimension: 64,
                     dropout_rate: 0.1,
@@ -1318,12 +1346,14 @@ pub mod blocks {
                     self.sequence_len,
                     self.model_dimension,
                     self.head_count,
+                    &self.attention_dense_layer_init_strategy,
                     &self.rng,
                 );
                 let encoder_attention = MultiHeadCrossAttentionLayer::new(
                     self.sequence_len,
                     self.model_dimension,
                     self.cross_attention_head_count,
+                    &self.attention_dense_layer_init_strategy,
                     &self.rng,
                 );
                 let network = FeedForwardLayer::new(
@@ -1374,13 +1404,14 @@ pub mod blocks {
 
         #[derive(Debug, Clone)]
         pub struct EncoderBlockBuilder {
-            pub(crate) sequence_len: usize,
-            pub(crate) model_dimension: usize,
-            pub(crate) head_count: usize,
-            pub(crate) rng: RngStrategy,
-            pub(crate) feed_forward_init_strategy: LayerInitStrategy,
-            pub(crate) feed_forward_hidden_dimension: usize,
-            pub(crate) dropout_rate: NodeValue,
+            sequence_len: usize,
+            model_dimension: usize,
+            head_count: usize,
+            rng: RngStrategy,
+            attention_dense_layer_init_strategy: LayerInitStrategy,
+            feed_forward_init_strategy: LayerInitStrategy,
+            feed_forward_hidden_dimension: usize,
+            dropout_rate: NodeValue,
         }
 
         impl EncoderBlockBuilder {
@@ -1390,6 +1421,7 @@ pub mod blocks {
                     model_dimension,
                     head_count,
                     rng: Default::default(),
+                    attention_dense_layer_init_strategy: LayerInitStrategy::KaimingZeroBias,
                     feed_forward_init_strategy: LayerInitStrategy::KaimingZeroBias,
                     feed_forward_hidden_dimension: 64,
                     dropout_rate: 0.1,
@@ -1401,6 +1433,7 @@ pub mod blocks {
                     self.sequence_len,
                     self.model_dimension,
                     self.head_count,
+                    &self.attention_dense_layer_init_strategy,
                     &self.rng,
                 );
                 let network = FeedForwardLayer::new(
@@ -1467,6 +1500,7 @@ pub mod layers {
             sequence_len: usize,
             embedding_dimension: usize,
             head_count: usize,
+            dense_layer_init_strategy: &LayerInitStrategy,
             rng: &RngStrategy,
         ) -> Self {
             let attention =
@@ -1475,7 +1509,7 @@ pub mod layers {
             let dense_layer = Dense::new(
                 embedding_dimension,
                 embedding_dimension,
-                &LayerInitStrategy::KaimingZeroBias,
+                &dense_layer_init_strategy,
                 &rng,
             );
 
@@ -1550,6 +1584,7 @@ pub mod layers {
             sequence_len: usize,
             embedding_dimension: usize,
             head_count: usize,
+            dense_layer_init_strategy: &LayerInitStrategy,
             rng: &RngStrategy,
         ) -> Self {
             let attention =
@@ -1558,7 +1593,7 @@ pub mod layers {
             let dense_layer = Dense::new(
                 embedding_dimension,
                 embedding_dimension,
-                &LayerInitStrategy::KaimingZeroBias,
+                &dense_layer_init_strategy,
                 &rng,
             );
 
@@ -1727,13 +1762,13 @@ pub mod layers {
             strategy: &LayerInitStrategy,
             rng: &RngStrategy,
         ) -> Self {
-            let embeddings = iter::repeat_with(|| {
-                let mut linear = Linear::new(1, model_dimensions);
-                linear.initialize_as_layer(strategy, rng);
-                linear
-            })
-            .take(vocab_size)
-            .collect();
+            let mut linear = Linear::new(vocab_size, model_dimensions);
+            linear.initialize_as_layer(strategy, rng);
+            let embeddings = linear
+                .to_values()
+                .into_iter()
+                .map(|row| Linear::from_values(&[row]).unwrap())
+                .collect();
 
             Self {
                 embeddings,
@@ -2274,11 +2309,12 @@ pub mod attention {
             head_count: usize,
             rng: &RngStrategy,
         ) -> Self {
-            let head_dimension = embedding_dimension / head_count;
+            let strategy = LayerInitStrategy::FullRandom; // TODO: move to config? has big influence on init-time activations
+            let head_dim = embedding_dimension / head_count;
             Self {
-                key_weights: Self::new_kqv_linear(embedding_dimension, head_dimension, rng),
-                query_weights: Self::new_kqv_linear(embedding_dimension, head_dimension, rng),
-                value_weights: Self::new_kqv_linear(embedding_dimension, head_dimension, rng),
+                key_weights: Self::new_kqv_linear(embedding_dimension, head_dim, &strategy, rng),
+                query_weights: Self::new_kqv_linear(embedding_dimension, head_dim, &strategy, rng),
+                value_weights: Self::new_kqv_linear(embedding_dimension, head_dim, &strategy, rng),
                 mask: None,
                 embedding_dimension,
                 sequence_len,
@@ -2474,10 +2510,11 @@ pub mod attention {
         fn new_kqv_linear(
             embedding_dimension: usize,
             head_dimension: usize,
+            strategy: &LayerInitStrategy,
             rng: &RngStrategy,
         ) -> Linear {
             let mut linear = Linear::new(embedding_dimension, head_dimension);
-            linear.initialize_as_layer(&LayerInitStrategy::Kaiming, &rng);
+            linear.initialize_as_layer(&strategy, &rng);
             linear
         }
 
@@ -2534,10 +2571,12 @@ pub mod attention {
             let embed_dim = 12;
 
             let rng = RngStrategy::testable(1234);
+            let strategy = LayerInitStrategy::KaimingZeroBias;
 
             let inputs = new_inputs(seq_len, embed_dim, &rng);
             let inputs = Linear::from_values(&inputs).unwrap();
-            let attention_layer = MultiHeadSelfAttentionLayer::new(seq_len, embed_dim, 3, &rng);
+            let attention_layer =
+                MultiHeadSelfAttentionLayer::new(seq_len, embed_dim, 3, &strategy, &rng);
             let output = attention_layer.forward(&inputs).unwrap().to_values();
 
             assert_eq!(output.len(), seq_len);
@@ -2623,8 +2662,13 @@ pub mod attention {
 
             assert_optimisation_converges(
                 &move |rng| {
-                    let attention_layer =
-                        MultiHeadSelfAttentionLayer::new(seq_len, embed_dim, head_count, &rng);
+                    let attention_layer = MultiHeadSelfAttentionLayer::new(
+                        seq_len,
+                        embed_dim,
+                        head_count,
+                        &LayerInitStrategy::KaimingZeroBias,
+                        &rng,
+                    );
                     let inputs = new_linear(seq_len, embed_dim, &rng);
                     let target = new_linear(seq_len, embed_dim, &rng);
                     (attention_layer, inputs, target)
@@ -3288,7 +3332,7 @@ pub mod linear {
                         }
                     });
                     let sum = exp_iter.clone().sum::<NodeValue>();
-                    let sum = if sum != 0.0 {sum} else {1e-8};
+                    let sum = if sum != 0.0 { sum } else { 1e-8 };
                     exp_iter.map(move |x| x / sum)
                 })
                 .collect();
