@@ -648,11 +648,11 @@ pub mod layers {
 
     use crate::ml::NetworkActivationMode;
 
-    use super::{attention::SelfAttentionHead, gradients::LossGradients, *};
+    use super::{attention::MultiHeadAttention, gradients::LossGradients, *};
 
     #[derive(Debug)]
     pub struct MultiHeadSelfAttentionLayer {
-        heads: Vec<SelfAttentionHead>,
+        attention: MultiHeadAttention,
         dense_layer: Dense,
     }
 
@@ -663,21 +663,20 @@ pub mod layers {
             head_count: usize,
             rng: &RngStrategy,
         ) -> Self {
-            let heads = iter::repeat_with(|| {
-                SelfAttentionHead::new_head(sequence_len, embedding_dimension, head_count, rng)
-            })
-            .take(head_count)
-            .collect();
+            let attention =
+                MultiHeadAttention::new(sequence_len, embedding_dimension, head_count, rng);
 
-            let layer_strategy = LayerInitStrategy::KaimingZeroBias;
             let dense_layer = Dense::new(
                 embedding_dimension,
                 embedding_dimension,
-                &layer_strategy,
+                &LayerInitStrategy::KaimingZeroBias,
                 &rng,
             );
 
-            Self { heads, dense_layer }
+            Self {
+                attention,
+                dense_layer,
+            }
         }
 
         pub fn forward(&self, inputs: &Linear) -> Result<Linear> {
@@ -685,20 +684,7 @@ pub mod layers {
         }
 
         pub fn forward_with_mask(&self, inputs: &Linear, mask: Option<&Linear>) -> Result<Linear> {
-            let mut head_outputs = vec![];
-            for head in &self.heads {
-                let head_output = head.forward_advanced(inputs, inputs, inputs, mask)?;
-                head_outputs.push(head_output);
-            }
-
-            let attention_output = head_outputs
-                .into_iter()
-                .fold(None, |concat: Option<Linear>, head| match concat {
-                    Some(iter) => Some(iter.concat(&head).collect()),
-                    None => Some(head),
-                })
-                .unwrap();
-
+            let attention_output = self.attention.forward(inputs, inputs, inputs, mask)?;
             self.dense_layer.forward(&attention_output)
         }
 
@@ -712,43 +698,38 @@ pub mod layers {
             mask: Option<&Linear>,
             output_gradients: &Linear,
         ) -> Result<Linear> {
-            let mut dense_layer_input_gradients = vec![];
+            // Forward pass
+            let attention_output = self.attention.forward(inputs, inputs, inputs, mask)?;
 
-            // TODO: check this backward pass.. seems that inputs should be the attention head forward pass output
-            for (row, inputs) in output_gradients.rows_iter().zip(inputs.rows_iter()) {
-                let dense_output = self.dense_layer.backward(inputs.into(), row.into())?;
+            // Backward pass
+            let dense_input_grads = self
+                .dense_layer
+                .backward(&attention_output, &output_gradients)?;
 
-                dense_layer_input_gradients.push(dense_output);
-            }
+            let kqv_input_grads =
+                self.attention
+                    .backward(inputs, inputs, inputs, mask, &dense_input_grads)?;
 
-            let dense_layer_input_gradient = Linear::from_values(&dense_layer_input_gradients)?;
-            let head_output_gradients = dense_layer_input_gradient.split(self.heads.len());
-
-            let mut sum_inputs_grads: Option<Linear> = None;
-
-            for (head, output_gradients) in self.heads.iter_mut().zip(&head_output_gradients) {
-                let kqv_grads =
-                    head.backward_advanced(&inputs, &inputs, &inputs, mask, &output_gradients)?;
-
-                let (k_grads, q_grads, v_grads) = kqv_grads;
-                let summed_grads = k_grads.iter().add(q_grads.iter()).add(v_grads.iter());
-                let head_input_gradients = summed_grads.collect();
-
-                sum_inputs_grads = match &mut sum_inputs_grads {
-                    Some(sum) => Some(head_input_gradients.iter().add(sum.iter()).collect()),
-                    _ => Some(head_input_gradients),
-                };
-            }
-
-            Ok(sum_inputs_grads.unwrap())
+            self.sum_kqv_gradients(inputs, kqv_input_grads)
         }
 
         pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
             self.dense_layer.apply_gradients(learn_rate);
+            self.attention.apply_gradients(learn_rate);
+        }
 
-            for head in self.heads.iter_mut() {
-                head.apply_gradients(learn_rate);
+        fn sum_kqv_gradients(
+            &self,
+            inputs: &Linear,
+            kqv_input_grads: Vec<(Linear, Linear, Linear)>,
+        ) -> Result<Linear> {
+            let zero: Linear = Linear::with_dimensions(inputs);
+            let mut sum_inputs_grads = zero.iter();
+            for (k_grads, q_grads, v_grads) in &kqv_input_grads {
+                let sum = Linear::sum([k_grads, q_grads, v_grads].into_iter()).unwrap();
+                sum_inputs_grads = sum_inputs_grads.add(sum);
             }
+            Ok(sum_inputs_grads.collect())
         }
     }
 
@@ -799,11 +780,11 @@ pub mod layers {
 
                 let final_layer_gradients = self
                     .output_layer
-                    .backward(final_layer_inputs, output_gradients)?;
+                    .backward_row(final_layer_inputs, output_gradients)?;
 
                 let dense_input_gradients = self
                     .hidden_layer
-                    .backward(inputs.into(), final_layer_gradients)?;
+                    .backward_row(inputs.into(), final_layer_gradients)?;
 
                 output_layer_input_gradients.push(dense_input_gradients);
             }
@@ -1266,6 +1247,8 @@ pub mod layers {
 }
 
 pub mod attention {
+    use std::iter;
+
     use anyhow::{anyhow, Result};
 
     use crate::ml::{layer::LayerInitStrategy, NetworkActivationMode, NodeValue, RngStrategy};
@@ -1276,7 +1259,86 @@ pub mod attention {
     };
 
     #[derive(Debug)]
-    pub struct SelfAttentionHead {
+    pub struct MultiHeadAttention {
+        heads: Vec<AttentionHead>,
+    }
+
+    impl MultiHeadAttention {
+        pub fn new(
+            sequence_len: usize,
+            embedding_dimension: usize,
+            head_count: usize,
+            rng: &RngStrategy,
+        ) -> Self {
+            let heads = iter::repeat_with(|| {
+                AttentionHead::new_head(sequence_len, embedding_dimension, head_count, rng)
+            })
+            .take(head_count)
+            .collect();
+
+            Self { heads }
+        }
+
+        pub fn forward(
+            &self,
+            key_inputs: &Linear,
+            query_inputs: &Linear,
+            value_inputs: &Linear,
+            mask: Option<&Linear>,
+        ) -> Result<Linear> {
+            let mut head_outputs = vec![];
+            for head in &self.heads {
+                let head_output =
+                    head.forward_advanced(key_inputs, query_inputs, value_inputs, mask)?;
+                head_outputs.push(head_output);
+            }
+
+            let attention_output = head_outputs
+                .into_iter()
+                .fold(None, |concat: Option<Linear>, head| match concat {
+                    Some(iter) => Some(iter.concat(&head).collect()),
+                    None => Some(head),
+                })
+                .unwrap();
+
+            Ok(attention_output)
+        }
+
+        pub fn backward(
+            &mut self,
+            key_inputs: &Linear,
+            query_inputs: &Linear,
+            value_inputs: &Linear,
+            mask: Option<&Linear>,
+            output_gradients: &Linear,
+        ) -> Result<Vec<(Linear, Linear, Linear)>> {
+            let head_output_gradients = output_gradients.split(self.heads.len());
+
+            let mut kqv_input_grads = vec![];
+
+            for (head, output_gradients) in self.heads.iter_mut().zip(&head_output_gradients) {
+                let head_input_gradients = head.backward_advanced(
+                    key_inputs,
+                    query_inputs,
+                    value_inputs,
+                    mask,
+                    &output_gradients,
+                )?;
+                kqv_input_grads.push(head_input_gradients);
+            }
+
+            Ok(kqv_input_grads)
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            for head in self.heads.iter_mut() {
+                head.apply_gradients(learn_rate);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct AttentionHead {
         key_weights: Linear,
         query_weights: Linear,
         value_weights: Linear,
@@ -1286,7 +1348,7 @@ pub mod attention {
         gradients: Option<LossGradients>,
     }
 
-    impl SelfAttentionHead {
+    impl AttentionHead {
         pub fn new(sequence_len: usize, embedding_dimension: usize, rng: &RngStrategy) -> Self {
             Self::new_head(sequence_len, embedding_dimension, 1, rng)
         }
@@ -1336,7 +1398,7 @@ pub mod attention {
             let values = value_inputs.matrix_product(&self.value_weights);
 
             let mask = mask.or(self.mask.as_ref());
-            let output = SelfAttentionHead::scaled_self_attention(&keys, &queries, &values, mask);
+            let output = AttentionHead::scaled_attention(&keys, &queries, &values, mask);
 
             Ok(output)
         }
@@ -1369,7 +1431,7 @@ pub mod attention {
 
             let mask = mask.or(self.mask.as_ref());
             let (dkeys, dqueries, dvalues) =
-                Self::scaled_self_attention_d(&keys, &queries, &values, mask, &output_gradients)?;
+                Self::scaled_attention_d(&keys, &queries, &values, mask, &output_gradients)?;
 
             let dkey_weights = key_inputs.matrix_product_lhs_transposed(&dkeys);
             let dquery_weights = query_inputs.matrix_product_lhs_transposed(&dqueries);
@@ -1384,7 +1446,7 @@ pub mod attention {
             Ok((dkey_inputs, dvalue_inputs, dquery_inputs))
         }
 
-        fn scaled_self_attention(
+        fn scaled_attention(
             keys: &Linear,
             queries: &Linear,
             values: &Linear,
@@ -1408,7 +1470,7 @@ pub mod attention {
             attention_weights.matrix_product(&values)
         }
 
-        fn scaled_self_attention_d(
+        fn scaled_attention_d(
             keys: &Linear,
             queries: &Linear,
             values: &Linear,
@@ -1548,7 +1610,7 @@ pub mod attention {
 
             let inputs = new_inputs(seq_len, embed_dim, &rng);
             let inputs = Linear::from_values(&inputs).unwrap();
-            let attention_layer = SelfAttentionHead::new(seq_len, embed_dim, &rng);
+            let attention_layer = AttentionHead::new(seq_len, embed_dim, &rng);
             let output = attention_layer.forward(&inputs).unwrap().to_values();
 
             assert_eq!(output.len(), seq_len);
@@ -1582,7 +1644,7 @@ pub mod attention {
             let keys = new_linear(seq_len, embed_dim, &rng);
             let values = new_linear(seq_len, embed_dim, &rng);
 
-            let output = SelfAttentionHead::scaled_self_attention(&queries, &keys, &values, None);
+            let output = AttentionHead::scaled_attention(&queries, &keys, &values, None);
 
             assert_eq!(output.count(), seq_len);
             assert_eq!(output.stride(), embed_dim);
@@ -1598,7 +1660,7 @@ pub mod attention {
             let inputs = new_inputs(seq_len, embed_dim, &rng);
             let inputs = Linear::from_values(&inputs).unwrap();
 
-            let mut attention_layer = SelfAttentionHead::new(seq_len, embed_dim, &rng);
+            let mut attention_layer = AttentionHead::new(seq_len, embed_dim, &rng);
             let output = attention_layer.forward(&inputs).unwrap().to_values();
 
             let output_gradients = &new_linear(seq_len, embed_dim, &rng);
@@ -1623,7 +1685,7 @@ pub mod attention {
 
             assert_optimisation_converges(
                 &move |rng| {
-                    let attention_head = SelfAttentionHead::new(seq_len, embed_dim, &rng);
+                    let attention_head = AttentionHead::new(seq_len, embed_dim, &rng);
                     let inputs = new_linear(seq_len, embed_dim, &rng);
                     let target = new_linear(seq_len, embed_dim, &rng);
                     (attention_head, inputs, target)
@@ -1814,7 +1876,19 @@ pub mod dense {
             }
         }
 
-        pub fn backward(
+        // TODO: optimise by making backward_row the trivial impl and backward operate on Linear matrixes
+        pub fn backward(&mut self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
+            let mut input_gradients = vec![];
+
+            for (row, inputs) in output_gradients.rows_iter().zip(inputs.rows_iter()) {
+                let input_grads = self.backward_row(inputs.into(), row.into())?;
+                input_gradients.push(input_grads);
+            }
+
+            Linear::from_values(&input_gradients)
+        }
+
+        pub fn backward_row(
             &mut self,
             inputs: LayerValues,
             output_gradients: LayerValues,
@@ -2094,6 +2168,15 @@ pub mod linear {
                 .iter()
                 .enumerate()
                 .map(|(idx, x)| (x, idx % self.stride, idx / self.stride))
+        }
+
+        pub fn sum<'a, I: Iterator<Item = &'a Self> + 'a>(mut iter: I) -> Option<LinearIter<'a>> {
+            let first = iter.next()?;
+            let mut sum_iter = first.iter();
+            for x in iter {
+                sum_iter = sum_iter.add(x.iter());
+            }
+            Some(sum_iter)
         }
     }
 
