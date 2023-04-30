@@ -8,6 +8,496 @@ use self::{dense::Dense, linear::Linear};
 
 use super::{layer::LayerInitStrategy, NodeValue};
 
+pub mod decoder {
+    use anyhow::{Context, Result};
+
+    use crate::ml::NodeValue;
+
+    use super::{
+        blocks::DecoderBlock,
+        dense::Dense,
+        layers::{DropoutLayer, EmbeddingLayer, PositionalEmbeddingLayer},
+        linear::Linear,
+    };
+
+    pub struct Decoder {
+        blocks: Vec<DecoderBlock>,
+        token_embedding: EmbeddingLayer,
+        position_embedding: PositionalEmbeddingLayer,
+        dropout: DropoutLayer,
+        output_dense: Dense,
+        sequence_length: usize,
+        padding_token: usize,
+    }
+
+    impl Decoder {
+        pub fn new(
+            sequence_len: usize,
+            embedding_dimension: usize,
+            head_count: usize,
+            target_vocab_size: usize,
+        ) -> Self {
+            Self::new_builder(sequence_len, embedding_dimension, target_vocab_size)
+                .with_head_count(head_count)
+                .build()
+                .unwrap()
+        }
+
+        pub fn new_builder(
+            sequence_len: usize,
+            embedding_dimension: usize,
+            target_vocab_size: usize,
+        ) -> builder::DecoderBuilder {
+            builder::DecoderBuilder::new(sequence_len, embedding_dimension, target_vocab_size)
+        }
+
+        pub fn forward_training<T: AsRef<[usize]>>(
+            &self,
+            input_sequence: T,
+            encoder_output: Option<&Linear>,
+            encoder_mask: Option<&Linear>,
+        ) -> Result<Linear> {
+            let input_sequence = input_sequence.as_ref();
+            let (input_sequence, mask) = self.apply_input_padding(input_sequence);
+            let token_embeddings = self.token_embedding.forward(&input_sequence)?;
+            let position_embeddings = self.position_embedding.forward(0, input_sequence.len())?;
+            let mask = Some(&mask);
+
+            let embeddings = token_embeddings
+                .iter()
+                .add(position_embeddings.iter())
+                .collect();
+            let block_input = self.dropout.forward(&embeddings)?;
+
+            let mut block_output = block_input;
+            for block in &self.blocks {
+                let block_input = &block_output;
+                block_output = block.forward_training_with_mask(
+                    &block_input,
+                    encoder_output,
+                    mask,
+                    encoder_mask,
+                )?;
+            }
+
+            let output = self.output_dense.forward(&block_output)?;
+            Ok(output)
+        }
+
+        pub fn backward<T: AsRef<[usize]>>(
+            &mut self,
+            input_sequence: T,
+            encoder_output: Option<&Linear>,
+            encoder_mask: Option<&Linear>,
+            output_gradients: Linear,
+        ) -> Result<Option<Linear>> {
+            // forawrd pass
+            let input_sequence = input_sequence.as_ref();
+            let (input_sequence, mask) = self.apply_input_padding(input_sequence);
+            let token_embeddings = self.token_embedding.forward(&input_sequence)?;
+            let position_embeddings = self.position_embedding.forward(0, input_sequence.len())?;
+            let mask = Some(&mask);
+
+            let embeddings = token_embeddings
+                .iter()
+                .add(position_embeddings.iter())
+                .collect();
+            let block_input = embeddings.clone(); // self.dropout.forward(&embeddings)?;
+
+            let mut block_inputs = vec![block_input];
+            for block in &self.blocks {
+                let block_input = block_inputs.last().unwrap();
+                let block_output = block.forward_training_with_mask(
+                    &block_input,
+                    encoder_output,
+                    mask,
+                    encoder_mask,
+                )?;
+                block_inputs.push(block_output);
+            }
+            let block_output = block_inputs.last().unwrap();
+
+            // backward pass
+            let mut block_output_gradients = self
+                .output_dense
+                .backward(&block_output, &output_gradients)?;
+
+            let mut encoder_output_grads = vec![];
+            for (block, inputs) in self.blocks.iter_mut().zip(block_inputs.iter()).rev() {
+                let (block_input_gradients, encoder_output_gradients) = block.backward_with_mask(
+                    inputs,
+                    encoder_output,
+                    mask,
+                    encoder_mask,
+                    &block_output_gradients,
+                )?;
+                block_output_gradients = block_input_gradients;
+                encoder_output_grads.push(encoder_output_gradients);
+            }
+
+            let d_embeddings = block_output_gradients;
+            let d_token_embeddings = &d_embeddings;
+            let d_position_embeddings = &d_embeddings;
+
+            self.token_embedding
+                .backward(&input_sequence, &d_token_embeddings)?;
+
+            self.position_embedding
+                .backward(0, input_sequence.len(), &d_position_embeddings)?;
+
+            match encoder_output {
+                Some(encoder_output) => Ok(Some(
+                    self.sum_encoder_gradients(encoder_output, &encoder_output_grads)?,
+                )),
+                None => Ok(None),
+            }
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            for block in self.blocks.iter_mut() {
+                block.apply_gradients(learn_rate);
+            }
+            self.token_embedding.apply_gradients(learn_rate);
+            self.position_embedding.apply_gradients(learn_rate);
+            self.output_dense.apply_gradients(learn_rate);
+        }
+
+        fn apply_input_padding(&self, input_sequence: &[usize]) -> (Vec<usize>, Linear) {
+            EmbeddingLayer::pad_inputs(input_sequence, self.sequence_length, self.padding_token)
+        }
+
+        fn sum_encoder_gradients(
+            &self,
+            encoder_outputs: &Linear,
+            encoder_gradients: &Vec<Option<Linear>>,
+        ) -> Result<Linear> {
+            let zero: Linear = Linear::with_dimensions(encoder_outputs);
+            let mut sum_outputs_grads = zero.iter();
+            for outputs_grads in encoder_gradients.iter() {
+                let grads = outputs_grads
+                    .as_ref()
+                    .context("missing gradient for encoder")?;
+
+                sum_outputs_grads = sum_outputs_grads.add(grads.iter());
+            }
+            Ok(sum_outputs_grads.collect())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::ml::{
+            transformer::tests::helpers::{assert_optimisation_converges, new_linear},
+            RngStrategy,
+        };
+
+        use super::*;
+
+        #[test]
+        fn decoder_can_process_inputs() {
+            let seq_len = 3;
+            let embed_dim = 12;
+            let head_count = 3;
+            let hidden_dim = 48;
+            let vocab_size = 10;
+
+            let rng = RngStrategy::testable(1234);
+
+            let decoder = Decoder::new_builder(seq_len, embed_dim, vocab_size)
+                .with_head_count(head_count)
+                .with_feed_forward_hidden_dimension(hidden_dim)
+                .with_rng(rng)
+                .build()
+                .unwrap();
+
+            let inputs = [3, 6, 9];
+            let output = decoder.forward_training(&inputs, None, None).unwrap();
+            println!("outputs -> {output:#}");
+
+            let outputs = output.clone().to_values();
+            assert_eq!(outputs.len(), seq_len);
+            assert_eq!(outputs[0].len(), vocab_size);
+            assert!(output.is_finite());
+            assert_eq!(
+                outputs
+                    .iter()
+                    .flat_map(|x| x.iter())
+                    .map(|x| x.abs())
+                    .reduce(NodeValue::max)
+                    .unwrap()
+                    .max(3.0),
+                3.0,
+                "initial state is not diffuse"
+            );
+        }
+
+        #[test]
+        fn decoder_can_process_inputs_shorter_than_seq_len() {
+            let seq_len = 4;
+            let embed_dim = 12;
+            let head_count = 3;
+            let hidden_dim = 48;
+            let vocab_size = 10;
+
+            let rng = RngStrategy::testable(1234);
+
+            let decoder = Decoder::new_builder(seq_len, embed_dim, vocab_size)
+                .with_head_count(head_count)
+                .with_feed_forward_hidden_dimension(hidden_dim)
+                .with_rng(rng)
+                .build()
+                .unwrap();
+
+            let inputs = [3, 6, 9];
+            assert!(inputs.len() < seq_len);
+
+            let output = decoder.forward_training(&inputs, None, None).unwrap();
+            println!("outputs -> {output:#}");
+
+            let outputs = output.clone().to_values();
+            assert_eq!(outputs.len(), seq_len);
+            assert_eq!(outputs[0].len(), vocab_size);
+            assert!(output.is_finite());
+        }
+
+        #[test]
+        fn decoder_can_minimise() {
+            let seq_len = 3;
+            let embed_dim = 6;
+            let head_count = 2;
+            let hidden_dim = 8;
+            let vocab_size = 10;
+            let block_count = 6;
+
+            let learn_rate = 0.01;
+            let iters = 25;
+            let dummy_grads = Linear::new(1, 1);
+
+            assert_optimisation_converges(
+                &move |rng| {
+                    let decoder = Decoder::new_builder(seq_len, embed_dim, vocab_size)
+                        .with_head_count(head_count)
+                        .with_block_count(block_count)
+                        .with_feed_forward_hidden_dimension(hidden_dim)
+                        .with_rng(rng.clone())
+                        .with_dropout_rate(0.0) // TODO: reenable dropout once relate TODOs are completed
+                        .build()
+                        .unwrap();
+                    let inputs = [3, 6, 9];
+                    let target = new_linear(seq_len, vocab_size, &rng);
+                    (decoder, inputs, target)
+                },
+                &move |decoder, inputs| decoder.forward_training(&inputs, None, None).unwrap(),
+                &move |decoder, inputs, dloss| {
+                    decoder.backward(&inputs, None, None, dloss).unwrap();
+                    decoder.apply_gradients(learn_rate);
+                    dummy_grads.clone()
+                },
+                iters,
+            );
+        }
+
+        #[test]
+        fn decoder_can_minimise_with_encoder_outputs() {
+            let seq_len = 3;
+            let embed_dim = 6;
+            let head_count = 2;
+            let hidden_dim = 8;
+            let vocab_size = 10;
+            let block_count = 6;
+
+            let learn_rate = 0.01;
+            let iters = 25;
+
+            assert_optimisation_converges(
+                &move |rng| {
+                    let decoder = Decoder::new_builder(seq_len, embed_dim, vocab_size)
+                        .with_head_count(head_count)
+                        .with_block_count(block_count)
+                        .with_feed_forward_hidden_dimension(hidden_dim)
+                        .with_rng(rng.clone())
+                        .with_dropout_rate(0.0) // TODO: reenable dropout once relate TODOs are completed
+                        .build()
+                        .unwrap();
+                    let inputs = [3, 6, 9];
+                    let target = new_linear(seq_len, vocab_size, &rng);
+                    let encoder_outputs = new_linear(seq_len, embed_dim, &rng);
+                    (decoder, (inputs, encoder_outputs), target)
+                },
+                &move |decoder, (inputs, encoder_outputs)| decoder.forward_training(&inputs, Some(encoder_outputs), None).unwrap(),
+                &move |decoder, (inputs, encoder_outputs), dloss| {
+                    let encoder_grads = decoder.backward(&inputs, Some(encoder_outputs), None, dloss).unwrap().unwrap();
+                    decoder.apply_gradients(learn_rate);
+                    *encoder_outputs = encoder_outputs.iter().apply_gradients(encoder_grads.iter(), learn_rate);
+                    encoder_grads
+                },
+                iters,
+            );
+        }
+    }
+
+    pub mod builder {
+        use anyhow::{anyhow, Result};
+
+        use super::{super::layers::DropoutLayer, Decoder};
+
+        use crate::ml::{
+            layer::LayerInitStrategy,
+            transformer::{
+                blocks::DecoderBlock,
+                dense::Dense,
+                layers::{EmbeddingLayer, PositionalEmbeddingLayer},
+            },
+            NodeValue, RngStrategy,
+        };
+
+        pub struct DecoderBuilder {
+            pub(crate) sequence_len: usize,
+            pub(crate) model_dimension: usize,
+            pub(crate) head_count: usize,
+            pub(crate) target_vocab_size: usize,
+            pub(crate) block_count: usize,
+            pub(crate) padding_token: usize,
+            pub(crate) rng: RngStrategy,
+            pub(crate) embedding_init_strategy: LayerInitStrategy,
+            pub(crate) output_dense_init_strategy: LayerInitStrategy,
+            pub(crate) feed_forward_init_strategy: LayerInitStrategy,
+            pub(crate) feed_forward_hidden_dimension: usize,
+            pub(crate) dropout_rate: NodeValue,
+        }
+
+        impl DecoderBuilder {
+            pub fn new(
+                sequence_len: usize,
+                model_dimension: usize,
+                target_vocab_size: usize,
+            ) -> Self {
+                Self {
+                    sequence_len,
+                    model_dimension,
+                    head_count: 3,
+                    target_vocab_size,
+                    block_count: 6,
+                    padding_token: 0,
+                    rng: Default::default(),
+                    embedding_init_strategy: LayerInitStrategy::KaimingZeroBias,
+                    output_dense_init_strategy: LayerInitStrategy::KaimingZeroBias,
+                    feed_forward_init_strategy: LayerInitStrategy::KaimingZeroBias,
+                    feed_forward_hidden_dimension: 64,
+                    dropout_rate: 0.1,
+                }
+            }
+
+            pub fn build(self) -> Result<Decoder> {
+                if self.model_dimension % self.block_count != 0 {
+                    Err(anyhow!("block_count is not a factor of model_dimension"))?;
+                }
+                let block_builder = DecoderBlock::new_builder(
+                    self.sequence_len,
+                    self.model_dimension,
+                    self.head_count,
+                    self.head_count,
+                );
+                let block_builder = block_builder
+                    .with_rng(self.rng.clone())
+                    .with_dropout_rate(self.dropout_rate)
+                    .with_feed_forward_hidden_dimension(self.feed_forward_hidden_dimension)
+                    .with_feed_forward_init_strategy(self.feed_forward_init_strategy);
+
+                let mut blocks = vec![];
+                for _ in 0..self.block_count {
+                    let block_builder = block_builder.clone();
+                    let block = block_builder.build();
+                    blocks.push(block);
+                }
+                let token_embedding = EmbeddingLayer::new(
+                    self.model_dimension,
+                    self.target_vocab_size,
+                    &self.embedding_init_strategy,
+                    &self.rng,
+                );
+                let position_embedding = PositionalEmbeddingLayer::new(
+                    self.model_dimension,
+                    self.sequence_len,
+                    &self.embedding_init_strategy,
+                    &self.rng,
+                );
+                let dropout = DropoutLayer::new(self.dropout_rate, &self.rng);
+                let output_dense = Dense::new(
+                    self.model_dimension,
+                    self.target_vocab_size,
+                    &self.output_dense_init_strategy,
+                    &self.rng,
+                );
+
+                Ok(Decoder {
+                    blocks,
+                    token_embedding,
+                    position_embedding,
+                    dropout,
+                    output_dense,
+                    sequence_length: self.sequence_len,
+                    padding_token: self.padding_token,
+                })
+            }
+
+            pub fn with_rng(mut self, rng: RngStrategy) -> Self {
+                self.rng = rng;
+                self
+            }
+
+            pub fn with_embedding_init_strategy(
+                mut self,
+                init_strategy: LayerInitStrategy,
+            ) -> Self {
+                self.embedding_init_strategy = init_strategy;
+                self
+            }
+
+            pub fn with_output_dense_init_strategy(
+                mut self,
+                init_strategy: LayerInitStrategy,
+            ) -> Self {
+                self.output_dense_init_strategy = init_strategy;
+                self
+            }
+
+            pub fn with_feed_forward_init_strategy(
+                mut self,
+                init_strategy: LayerInitStrategy,
+            ) -> Self {
+                self.feed_forward_init_strategy = init_strategy;
+                self
+            }
+
+            pub fn with_feed_forward_hidden_dimension(mut self, hidden_dimension: usize) -> Self {
+                self.feed_forward_hidden_dimension = hidden_dimension;
+                self
+            }
+
+            pub fn with_dropout_rate(mut self, dropout_rate: NodeValue) -> Self {
+                self.dropout_rate = dropout_rate;
+                self
+            }
+
+            pub fn with_block_count(mut self, block_count: usize) -> Self {
+                self.block_count = block_count;
+                self
+            }
+
+            pub fn with_head_count(mut self, head_count: usize) -> Self {
+                self.head_count = head_count;
+                self
+            }
+
+            pub fn with_padding_token(mut self, padding_token: usize) -> Self {
+                self.padding_token = padding_token;
+                self
+            }
+        }
+    }
+}
+
 pub mod encoder {
     use anyhow::Result;
 
@@ -87,7 +577,7 @@ pub mod encoder {
                 .iter()
                 .add(position_embeddings.iter())
                 .collect();
-            let block_input = self.dropout.forward(&embeddings)?;
+            let block_input = embeddings.clone(); // self.dropout.forward(&embeddings)?;
 
             let mut block_inputs = vec![block_input];
             for block in &self.blocks {
@@ -160,9 +650,10 @@ pub mod encoder {
             let output = encoder.forward_training(&inputs).unwrap();
             println!("outputs -> {output:#}");
 
-            let output = output.to_values();
-            assert_eq!(output.len(), seq_len);
-            assert_eq!(output[0].len(), embed_dim);
+            let outputs = output.clone().to_values();
+            assert_eq!(outputs.len(), seq_len);
+            assert_eq!(outputs[0].len(), vocab_size);
+            assert!(output.is_finite());
         }
 
         #[test]
@@ -188,9 +679,10 @@ pub mod encoder {
             let output = encoder.forward_training(&inputs).unwrap();
             println!("outputs -> {output:#}");
 
-            let output = output.to_values();
-            assert_eq!(output.len(), seq_len);
-            assert_eq!(output[0].len(), embed_dim);
+            let outputs = output.clone().to_values();
+            assert_eq!(outputs.len(), seq_len);
+            assert_eq!(outputs[0].len(), vocab_size);
+            assert!(output.is_finite());
         }
 
         #[test]
@@ -379,9 +871,232 @@ pub mod blocks {
     use crate::ml::NodeValue;
 
     use super::{
-        layers::{DropoutLayer, FeedForwardLayer, LayerNormalization, MultiHeadSelfAttentionLayer},
+        layers::{
+            DropoutLayer, FeedForwardLayer, LayerNormalization, MultiHeadCrossAttentionLayer,
+            MultiHeadSelfAttentionLayer,
+        },
         linear::Linear,
     };
+
+    #[derive(Debug)]
+    pub struct DecoderBlock {
+        self_attention: MultiHeadSelfAttentionLayer,
+        encoder_attention: MultiHeadCrossAttentionLayer,
+        network: FeedForwardLayer,
+        dropout: (DropoutLayer, DropoutLayer, DropoutLayer),
+        layer_norm: (LayerNormalization, LayerNormalization, LayerNormalization),
+    }
+
+    impl DecoderBlock {
+        pub fn new(
+            sequence_len: usize,
+            embedding_dimension: usize,
+            head_count: usize,
+            cross_attention_head_count: usize,
+        ) -> Self {
+            Self::new_builder(
+                sequence_len,
+                embedding_dimension,
+                head_count,
+                cross_attention_head_count,
+            )
+            .build()
+        }
+
+        pub fn new_builder(
+            sequence_len: usize,
+            embedding_dimension: usize,
+            head_count: usize,
+            cross_attention_head_count: usize,
+        ) -> builder::DecoderBlockBuilder {
+            builder::DecoderBlockBuilder::new(
+                sequence_len,
+                embedding_dimension,
+                head_count,
+                cross_attention_head_count,
+            )
+        }
+
+        pub fn forward_training(
+            &self,
+            inputs: &Linear,
+            encoder_output: Option<&Linear>,
+        ) -> Result<Linear> {
+            self.forward_training_with_mask(inputs, encoder_output, None, None)
+        }
+
+        pub fn forward_training_with_mask(
+            &self,
+            inputs: &Linear,
+            encoder_output: Option<&Linear>,
+            mask: Option<&Linear>,
+            encoder_mask: Option<&Linear>,
+        ) -> Result<Linear> {
+            let self_attention_output = self.self_attention.forward_with_mask(&inputs, mask)?;
+            let self_attention_output = self.dropout.0.forward(&self_attention_output)?;
+
+            let skip_self_attention_output =
+                self_attention_output.iter().add(inputs.iter()).collect();
+            let decoder_attention_inputs =
+                self.layer_norm.0.forward(&skip_self_attention_output)?;
+
+            let ff_network_inputs = match encoder_output {
+                Some(encoder_output) => {
+                    let encoder_attention_output = self.encoder_attention.forward_with_mask(
+                        &encoder_output,
+                        &decoder_attention_inputs,
+                        encoder_mask,
+                    )?;
+                    let encoder_attention_output =
+                        self.dropout.1.forward(&encoder_attention_output)?;
+
+                    let skip_encoder_attention_output = encoder_attention_output
+                        .iter()
+                        .add(decoder_attention_inputs.iter())
+                        .collect();
+
+                    self.layer_norm.1.forward(&skip_encoder_attention_output)?
+                }
+                None => decoder_attention_inputs,
+            };
+
+            let ff_network_output = self.network.forward(&ff_network_inputs)?;
+            let ff_network_output = self.dropout.2.forward(&ff_network_output)?;
+
+            let skip_ff_output = ff_network_output
+                .iter()
+                .add(ff_network_inputs.iter())
+                .collect();
+            let decoder_output = self.layer_norm.2.forward(&skip_ff_output)?;
+
+            Ok(decoder_output)
+        }
+
+        pub fn backward(
+            &mut self,
+            inputs: &Linear,
+            encoder_output: Option<&Linear>,
+            output_gradients: &Linear,
+        ) -> Result<(Linear, Option<Linear>)> {
+            self.backward_with_mask(inputs, encoder_output, None, None, output_gradients)
+        }
+
+        pub fn backward_with_mask(
+            &mut self,
+            inputs: &Linear,
+            encoder_output: Option<&Linear>,
+            mask: Option<&Linear>,
+            encoder_mask: Option<&Linear>,
+            output_gradients: &Linear,
+        ) -> Result<(Linear, Option<Linear>)> {
+            // forward pass
+            let self_attention_output = self.self_attention.forward_with_mask(&inputs, mask)?;
+            let skip_self_attention_output =
+                self_attention_output.iter().add(inputs.iter()).collect();
+            let decoder_attention_inputs =
+                self.layer_norm.0.forward(&skip_self_attention_output)?;
+
+            let ff_network_inputs = match encoder_output {
+                Some(encoder_output) => {
+                    let encoder_attention_output = self.encoder_attention.forward_with_mask(
+                        &encoder_output,
+                        &decoder_attention_inputs,
+                        encoder_mask,
+                    )?;
+                    let skip_encoder_attention_output = encoder_attention_output
+                        .iter()
+                        .add(decoder_attention_inputs.iter())
+                        .collect();
+                    self.layer_norm.1.forward(&skip_encoder_attention_output)?
+                }
+                None => decoder_attention_inputs.clone(),
+            };
+
+            let ff_network_output = self.network.forward(&ff_network_inputs)?;
+            let skip_ff_output = ff_network_output
+                .iter()
+                .add(ff_network_inputs.iter())
+                .collect();
+
+            // backward pass
+            let d_skip_ff_output = self
+                .layer_norm
+                .2
+                .backward(&skip_ff_output, &output_gradients)?;
+
+            // TODO: add dropouts backward pass
+            let d_ff_network_output = &d_skip_ff_output;
+
+            let ff_gradients = self
+                .network
+                .backward(&ff_network_inputs, &d_ff_network_output)?;
+
+            let d_ff_network_inputs = d_skip_ff_output.iter().add(ff_gradients.iter()).collect();
+
+            let (d_decoder_attention_inputs, d_encoder_output) = match encoder_output {
+                Some(encoder_output) => {
+                    // forward pass
+                    let encoder_attention_output = self.encoder_attention.forward_with_mask(
+                        &encoder_output,
+                        &decoder_attention_inputs,
+                        encoder_mask,
+                    )?;
+                    let skip_encoder_attention_output = encoder_attention_output
+                        .iter()
+                        .add(decoder_attention_inputs.iter())
+                        .collect();
+
+                    let d_skip_encoder_attention_output = self
+                        .layer_norm
+                        .1
+                        .backward(&skip_encoder_attention_output, &d_ff_network_inputs)?;
+                    let d_encoder_attention_output = &d_skip_encoder_attention_output;
+                    let encoder_kv_q_attention_grads = self.encoder_attention.backward_with_mask(
+                        &encoder_output,
+                        &decoder_attention_inputs,
+                        encoder_mask,
+                        d_encoder_attention_output,
+                    )?;
+
+                    let (d_encoder_output, attention_gradients) = encoder_kv_q_attention_grads;
+                    (
+                        d_skip_encoder_attention_output
+                            .iter()
+                            .add(attention_gradients.iter())
+                            .collect(),
+                        Some(d_encoder_output),
+                    )
+                }
+                None => (d_ff_network_inputs, None),
+            };
+
+            let d_skip_self_attention_output = self
+                .layer_norm
+                .0
+                .backward(&skip_self_attention_output, &d_decoder_attention_inputs)?;
+            let d_self_attention_output = &d_skip_self_attention_output;
+
+            let attention_gradients =
+                self.self_attention
+                    .backward_with_mask(&inputs, mask, &d_self_attention_output)?;
+
+            let d_inputs = d_skip_self_attention_output
+                .iter()
+                .add(attention_gradients.iter())
+                .collect();
+
+            Ok((d_inputs, d_encoder_output))
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            self.self_attention.apply_gradients(learn_rate);
+            self.encoder_attention.apply_gradients(learn_rate);
+            self.network.apply_gradients(learn_rate);
+            self.layer_norm.0.apply_gradients(learn_rate);
+            self.layer_norm.1.apply_gradients(learn_rate);
+            self.layer_norm.2.apply_gradients(learn_rate);
+        }
+    }
 
     #[derive(Debug)]
     pub struct EncoderBlock {
@@ -558,13 +1273,104 @@ pub mod blocks {
     mod builder {
         use super::{
             super::layers::{DropoutLayer, FeedForwardLayer, LayerNormalization},
-            EncoderBlock,
+            DecoderBlock, EncoderBlock,
         };
 
         use crate::ml::{
-            layer::LayerInitStrategy, transformer::layers::MultiHeadSelfAttentionLayer, NodeValue,
-            RngStrategy,
+            layer::LayerInitStrategy,
+            transformer::layers::{MultiHeadCrossAttentionLayer, MultiHeadSelfAttentionLayer},
+            NodeValue, RngStrategy,
         };
+
+        #[derive(Debug, Clone)]
+        pub struct DecoderBlockBuilder {
+            pub(crate) sequence_len: usize,
+            pub(crate) model_dimension: usize,
+            pub(crate) head_count: usize,
+            pub(crate) cross_attention_head_count: usize,
+            pub(crate) rng: RngStrategy,
+            pub(crate) feed_forward_init_strategy: LayerInitStrategy,
+            pub(crate) feed_forward_hidden_dimension: usize,
+            pub(crate) dropout_rate: NodeValue,
+        }
+
+        impl DecoderBlockBuilder {
+            pub fn new(
+                sequence_len: usize,
+                model_dimension: usize,
+                head_count: usize,
+                cross_attention_head_count: usize,
+            ) -> Self {
+                Self {
+                    sequence_len,
+                    model_dimension,
+                    head_count,
+                    cross_attention_head_count,
+                    rng: Default::default(),
+                    feed_forward_init_strategy: LayerInitStrategy::KaimingZeroBias,
+                    feed_forward_hidden_dimension: 64,
+                    dropout_rate: 0.1,
+                }
+            }
+
+            pub fn build(self) -> DecoderBlock {
+                let self_attention = MultiHeadSelfAttentionLayer::new(
+                    self.sequence_len,
+                    self.model_dimension,
+                    self.head_count,
+                    &self.rng,
+                );
+                let encoder_attention = MultiHeadCrossAttentionLayer::new(
+                    self.sequence_len,
+                    self.model_dimension,
+                    self.cross_attention_head_count,
+                    &self.rng,
+                );
+                let network = FeedForwardLayer::new(
+                    self.model_dimension,
+                    self.feed_forward_hidden_dimension,
+                    &self.feed_forward_init_strategy,
+                    &self.rng,
+                );
+                let dropout1 = DropoutLayer::new(self.dropout_rate, &self.rng);
+                let dropout2 = DropoutLayer::new(self.dropout_rate, &self.rng);
+                let dropout3 = DropoutLayer::new(self.dropout_rate, &self.rng);
+                let layer_norm1 = LayerNormalization::new(self.sequence_len);
+                let layer_norm2 = LayerNormalization::new(self.sequence_len);
+                let layer_norm3 = LayerNormalization::new(self.sequence_len);
+
+                DecoderBlock {
+                    self_attention,
+                    encoder_attention,
+                    network,
+                    dropout: (dropout1, dropout2, dropout3),
+                    layer_norm: (layer_norm1, layer_norm2, layer_norm3),
+                }
+            }
+
+            pub fn with_rng(mut self, rng: RngStrategy) -> Self {
+                self.rng = rng;
+                self
+            }
+
+            pub fn with_feed_forward_init_strategy(
+                mut self,
+                init_strategy: LayerInitStrategy,
+            ) -> Self {
+                self.feed_forward_init_strategy = init_strategy;
+                self
+            }
+
+            pub fn with_feed_forward_hidden_dimension(mut self, hidden_dimension: usize) -> Self {
+                self.feed_forward_hidden_dimension = hidden_dimension;
+                self
+            }
+
+            pub fn with_dropout_rate(mut self, dropout_rate: NodeValue) -> Self {
+                self.dropout_rate = dropout_rate;
+                self
+            }
+        }
 
         #[derive(Debug, Clone)]
         pub struct EncoderBlockBuilder {
@@ -730,6 +1536,115 @@ pub mod layers {
                 sum_inputs_grads = sum_inputs_grads.add(sum);
             }
             Ok(sum_inputs_grads.collect())
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct MultiHeadCrossAttentionLayer {
+        attention: MultiHeadAttention,
+        dense_layer: Dense,
+    }
+
+    impl MultiHeadCrossAttentionLayer {
+        pub fn new(
+            sequence_len: usize,
+            embedding_dimension: usize,
+            head_count: usize,
+            rng: &RngStrategy,
+        ) -> Self {
+            let attention =
+                MultiHeadAttention::new(sequence_len, embedding_dimension, head_count, rng);
+
+            let dense_layer = Dense::new(
+                embedding_dimension,
+                embedding_dimension,
+                &LayerInitStrategy::KaimingZeroBias,
+                &rng,
+            );
+
+            Self {
+                attention,
+                dense_layer,
+            }
+        }
+
+        pub fn forward(&self, kv_inputs: &Linear, q_inputs: &Linear) -> Result<Linear> {
+            self.forward_with_mask(kv_inputs, q_inputs, None)
+        }
+
+        pub fn forward_with_mask(
+            &self,
+            kv_inputs: &Linear,
+            q_inputs: &Linear,
+            mask: Option<&Linear>,
+        ) -> Result<Linear> {
+            let attention_output = self
+                .attention
+                .forward(kv_inputs, q_inputs, kv_inputs, mask)?;
+            self.dense_layer.forward(&attention_output)
+        }
+
+        pub fn backward(
+            &mut self,
+            kv_inputs: &Linear,
+            q_inputs: &Linear,
+            output_gradients: &Linear,
+        ) -> Result<(Linear, Linear)> {
+            self.backward_with_mask(kv_inputs, q_inputs, None, output_gradients)
+        }
+
+        pub fn backward_with_mask(
+            &mut self,
+            kv_inputs: &Linear,
+            q_inputs: &Linear,
+            mask: Option<&Linear>,
+            output_gradients: &Linear,
+        ) -> Result<(Linear, Linear)> {
+            // Forward pass
+            let attention_output = self
+                .attention
+                .forward(kv_inputs, q_inputs, kv_inputs, mask)?;
+
+            // Backward pass
+            let dense_input_grads = self
+                .dense_layer
+                .backward(&attention_output, &output_gradients)?;
+
+            let kqv_input_grads = self.attention.backward(
+                kv_inputs,
+                q_inputs,
+                kv_inputs,
+                mask,
+                &dense_input_grads,
+            )?;
+
+            self.sum_kv_q_gradients(kv_inputs, kqv_input_grads)
+        }
+
+        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+            self.dense_layer.apply_gradients(learn_rate);
+            self.attention.apply_gradients(learn_rate);
+        }
+
+        fn sum_kv_q_gradients(
+            &self,
+            inputs: &Linear,
+            kqv_input_grads: Vec<(Linear, Linear, Linear)>,
+        ) -> Result<(Linear, Linear)> {
+            let zero: Linear = Linear::with_dimensions(inputs);
+            let mut sum_kv_inputs_grads = zero.iter();
+            let mut sum_q_inputs_grads = zero.iter();
+
+            for (k_grads, q_grads, v_grads) in &kqv_input_grads {
+                let sum_kv = Linear::sum([k_grads, v_grads].into_iter()).unwrap();
+                sum_kv_inputs_grads = sum_kv_inputs_grads.add(sum_kv);
+                sum_q_inputs_grads = sum_q_inputs_grads.add(q_grads.iter());
+            }
+
+            let kv_inputs_grads = sum_kv_inputs_grads.collect();
+            let q_inputs_grads = sum_q_inputs_grads.collect();
+
+            Ok((kv_inputs_grads, q_inputs_grads))
         }
     }
 
@@ -1452,11 +2367,9 @@ pub mod attention {
             values: &Linear,
             mask: Option<&Linear>,
         ) -> Linear {
-            let attention_scores = queries.iter().matrix_transpose_product(keys.iter());
-
-            let scaled_attention_scores = attention_scores
-                .iter()
-                .multiply_scalar(1.0 / keys.count() as NodeValue);
+            let attention_scores = queries.matrix_product_rhs_transposed(&keys);
+            let scale_factor = (keys.count() as NodeValue).powf(-0.5);
+            let scaled_attention_scores = attention_scores.iter().multiply_scalar(scale_factor);
 
             let masked_attention_scores = match mask {
                 Some(mask) => {
@@ -1478,11 +2391,9 @@ pub mod attention {
             output_gradients: &Linear,
         ) -> Result<(Linear, Linear, Linear)> {
             // forward pass
-            let attention_scores = queries.iter().matrix_transpose_product(keys.iter());
-
-            let scaled_attention_scores = attention_scores
-                .iter()
-                .multiply_scalar(1.0 / keys.count() as NodeValue);
+            let attention_scores = queries.matrix_product_rhs_transposed(&keys);
+            let scale_factor = (keys.count() as NodeValue).powf(-0.5);
+            let scaled_attention_scores = attention_scores.iter().multiply_scalar(scale_factor);
 
             let mask = mask.map(|mask| mask.iter().grow(attention_scores.stride()).collect());
             let masked_attention_scores = match &mask {
@@ -2369,8 +3280,15 @@ pub mod linear {
                         .max_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
                         .cloned()
                         .unwrap_or_default();
-                    let exp_iter = chunk.into_iter().map(move |x| (x - max).exp());
-                    let sum: NodeValue = exp_iter.clone().sum();
+                    let exp_iter = chunk.into_iter().map(move |x| {
+                        if x != NodeValue::NEG_INFINITY {
+                            (x - max).exp()
+                        } else {
+                            0.0
+                        }
+                    });
+                    let sum = exp_iter.clone().sum::<NodeValue>();
+                    let sum = if sum != 0.0 {sum} else {1e-8};
                     exp_iter.map(move |x| x / sum)
                 })
                 .collect();
@@ -2559,8 +3477,13 @@ pub mod linear {
 
         #[test]
         fn can_linear_perform_masked_softmax() {
-            let x = Linear::from_iter(2, [1.0, 1.0, 0.0, 0.0, 100.0, 100.0].into_iter()).unwrap();
-            let mask = Linear::from_iter(2, [1.0, 0.0, 1.0, 1.0, 0.0, 1.0].into_iter()).unwrap();
+            let x = Linear::from_iter(
+                2,
+                [-1.0, 1.0, 0.0, 0.0, 25.0, 175.0, -25.0, -75.0].into_iter(),
+            )
+            .unwrap();
+            let mask =
+                Linear::from_iter(2, [1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0].into_iter()).unwrap();
 
             let y = x
                 .iter()
@@ -2568,7 +3491,7 @@ pub mod linear {
                 .softmax();
 
             let expected =
-                Linear::from_iter(2, [1.0, 0.0, 0.5, 0.5, 0.0, 1.0].into_iter()).unwrap();
+                Linear::from_iter(2, [1.0, 0.0, 0.5, 0.5, 0.0, 1.0, 0.0, 0.0].into_iter()).unwrap();
             assert_eq!(expected, y);
         }
     }
