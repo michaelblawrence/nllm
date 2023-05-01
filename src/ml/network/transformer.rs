@@ -1,21 +1,12 @@
-use anyhow::anyhow;
-
-use crate::ml::RngStrategy;
-
-use self::{dense::Dense, linear::Linear};
-
-use super::{layer::LayerInitStrategy, NodeValue};
-
 pub mod decoder {
     use anyhow::{Context, Result};
-
-    use crate::ml::NodeValue;
 
     use super::{
         blocks::DecoderBlock,
         dense::Dense,
         layers::{DropoutLayer, EmbeddingLayer, PositionalEmbeddingLayer},
         linear::Linear,
+        solver::source::OptimizerSource,
     };
 
     pub struct Decoder {
@@ -151,13 +142,15 @@ pub mod decoder {
             }
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
             for block in self.blocks.iter_mut() {
-                block.apply_gradients(learn_rate);
+                block.apply_gradients(optimizer)?;
             }
-            self.token_embedding.apply_gradients(learn_rate);
-            self.position_embedding.apply_gradients(learn_rate);
-            self.output_dense.apply_gradients(learn_rate);
+            self.token_embedding.apply_gradients(optimizer)?;
+            self.position_embedding.apply_gradients(optimizer)?;
+            self.output_dense.apply_gradients(optimizer)?;
+
+            Ok(())
         }
 
         fn apply_input_padding(&self, input_sequence: &[usize]) -> (Vec<usize>, Linear) {
@@ -184,9 +177,15 @@ pub mod decoder {
 
     #[cfg(test)]
     mod tests {
-        use crate::ml::{
-            transformer::tests::helpers::{assert_optimisation_converges, new_linear},
-            RngStrategy,
+        use crate::{
+            lazy_opt,
+            ml::{
+                transformer::{
+                    solver::{self, Optimizer},
+                    tests::helpers::{assert_optimisation_converges, new_linear},
+                },
+                NodeValue, RngStrategy,
+            },
         };
 
         use super::*;
@@ -273,6 +272,7 @@ pub mod decoder {
             let learn_rate = 0.01;
             let iters = 25;
             let dummy_grads = Linear::new(1, 1);
+            let optimizer = solver::SGDOptimizer::new_cache(learn_rate);
 
             assert_optimisation_converges(
                 &move |rng| {
@@ -291,7 +291,7 @@ pub mod decoder {
                 &move |decoder, inputs| decoder.forward_training(&inputs, None, None).unwrap(),
                 &move |decoder, inputs, dloss| {
                     decoder.backward(&inputs, None, None, dloss).unwrap();
-                    decoder.apply_gradients(learn_rate);
+                    decoder.apply_gradients(&optimizer).unwrap();
                     dummy_grads.clone()
                 },
                 iters,
@@ -307,7 +307,7 @@ pub mod decoder {
             let vocab_size = 10;
             let block_count = 6;
 
-            let learn_rate = 0.01;
+            let optimizer = solver::SGDOptimizer::new_cache(0.001);
             let iters = 25;
 
             assert_optimisation_converges(
@@ -335,10 +335,10 @@ pub mod decoder {
                         .backward(&inputs, Some(encoder_outputs), None, dloss)
                         .unwrap()
                         .unwrap();
-                    decoder.apply_gradients(learn_rate);
-                    *encoder_outputs = encoder_outputs
-                        .iter()
-                        .apply_gradients(encoder_grads.iter(), learn_rate);
+
+                    let mut opt = lazy_opt!(optimizer);
+                    decoder.apply_gradients(&optimizer).unwrap();
+                    opt.update(encoder_outputs, &encoder_grads).unwrap();
                     encoder_grads
                 },
                 iters,
@@ -399,8 +399,8 @@ pub mod decoder {
             }
 
             pub fn build(self) -> Result<Decoder> {
-                if self.model_dimension % self.block_count != 0 {
-                    Err(anyhow!("block_count is not a factor of model_dimension"))?;
+                if self.model_dimension % self.head_count != 0 {
+                    Err(anyhow!("head_count is not a factor of model_dimension"))?;
                 }
                 let block_builder = DecoderBlock::new_builder(
                     self.sequence_len,
@@ -511,12 +511,11 @@ pub mod decoder {
 pub mod encoder {
     use anyhow::Result;
 
-    use crate::ml::NodeValue;
-
     use super::{
         blocks::EncoderBlock,
         layers::{DropoutLayer, EmbeddingLayer, PositionalEmbeddingLayer},
         linear::Linear,
+        solver::source::OptimizerSource,
     };
 
     pub struct Encoder {
@@ -617,12 +616,14 @@ pub mod encoder {
             Ok(())
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
             for block in self.blocks.iter_mut() {
-                block.apply_gradients(learn_rate);
+                block.apply_gradients(optimizer)?;
             }
-            self.token_embedding.apply_gradients(learn_rate);
-            self.position_embedding.apply_gradients(learn_rate);
+            self.token_embedding.apply_gradients(optimizer)?;
+            self.position_embedding.apply_gradients(optimizer)?;
+
+            Ok(())
         }
 
         fn apply_input_padding(&self, input_sequence: &[usize]) -> (Vec<usize>, Linear) {
@@ -633,8 +634,11 @@ pub mod encoder {
     #[cfg(test)]
     mod tests {
         use crate::ml::{
-            transformer::tests::helpers::{assert_optimisation_converges, new_linear},
-            RngStrategy,
+            transformer::{
+                solver,
+                tests::helpers::{assert_optimisation_converges, new_linear},
+            },
+            NodeValue, RngStrategy,
         };
 
         use super::*;
@@ -721,6 +725,7 @@ pub mod encoder {
             let learn_rate = 0.01;
             let iters = 25;
             let dummy_grads = Linear::new(1, 1);
+            let optimizer = solver::SGDOptimizer::new_cache(learn_rate);
 
             assert_optimisation_converges(
                 &move |rng| {
@@ -739,7 +744,7 @@ pub mod encoder {
                 &move |encoder, inputs| encoder.forward_training(&inputs).unwrap(),
                 &move |encoder, inputs, dloss| {
                     encoder.backward(&inputs, dloss).unwrap();
-                    encoder.apply_gradients(learn_rate);
+                    encoder.apply_gradients(&optimizer).unwrap();
                     dummy_grads.clone()
                 },
                 iters,
@@ -892,14 +897,13 @@ pub mod encoder {
 pub mod blocks {
     use anyhow::Result;
 
-    use crate::ml::NodeValue;
-
     use super::{
         layers::{
             DropoutLayer, FeedForwardLayer, LayerNormalization, MultiHeadCrossAttentionLayer,
             MultiHeadSelfAttentionLayer,
         },
         linear::Linear,
+        solver::source::OptimizerSource,
     };
 
     #[derive(Debug)]
@@ -1112,13 +1116,15 @@ pub mod blocks {
             Ok((d_inputs, d_encoder_output))
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
-            self.self_attention.apply_gradients(learn_rate);
-            self.encoder_attention.apply_gradients(learn_rate);
-            self.network.apply_gradients(learn_rate);
-            self.layer_norm.0.apply_gradients(learn_rate);
-            self.layer_norm.1.apply_gradients(learn_rate);
-            self.layer_norm.2.apply_gradients(learn_rate);
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
+            self.self_attention.apply_gradients(optimizer)?;
+            self.encoder_attention.apply_gradients(optimizer)?;
+            self.network.apply_gradients(optimizer)?;
+            self.layer_norm.0.apply_gradients(optimizer)?;
+            self.layer_norm.1.apply_gradients(optimizer)?;
+            self.layer_norm.2.apply_gradients(optimizer)?;
+
+            Ok(())
         }
     }
 
@@ -1223,18 +1229,23 @@ pub mod blocks {
             Ok(d_inputs)
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
-            self.attention.apply_gradients(learn_rate);
-            self.network.apply_gradients(learn_rate);
-            self.layer_norm.0.apply_gradients(learn_rate);
-            self.layer_norm.1.apply_gradients(learn_rate);
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
+            self.attention.apply_gradients(optimizer)?;
+            self.network.apply_gradients(optimizer)?;
+            self.layer_norm.0.apply_gradients(optimizer)?;
+            self.layer_norm.1.apply_gradients(optimizer)?;
+
+            Ok(())
         }
     }
 
     #[cfg(test)]
     mod tests {
         use crate::ml::{
-            transformer::tests::helpers::{assert_optimisation_converges, new_linear},
+            transformer::{
+                solver,
+                tests::helpers::{assert_optimisation_converges, new_linear},
+            },
             RngStrategy,
         };
 
@@ -1270,6 +1281,7 @@ pub mod blocks {
 
             let learn_rate = 0.01;
             let iters = 25;
+            let optimizer = solver::SGDOptimizer::new_cache(learn_rate);
 
             assert_optimisation_converges(
                 &move |rng| {
@@ -1284,7 +1296,7 @@ pub mod blocks {
                 &move |encoder_block, inputs| encoder_block.forward_training(&inputs).unwrap(),
                 &move |encoder_block, inputs, dloss| {
                     let grads = encoder_block.backward(&inputs, &dloss).unwrap();
-                    encoder_block.apply_gradients(learn_rate);
+                    encoder_block.apply_gradients(&optimizer).unwrap();
                     *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
 
                     grads
@@ -1480,12 +1492,21 @@ pub mod blocks {
 }
 
 pub mod layers {
-    use anyhow::{Context, Result};
+    use anyhow::{anyhow, Context, Result};
     use itertools::Itertools;
 
-    use crate::ml::NetworkActivationMode;
+    use crate::{
+        lazy_opt,
+        ml::{layer::LayerInitStrategy, NetworkActivationMode, NodeValue, RngStrategy},
+    };
 
-    use super::{attention::MultiHeadAttention, gradients::LossGradients, *};
+    use super::{
+        attention::MultiHeadAttention,
+        dense::Dense,
+        gradients::{self, LossGradients},
+        linear::Linear,
+        solver::{source::OptimizerSource, Optimizer},
+    };
 
     #[derive(Debug)]
     pub struct MultiHeadSelfAttentionLayer {
@@ -1551,9 +1572,11 @@ pub mod layers {
             self.sum_kqv_gradients(inputs, kqv_input_grads)
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
-            self.dense_layer.apply_gradients(learn_rate);
-            self.attention.apply_gradients(learn_rate);
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
+            self.dense_layer.apply_gradients(optimizer)?;
+            self.attention.apply_gradients(optimizer)?;
+
+            Ok(())
         }
 
         fn sum_kqv_gradients(
@@ -1654,9 +1677,11 @@ pub mod layers {
             self.sum_kv_q_gradients(kv_inputs, kqv_input_grads)
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
-            self.dense_layer.apply_gradients(learn_rate);
-            self.attention.apply_gradients(learn_rate);
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
+            self.dense_layer.apply_gradients(optimizer)?;
+            self.attention.apply_gradients(optimizer)?;
+
+            Ok(())
         }
 
         fn sum_kv_q_gradients(
@@ -1740,9 +1765,11 @@ pub mod layers {
             Linear::from_values(&output_layer_input_gradients)
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
-            self.hidden_layer.apply_gradients(learn_rate);
-            self.output_layer.apply_gradients(learn_rate);
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
+            self.hidden_layer.apply_gradients(optimizer)?;
+            self.output_layer.apply_gradients(optimizer)?;
+
+            Ok(())
         }
     }
 
@@ -1836,21 +1863,16 @@ pub mod layers {
             }
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
             // could mutate in-place these values back to zero rather than take
             let gradients = self.gradients.take();
+            let mut opt = lazy_opt!(optimizer, self.embeddings.first().unwrap());
             if let Some(gradients::LossGradients::Embedding { dweights }) = gradients {
                 for (embedding, gradient) in self.embeddings.iter_mut().zip(&dweights) {
-                    gradient_descent(embedding, &gradient, learn_rate);
+                    opt.update(embedding, &gradient)?;
                 }
             }
-
-            fn gradient_descent(target: &mut Linear, gradient: &Linear, learn_rate: NodeValue) {
-                *target = target
-                    .iter()
-                    .sub(gradient.iter().multiply_scalar(learn_rate))
-                    .collect();
-            }
+            Ok(())
         }
 
         pub fn vocab_size(&self) -> usize {
@@ -1922,8 +1944,9 @@ pub mod layers {
                 .backward(&sequence.collect_vec(), output_gradients)
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
-            self.embeddings.apply_gradients(learn_rate);
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
+            self.embeddings.apply_gradients(optimizer)?;
+            Ok(())
         }
     }
 
@@ -2075,28 +2098,27 @@ pub mod layers {
             }
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
             // could mutate in-place these values back to zero rather than take
             let gradients = self.gradients.take();
+            let mut opt_beta = lazy_opt!(optimizer, self.beta);
+            let mut opt_gamma = lazy_opt!(optimizer, self.gamma);
             if let Some(gradients::LossGradients::LayerNormalization { dbeta, dgamma }) = gradients
             {
-                gradient_descent(&mut self.beta, &dbeta, learn_rate);
-                gradient_descent(&mut self.gamma, &dgamma, learn_rate);
+                opt_beta.update(&mut self.beta, &dbeta)?;
+                opt_gamma.update(&mut self.gamma, &dgamma)?;
             }
-
-            fn gradient_descent(target: &mut Linear, gradient: &Linear, learn_rate: NodeValue) {
-                *target = target
-                    .iter()
-                    .sub(gradient.iter().multiply_scalar(learn_rate))
-                    .collect();
-            }
+            Ok(())
         }
     }
 
     #[cfg(test)]
     mod tests {
         use crate::ml::{
-            transformer::tests::helpers::{assert_optimisation_converges, new_linear},
+            transformer::{
+                solver,
+                tests::helpers::{assert_optimisation_converges, new_linear},
+            },
             RngStrategy,
         };
 
@@ -2145,6 +2167,7 @@ pub mod layers {
 
             let learn_rate = 0.01;
             let iters = 15;
+            let optimizer = solver::SGDOptimizer::new_cache(learn_rate);
 
             assert_optimisation_converges(
                 &move |rng| {
@@ -2156,7 +2179,7 @@ pub mod layers {
                 &move |ff_layer, inputs| ff_layer.forward(&inputs).unwrap(),
                 &move |ff_layer, inputs, dloss| {
                     let grads = ff_layer.backward(&inputs, &dloss).unwrap();
-                    ff_layer.apply_gradients(learn_rate);
+                    ff_layer.apply_gradients(&optimizer).unwrap();
                     *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
 
                     grads
@@ -2172,6 +2195,7 @@ pub mod layers {
 
             let learn_rate = 0.001;
             let iters = 500;
+            let optimizer = solver::SGDOptimizer::new_cache(learn_rate);
 
             assert_optimisation_converges(
                 &move |rng| {
@@ -2183,7 +2207,7 @@ pub mod layers {
                 &move |layer_norm, inputs| layer_norm.forward(&inputs).unwrap(),
                 &move |layer_norm, inputs, dloss| {
                     let grads = layer_norm.backward(&inputs, &dloss).unwrap();
-                    layer_norm.apply_gradients(learn_rate);
+                    layer_norm.apply_gradients(&optimizer).unwrap();
                     *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
 
                     grads
@@ -2199,11 +2223,15 @@ pub mod attention {
 
     use anyhow::{anyhow, Result};
 
-    use crate::ml::{layer::LayerInitStrategy, NetworkActivationMode, NodeValue, RngStrategy};
+    use crate::{
+        lazy_opt,
+        ml::{layer::LayerInitStrategy, NetworkActivationMode, NodeValue, RngStrategy},
+    };
 
     use super::{
         gradients::{self, LossGradients},
         linear::Linear,
+        solver::{source::OptimizerSource, Optimizer},
     };
 
     #[derive(Debug)]
@@ -2278,10 +2306,11 @@ pub mod attention {
             Ok(kqv_input_grads)
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
             for head in self.heads.iter_mut() {
-                head.apply_gradients(learn_rate);
+                head.apply_gradients(optimizer)?;
             }
+            Ok(())
         }
     }
 
@@ -2483,26 +2512,23 @@ pub mod attention {
             }
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
             // could mutate in-place these values back to zero rather than take
             let gradients = self.gradients.take();
+            let mut opt_key = lazy_opt!(optimizer, self.key_weights);
+            let mut opt_query = lazy_opt!(optimizer, self.query_weights);
+            let mut opt_value = lazy_opt!(optimizer, self.value_weights);
             if let Some(gradients::LossGradients::AttentionHead {
                 dkeys,
                 dqueries,
                 dvalues,
             }) = gradients
             {
-                gradient_descent(&mut self.key_weights, &dkeys, learn_rate);
-                gradient_descent(&mut self.query_weights, &dqueries, learn_rate);
-                gradient_descent(&mut self.value_weights, &dvalues, learn_rate);
+                opt_key.update(&mut self.key_weights, &dkeys)?;
+                opt_query.update(&mut self.query_weights, &dqueries)?;
+                opt_value.update(&mut self.value_weights, &dvalues)?;
             }
-
-            fn gradient_descent(target: &mut Linear, gradient: &Linear, learn_rate: NodeValue) {
-                *target = target
-                    .iter()
-                    .sub(gradient.iter().multiply_scalar(learn_rate))
-                    .collect();
-            }
+            Ok(())
         }
 
         fn new_kqv_linear(
@@ -2540,6 +2566,7 @@ pub mod attention {
         use crate::ml::{
             transformer::{
                 layers::MultiHeadSelfAttentionLayer,
+                solver,
                 tests::helpers::{assert_optimisation_converges, new_linear},
             },
             LayerValues,
@@ -2630,6 +2657,7 @@ pub mod attention {
             let embed_dim = 12;
             let learn_rate = 0.001;
             let total_iterations = 25;
+            let optimizer = solver::SGDOptimizer::new_cache(learn_rate);
 
             assert_optimisation_converges(
                 &move |rng| {
@@ -2643,7 +2671,7 @@ pub mod attention {
                     let grads = attention_head.backward(&inputs, &dloss).unwrap();
 
                     *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
-                    attention_head.apply_gradients(learn_rate);
+                    attention_head.apply_gradients(&optimizer).unwrap();
                     grads
                 },
                 total_iterations,
@@ -2657,6 +2685,7 @@ pub mod attention {
             let head_count = 3;
             let learn_rate = 0.001;
             let total_iterations = 25;
+            let optimizer = solver::SGDOptimizer::new_cache(learn_rate);
 
             assert_optimisation_converges(
                 &move |rng| {
@@ -2676,7 +2705,7 @@ pub mod attention {
                     let grads = attention_layer.backward(&inputs, &dloss).unwrap();
 
                     *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
-                    attention_layer.apply_gradients(learn_rate);
+                    attention_layer.apply_gradients(&optimizer).unwrap();
                     grads
                 },
                 total_iterations,
@@ -2734,13 +2763,15 @@ pub mod gradients {
 pub mod dense {
     use anyhow::{anyhow, Result};
 
-    use crate::ml::{
-        layer::LayerInitStrategy, LayerValues, NetworkActivationMode, NodeValue, RngStrategy,
+    use crate::{
+        lazy_opt,
+        ml::{layer::LayerInitStrategy, LayerValues, NetworkActivationMode, RngStrategy},
     };
 
     use super::{
         gradients,
         linear::{Linear, LinearIter},
+        solver::{source::OptimizerSource, Optimizer},
     };
 
     #[derive(Debug, PartialEq)]
@@ -2908,27 +2939,23 @@ pub mod dense {
             }
         }
 
-        pub fn apply_gradients(&mut self, learn_rate: NodeValue) {
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
             // could mutate in-place these values back to zero rather than take
             let gradients = self.gradients.take();
+            let mut opt_weights = lazy_opt!(optimizer, self.weights);
             if let Some(gradients::LossGradients::Dense { weights, bias }) = gradients {
                 match (bias, &mut self.bias) {
                     (Some(bias_gradient), Some(bias)) => {
-                        gradient_descent(bias, &bias_gradient, learn_rate);
-                        gradient_descent(&mut self.weights, &weights, learn_rate);
+                        let mut opt_bias = lazy_opt!(optimizer, bias);
+                        opt_bias.update(bias, &bias_gradient)?;
+                        opt_weights.update(&mut self.weights, &weights)?;
                     }
                     _ => {
-                        gradient_descent(&mut self.weights, &weights, learn_rate);
+                        opt_weights.update(&mut self.weights, &weights)?;
                     }
                 }
             }
-
-            fn gradient_descent(target: &mut Linear, gradient: &Linear, learn_rate: NodeValue) {
-                *target = target
-                    .iter()
-                    .sub(gradient.iter().multiply_scalar(learn_rate))
-                    .collect();
-            }
+            Ok(())
         }
     }
 }
@@ -3544,7 +3571,13 @@ pub mod solver {
 
     use crate::ml::NodeValue;
 
+    use self::source::{DefaultOptimizerCache, OptimizerSource};
+
     use super::linear::Linear;
+
+    pub trait Optimizer {
+        fn update(&mut self, target: &mut Linear, dloss_dtarget: &Linear) -> Result<()>;
+    }
 
     pub struct AdamOptimizer {
         momentum: Linear,
@@ -3569,7 +3602,15 @@ pub mod solver {
             builder::AdamOptimizerBuilder::new(param_count, param_dimension)
         }
 
-        pub fn update(&mut self, target: &mut Linear, dloss_dtarget: &Linear) -> Result<()> {
+        pub fn new_cache(learn_rate: NodeValue) -> impl OptimizerSource {
+            DefaultOptimizerCache::new(move |param_count, param_dimension| {
+                Self::new(param_count, param_dimension, learn_rate)
+            })
+        }
+    }
+
+    impl Optimizer for AdamOptimizer {
+        fn update(&mut self, target: &mut Linear, dloss_dtarget: &Linear) -> Result<()> {
             let beta1 = self.beta.0;
             let beta2 = self.beta.1;
             let t = self.t as NodeValue;
@@ -3619,6 +3660,74 @@ pub mod solver {
         }
     }
 
+    pub struct RMSpropOptimizer {
+        cache: Linear,
+        gamma: NodeValue,
+        epsilon: NodeValue,
+        eta: NodeValue,
+    }
+
+    impl RMSpropOptimizer {
+        pub fn new(param_count: usize, param_dimension: usize) -> Self {
+            Self {
+                cache: Linear::new(param_count, param_dimension),
+                gamma: 0.9,
+                epsilon: 1e-8,
+                eta: 0.001,
+            }
+        }
+
+        pub fn with_gamma(mut self, gamma: NodeValue) -> Self {
+            self.gamma = gamma;
+            self
+        }
+
+        pub fn with_epsilon(mut self, epsilon: NodeValue) -> Self {
+            self.epsilon = epsilon;
+            self
+        }
+
+        pub fn with_eta(mut self, eta: NodeValue) -> Self {
+            self.eta = eta;
+            self
+        }
+
+        pub fn new_cache(learn_rate: NodeValue) -> impl OptimizerSource {
+            DefaultOptimizerCache::new(move |param_count, param_dimension| {
+                Self::new(param_count, param_dimension).with_eta(learn_rate)
+            })
+        }
+    }
+
+    impl Optimizer for RMSpropOptimizer {
+        fn update(&mut self, target: &mut Linear, dloss_dtarget: &Linear) -> Result<()> {
+            let gamma = self.gamma;
+            let epsilon = self.epsilon;
+            let eta = self.eta;
+
+            let gradient_squared = dloss_dtarget.iter().powf_scalar(2.0);
+            self.cache = self
+                .cache
+                .iter()
+                .multiply_scalar(gamma)
+                .add(gradient_squared.multiply_scalar(1.0 - gamma))
+                .collect();
+
+            let eta_correction = dloss_dtarget
+                .iter()
+                .div(self.cache.iter().powf_scalar(0.5), Some(epsilon))
+                .multiply_scalar(-eta);
+
+            let next_value = target.iter().add(eta_correction).collect();
+            if !next_value.is_finite() {
+                Err(anyhow!("failed to update target: invalid gradients"))?;
+            }
+
+            *target = next_value;
+            Ok(())
+        }
+    }
+
     pub struct SGDOptimizer {
         learn_rate: NodeValue,
     }
@@ -3628,7 +3737,13 @@ pub mod solver {
             Self { learn_rate }
         }
 
-        pub fn update(&mut self, target: &mut Linear, dloss_dtarget: &Linear) -> Result<()> {
+        pub fn new_cache(learn_rate: NodeValue) -> impl OptimizerSource {
+            DefaultOptimizerCache::new(move |_, _| Self::new(learn_rate))
+        }
+    }
+
+    impl Optimizer for SGDOptimizer {
+        fn update(&mut self, target: &mut Linear, dloss_dtarget: &Linear) -> Result<()> {
             let next_value = target
                 .iter()
                 .apply_gradients(dloss_dtarget.iter(), self.learn_rate);
@@ -3641,15 +3756,185 @@ pub mod solver {
         }
     }
 
+    pub mod source {
+        use std::{cell::RefCell, collections::HashMap, rc::Rc};
+
+        use tracing::debug;
+
+        use super::{lazy::LazyOptimizer, Optimizer};
+
+        pub trait OptimizerSource
+        where
+            <Self as OptimizerSource>::Optimizer: Optimizer,
+        {
+            type Optimizer;
+
+            fn create(
+                &self,
+                param_count: usize,
+                param_dimension: usize,
+                instance_name: Option<String>,
+            ) -> Self::Optimizer;
+            fn create_lazy(&self) -> LazyOptimizer<Self::Optimizer>;
+            fn create_lazy_named(&self, instance_name: String) -> LazyOptimizer<Self::Optimizer>;
+        }
+
+        pub struct DefaultOptimizerCache<F, O>
+        where
+            F: Fn(usize, usize) -> O + 'static,
+        {
+            factory: F,
+            instances: RefCell<HashMap<String, Rc<RefCell<O>>>>,
+        }
+
+        impl<'a, F: Fn(usize, usize) -> O + 'static, O> DefaultOptimizerCache<F, O> {
+            pub fn new(factory: F) -> Self {
+                Self {
+                    factory,
+                    instances: RefCell::new(HashMap::new()),
+                }
+            }
+
+            fn new_instance(&self, param_count: usize, param_dimension: usize) -> O {
+                let factory = &self.factory;
+                factory(param_count, param_dimension)
+            }
+        }
+
+        impl<F, O> OptimizerSource for DefaultOptimizerCache<F, O>
+        where
+            F: Fn(usize, usize) -> O + 'static,
+            O: Optimizer + 'static,
+        {
+            type Optimizer = OptimizerCacheEntry<O>;
+
+            fn create(
+                &self,
+                param_count: usize,
+                param_dimension: usize,
+                instance_name: Option<String>,
+            ) -> Self::Optimizer {
+                let name = instance_name.unwrap_or_else(|| {
+                    let id = self.instances.borrow().len();
+                    format!("unnamed_{id}")
+                });
+                let value = self
+                    .instances
+                    .borrow_mut()
+                    .entry(name)
+                    .or_insert_with_key(|key| {
+                        debug!("Created new optimiser instance with key='{}'", key);
+                        let value = self.new_instance(param_count, param_dimension);
+                        let value = RefCell::new(value);
+                        Rc::new(value)
+                    })
+                    .clone();
+                OptimizerCacheEntry(value)
+            }
+
+            fn create_lazy(&self) -> LazyOptimizer<Self::Optimizer> {
+                LazyOptimizer::new(|param_count, param_dimension| {
+                    self.create(param_count, param_dimension, None)
+                })
+            }
+
+            fn create_lazy_named(&self, instance_name: String) -> LazyOptimizer<Self::Optimizer> {
+                LazyOptimizer::new(move |param_count, param_dimension| {
+                    self.create(param_count, param_dimension, Some(instance_name))
+                })
+            }
+        }
+
+        pub struct OptimizerCacheEntry<O>(Rc<RefCell<O>>);
+
+        impl<T: Optimizer> Optimizer for OptimizerCacheEntry<T> {
+            fn update(
+                &mut self,
+                target: &mut crate::ml::transformer::linear::Linear,
+                dloss_dtarget: &crate::ml::transformer::linear::Linear,
+            ) -> anyhow::Result<()> {
+                self.0.borrow_mut().update(target, dloss_dtarget)
+            }
+        }
+
+        #[macro_export]
+        macro_rules! lazy_opt {
+            ($opt:expr, $linear:expr) => {
+                $opt.create_lazy_named(format!(
+                    "f={},l={},c={}__{}_{}_{}",
+                    file!(),
+                    line!(),
+                    column!(),
+                    stringify!($linear),
+                    $linear.stride(),
+                    $linear.count()
+                ))
+            };
+            ($opt:expr) => {
+                $opt.create_lazy_named(format!("f={},l={},c={}", file!(), line!(), column!()))
+            };
+        }
+
+        #[macro_export]
+        macro_rules! cached_opt {
+            ($opt:expr, $linear:expr) => {
+                $opt.create(format!(
+                    "f={},l={},c={}__{}_{}_{}",
+                    file!(),
+                    line!(),
+                    column!(),
+                    stringify!($linear),
+                    $linear.stride(),
+                    $linear.count()
+                ))
+            };
+        }
+    }
+
+    pub mod lazy {
+        use anyhow::Result;
+
+        use crate::ml::transformer::linear::Linear;
+
+        use super::Optimizer;
+
+        pub struct LazyOptimizer<'a, O> {
+            factory: Option<Box<dyn FnOnce(usize, usize) -> O + 'a>>,
+            instance: Option<O>,
+        }
+
+        impl<'a, O: Optimizer> LazyOptimizer<'a, O> {
+            pub fn new<F: FnOnce(usize, usize) -> O + 'a>(factory: F) -> Self {
+                Self {
+                    factory: Some(Box::new(factory)),
+                    instance: None,
+                }
+            }
+        }
+
+        impl<'a, O: Optimizer> Optimizer for LazyOptimizer<'a, O> {
+            fn update(&mut self, target: &mut Linear, dloss_dtarget: &Linear) -> Result<()> {
+                let instance = self.instance.get_or_insert_with(|| {
+                    let param_count = dloss_dtarget.count();
+                    let param_dimension = dloss_dtarget.stride();
+                    let factory = self.factory.take().unwrap();
+                    factory(param_count, param_dimension)
+                });
+
+                instance.update(target, dloss_dtarget)
+            }
+        }
+    }
+
     pub mod builder {
         use super::*;
 
         pub struct AdamOptimizerBuilder {
             momentum: Linear,
             rms: Linear,
-            beta: (f64, f64),
-            epsilon: f64,
-            eta: f64,
+            beta: (NodeValue, NodeValue),
+            epsilon: NodeValue,
+            eta: NodeValue,
         }
 
         impl AdamOptimizerBuilder {
@@ -3663,17 +3948,17 @@ pub mod solver {
                 }
             }
 
-            pub fn with_beta(mut self, beta: (f64, f64)) -> Self {
-                self.beta = beta;
+            pub fn with_beta(mut self, beta1: NodeValue, beta2: NodeValue) -> Self {
+                self.beta = (beta1, beta2);
                 self
             }
 
-            pub fn with_epsilon(mut self, epsilon: f64) -> Self {
+            pub fn with_epsilon(mut self, epsilon: NodeValue) -> Self {
                 self.epsilon = epsilon;
                 self
             }
 
-            pub fn with_eta(mut self, eta: f64) -> Self {
+            pub fn with_eta(mut self, eta: NodeValue) -> Self {
                 self.eta = eta;
                 self
             }
@@ -3731,6 +4016,37 @@ pub mod solver {
         }
 
         #[test]
+        fn rms_prop_can_optimise_linear() {
+            let batch_count = 12;
+            let input_dimension = 48;
+            let output_dimension = 8;
+
+            let iters = 100;
+
+            let optimizer = RMSpropOptimizer::new(output_dimension, input_dimension)
+                .with_eta(0.01)
+                .with_gamma(0.999);
+            let optimizer = RefCell::new(optimizer);
+
+            assert_optimisation_converges(
+                &move |rng| {
+                    let weights = new_linear(output_dimension, input_dimension, &rng);
+                    let inputs = new_linear(batch_count, input_dimension, &rng);
+                    let target = new_linear(batch_count, output_dimension, &rng);
+                    (weights, inputs, target)
+                },
+                &move |weights, inputs| inputs.matrix_product_rhs_transposed(&weights),
+                &move |weights, inputs, dloss| {
+                    let dweights = dloss.matrix_product_lhs_transposed(&inputs);
+                    let dinputs = dloss.matrix_product(&weights);
+                    optimizer.borrow_mut().update(weights, &dweights).unwrap();
+                    dinputs
+                },
+                iters,
+            );
+        }
+
+        #[test]
         fn sgd_can_optimise_linear() {
             let batch_count = 12;
             let input_dimension = 48;
@@ -3764,10 +4080,8 @@ pub mod solver {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     pub mod helpers {
-        use super::*;
+        use crate::ml::{layer::LayerInitStrategy, transformer::linear::Linear, RngStrategy};
 
         pub fn assert_optimisation_converges<T, I>(
             create: &dyn Fn(RngStrategy) -> (T, I, Linear),
@@ -3820,7 +4134,12 @@ mod tests {
                     break (output, mean_loss);
                 }
             };
-            dbg!((target.to_string(), output.to_string()));
+            match format!(" target: {},\n output: {}", target, output) {
+                dump if dump.len() < 1500 => {
+                    println!("{dump}")
+                }
+                _ => {}
+            }
 
             let initial_mean_loss = initial_mean_loss.unwrap();
 
