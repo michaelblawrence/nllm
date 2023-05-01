@@ -2844,32 +2844,56 @@ pub mod dense {
             Ok(outputs)
         }
 
-        // optimise? too many transposes for func that is called many times forward & backward?
         fn compute_weighted_inputs(&self, inputs: &Linear) -> Result<Linear> {
-            // -> output.T = weights.T * inputs.T
-            let output = self
-                .weights
-                .iter_transpose()
-                .matrix_transpose_product(inputs.iter());
-            // let mut weighted_inputs = self.weights.iter().apply_one(inputs);
+            // -> output = inputs * weights
+            let output = inputs.matrix_product(&self.weights);
+
             if let Some(bias) = &self.bias {
                 let bias = bias.iter().stack(inputs.count());
-                Ok(output.iter_transpose().add(bias).collect())
+                Ok(output.iter().add(bias).collect())
             } else {
-                Ok(output.iter_transpose().collect())
+                Ok(output)
             }
         }
 
-        // TODO: optimise by making backward_row the trivial impl and backward operate on Linear matrixes
         pub fn backward(&mut self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
-            let mut input_gradients = vec![];
+            let weighted_inputs_gradients = match &self.activation {
+                Some(activation) => {
+                    let mut weighted_inputs = self.compute_weighted_inputs(&inputs)?;
+                    weighted_inputs
+                        .rows_iter_mut()
+                        .zip(output_gradients.rows_iter())
+                        .for_each(|(x, grads)| {
+                            let output_gradients = grads.into();
+                            let outputs = x.into();
+                            let activated_inputs = activation.apply(&outputs);
+                            activation
+                                .derivative(&output_gradients, &activated_inputs)
+                                .multiply_iter(&output_gradients)
+                                .zip(x)
+                                .for_each(|(grad, x)| *x = grad)
+                        });
+                    weighted_inputs
+                }
+                None => output_gradients.clone(),
+            };
 
-            for (row, inputs) in output_gradients.rows_iter().zip(inputs.rows_iter()) {
-                let input_grads = self.backward_row(inputs.into(), row.into())?;
-                input_gradients.push(input_grads);
-            }
+            let bias_gradients = weighted_inputs_gradients.iter_transpose().flatten_sum();
 
-            Linear::from_values(&input_gradients)
+            // -> output = inputs * weights
+            // -> weighted_inputs_gradients = inputs * weights_gradients
+            // -> weights_gradients = inputs.T * weighted_inputs_gradients
+            let weights_gradients =
+                inputs.matrix_product_lhs_transposed(&weighted_inputs_gradients);
+            self.add_gradients(weights_gradients.iter(), bias_gradients.iter_transpose());
+
+            // -> output = inputs * weights
+            // -> weighted_inputs_gradients = input_gradients_m * self.weights
+            // -> input_gradients_m = weighted_inputs_gradients * self.weights.T
+            let input_gradients =
+                weighted_inputs_gradients.matrix_product_rhs_transposed(&self.weights);
+
+            Ok(input_gradients)
         }
 
         pub fn backward_row(
@@ -2878,39 +2902,9 @@ pub mod dense {
             output_gradients: LayerValues,
         ) -> Result<LayerValues> {
             let inputs = Linear::from_values(&[inputs])?;
+            let output_gradients = Linear::from_values(&[output_gradients])?;
+            let input_gradients_m = self.backward(&inputs, &output_gradients)?;
 
-            let weighted_inputs_gradients = match &self.activation {
-                Some(activation) => {
-                    let mut weighted_inputs = self.compute_weighted_inputs(&inputs)?;
-                    weighted_inputs.rows_iter_mut().for_each(|x| {
-                        let outputs = x.into();
-                        let activated_inputs = activation.apply(&outputs);
-                        activation
-                            .derivative(&output_gradients, &activated_inputs)
-                            .multiply_iter(&output_gradients)
-                            .zip(x)
-                            .for_each(|(grad, x)| *x = grad)
-                    });
-                    weighted_inputs
-                }
-                None => Linear::from_values(&[output_gradients])?,
-            };
-
-            let bias_gradients = &weighted_inputs_gradients;
-
-            // -> output.T = weights.T * inputs.T
-            // -> weighted_inputs_gradients.T = weights_gradients.T * inputs.T
-            // -> weights_gradients * weighted_inputs_gradients.T = inputs.T
-            // -> weights_gradients = inputs.T * weighted_inputs_gradients
-            let weights_gradients =
-                inputs.matrix_product_lhs_transposed(&weighted_inputs_gradients);
-            self.add_gradients(weights_gradients.iter(), bias_gradients.iter());
-
-            // -> output.T = weights.T * inputs.T
-            // -> weighted_inputs_gradients.T = self.weights.T * input_gradients_m.T
-            // -> input_gradients_m = weighted_inputs_gradients * self.weights.T
-            let input_gradients_m =
-                weighted_inputs_gradients.matrix_product_rhs_transposed(&self.weights);
             let input_gradients = input_gradients_m.rows_iter().next().unwrap().into();
             Ok(input_gradients)
         }
@@ -3039,13 +3033,10 @@ pub mod linear {
             let count = self.count;
 
             let x = (0..self.inner.len()).map(move |idx| {
-                let inner_idx = |x, y| x + y * stride;
-                // let identity_xy = |i| (i % stride, i / stride);
-                let transpose_xy = |i| (i % count, i / count);
-
-                let (x, y) = transpose_xy(idx);
-                let transpose_idx = inner_idx(y, x);
-                self.inner[transpose_idx]
+                let (x, y) = (idx % count, idx / count);
+                let (i, j) = (y, x); // transpose dims
+                let inner_idx = i + j * stride;
+                self.inner[inner_idx]
             });
             LinearIter {
                 inner: Box::new(x),
