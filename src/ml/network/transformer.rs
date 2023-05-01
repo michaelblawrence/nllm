@@ -1,5 +1,6 @@
 pub mod decoder {
     use anyhow::{Context, Result};
+    use serde::{Deserialize, Serialize};
 
     use super::{
         blocks::DecoderBlock,
@@ -9,6 +10,7 @@ pub mod decoder {
         solver::source::OptimizerSource,
     };
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Decoder {
         blocks: Vec<DecoderBlock>,
         token_embedding: EmbeddingLayer,
@@ -344,6 +346,77 @@ pub mod decoder {
                 iters,
             );
         }
+
+        #[test]
+        #[ignore = "evaluating optimization algorithms, takes long"]
+        fn decoder_can_minimise_big_models_evaluating_opt_algos() {
+            fn run_cycle<T: OptimizerSource>(label: &str, optimizer: T) {
+                let seq_len = 128;
+                let embed_dim = 32;
+                let head_count = 4;
+                let hidden_dim = 48;
+                let vocab_size = 100;
+                let block_count = 6;
+
+                let iters = 100;
+                assert_optimisation_converges(
+                    &move |rng| {
+                        println!("Creating instance for optimizer test = '{label}'");
+                        // let rng = RngStrategy::default();
+                        let decoder = Decoder::new_builder(seq_len, embed_dim, vocab_size)
+                            .with_head_count(head_count)
+                            .with_block_count(block_count)
+                            .with_feed_forward_hidden_dimension(hidden_dim)
+                            .with_rng(rng.clone())
+                            .with_dropout_rate(0.0) // TODO: reenable dropout once relate TODOs are completed
+                            .build()
+                            .unwrap();
+                        let inputs = [3, 6, 9];
+                        let target = new_linear(seq_len, vocab_size, &rng);
+                        (decoder, inputs, target)
+                    },
+                    &move |decoder, inputs| decoder.forward_training(&inputs, None, None).unwrap(),
+                    &move |decoder, inputs, dloss| {
+                        decoder.backward(&inputs, None, None, dloss).unwrap();
+                        decoder.apply_gradients(&optimizer).unwrap();
+                        Linear::new(1, 1)
+                    },
+                    iters,
+                );
+            }
+
+            // run_cycle("SGDOptimizer", solver::SGDOptimizer::new_cache(0.0001));
+            // run_cycle("AdamOptimizer", solver::AdamOptimizer::new_cache(0.01));
+            // run_cycle(
+            //     "AdamOptimizerTuned",
+            //     solver::source::DefaultOptimizerCache::new(|param_count, param_dimension| {
+            //         solver::AdamOptimizer::new_builder(param_count, param_dimension)
+            //             .with_eta(0.01)
+            //             .with_beta(0.89, 0.995)
+            //             .build()
+            //     }),
+            // );
+            // run_cycle(
+            //     "RMSpropOptimizerTuned",
+            //     solver::source::DefaultOptimizerCache::new(|param_count, param_dimension| {
+            //         solver::RMSpropOptimizer::new(param_count, param_dimension)
+            //             .with_eta(0.01)
+            //             .with_gamma(0.995)
+            //     }),
+            // );
+            run_cycle(
+                "RMSpropOptimizerTuned_opt_gamma-0.999",
+                solver::source::DefaultOptimizerCache::new(|param_count, param_dimension| {
+                    solver::RMSpropOptimizer::new(param_count, param_dimension)
+                        .with_eta(0.01)
+                        .with_gamma(0.999)
+                }),
+            );
+            run_cycle(
+                "SGDOptimizer_rate-0.0002",
+                solver::SGDOptimizer::new_cache(0.0002),
+            );
+        }
     }
 
     pub mod builder {
@@ -510,6 +583,7 @@ pub mod decoder {
 
 pub mod encoder {
     use anyhow::Result;
+    use serde::{Deserialize, Serialize};
 
     use super::{
         blocks::EncoderBlock,
@@ -518,6 +592,7 @@ pub mod encoder {
         solver::source::OptimizerSource,
     };
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Encoder {
         blocks: Vec<EncoderBlock>,
         token_embedding: EmbeddingLayer,
@@ -896,6 +971,7 @@ pub mod encoder {
 
 pub mod blocks {
     use anyhow::Result;
+    use serde::{Deserialize, Serialize};
 
     use super::{
         layers::{
@@ -906,7 +982,7 @@ pub mod blocks {
         solver::source::OptimizerSource,
     };
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct DecoderBlock {
         self_attention: MultiHeadSelfAttentionLayer,
         encoder_attention: MultiHeadCrossAttentionLayer,
@@ -1128,7 +1204,7 @@ pub mod blocks {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct EncoderBlock {
         attention: MultiHeadSelfAttentionLayer,
         network: FeedForwardLayer,
@@ -1494,6 +1570,7 @@ pub mod blocks {
 pub mod layers {
     use anyhow::{anyhow, Context, Result};
     use itertools::Itertools;
+    use serde::{Deserialize, Serialize};
 
     use crate::{
         lazy_opt,
@@ -1508,7 +1585,7 @@ pub mod layers {
         solver::{source::OptimizerSource, Optimizer},
     };
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct MultiHeadSelfAttentionLayer {
         attention: MultiHeadAttention,
         dense_layer: Dense,
@@ -1594,7 +1671,7 @@ pub mod layers {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct MultiHeadCrossAttentionLayer {
         attention: MultiHeadAttention,
         dense_layer: Dense,
@@ -1706,7 +1783,7 @@ pub mod layers {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct FeedForwardLayer {
         hidden_layer: Dense,
         output_layer: Dense,
@@ -1773,10 +1850,12 @@ pub mod layers {
         }
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct EmbeddingLayer {
         embeddings: Vec<Linear>,
         vocab_size: usize,
         model_dimensions: usize,
+        #[serde(skip)]
         gradients: Option<LossGradients>,
     }
 
@@ -1899,6 +1978,7 @@ pub mod layers {
         }
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct PositionalEmbeddingLayer {
         embeddings: EmbeddingLayer,
     }
@@ -1950,7 +2030,7 @@ pub mod layers {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct DropoutLayer {
         dropout_rate: NodeValue,
         rng: RngStrategy,
@@ -1974,10 +2054,11 @@ pub mod layers {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct LayerNormalization {
         beta: Linear,
         gamma: Linear,
+        #[serde(skip)]
         gradients: Option<LossGradients>,
     }
 
@@ -2222,6 +2303,7 @@ pub mod attention {
     use std::iter;
 
     use anyhow::{anyhow, Result};
+    use serde::{Deserialize, Serialize};
 
     use crate::{
         lazy_opt,
@@ -2234,7 +2316,7 @@ pub mod attention {
         solver::{source::OptimizerSource, Optimizer},
     };
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct MultiHeadAttention {
         heads: Vec<AttentionHead>,
     }
@@ -2314,7 +2396,7 @@ pub mod attention {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct AttentionHead {
         key_weights: Linear,
         query_weights: Linear,
@@ -2322,6 +2404,7 @@ pub mod attention {
         mask: Option<Linear>,
         embedding_dimension: usize,
         sequence_len: usize,
+        #[serde(skip)]
         gradients: Option<LossGradients>,
     }
 
@@ -2739,7 +2822,7 @@ pub mod attention {
 pub mod gradients {
     use super::linear::Linear;
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, Clone, PartialEq)]
     pub enum LossGradients {
         Dense {
             weights: Linear,
@@ -2762,6 +2845,7 @@ pub mod gradients {
 
 pub mod dense {
     use anyhow::{anyhow, Result};
+    use serde::{Deserialize, Serialize};
 
     use crate::{
         lazy_opt,
@@ -2774,13 +2858,14 @@ pub mod dense {
         solver::{source::OptimizerSource, Optimizer},
     };
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
     pub struct Dense {
         weights: Linear,
         bias: Option<Linear>,
         activation: Option<NetworkActivationMode>,
         inputs_count: usize,
         outputs_count: usize,
+        #[serde(skip)]
         gradients: Option<gradients::LossGradients>,
     }
 
@@ -2959,10 +3044,11 @@ pub mod linear {
 
     use anyhow::{anyhow, Context, Result};
     use itertools::Itertools;
+    use serde::{Deserialize, Serialize};
 
     use crate::ml::{layer::LayerInitStrategy, LayerValues, NodeValue, RngStrategy};
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct Linear {
         inner: LayerValues,
         stride: usize,
