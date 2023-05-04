@@ -2,8 +2,7 @@
 /dist
 /out
 /.vscode
+/res/*
 !/res/scripts
-!/res/tinyimdb.txt
-!/res/tinyshakespeare.txt
-/res
+!/res/tiny*.txt
 .DS_Store
