@@ -224,80 +224,6 @@ impl Layer {
         self.size
     }
 
-    pub fn calculate_error(
-        &self,
-        outputs: &LayerValues,
-        expected_outputs: &LayerValues,
-        use_nll: bool,
-    ) -> Result<LayerValues> {
-        match use_nll {
-            true => expected_outputs
-                .iter()
-                .zip(outputs.iter())
-                .map(|(expected, actual)| {
-                    if *expected == 1.0 {
-                        Ok(-actual.ln())
-                    } else if *expected == 0.0 {
-                        Ok(-(1.0 - actual).ln())
-                    } else {
-                        Err(anyhow!(
-                            "target outputs should be one-hot encoded: {expected_outputs:?}"
-                        ))
-                    }
-                })
-                .collect(),
-            _ => self.calculate_msd_error(outputs, expected_outputs),
-        }
-    }
-
-    pub fn calculate_msd_error(
-        &self,
-        outputs: &LayerValues,
-        expected_outputs: &LayerValues,
-    ) -> Result<LayerValues> {
-        let mut error = vec![];
-        for (actual, expected) in outputs.iter().zip(expected_outputs.iter()) {
-            error.push((actual - expected).powi(2));
-        }
-
-        Ok(LayerValues(error))
-    }
-
-    pub fn cross_entropy_error_d(
-        &self,
-        softmax_outputs: &LayerValues,
-        expected_outputs: &LayerValues,
-    ) -> Result<LayerValues> {
-        expected_outputs
-            .iter()
-            .zip(softmax_outputs.iter())
-            .map(|(&expected, &actual)| {
-                if expected == 0.0 {
-                    Ok(actual)
-                } else if expected == 1.0 {
-                    Ok(actual - 1.0)
-                } else {
-                    Err(anyhow!(
-                        "expected cross entropy outputs should be one-hot encoded"
-                    ))
-                }
-            })
-            .collect()
-    }
-
-    pub fn msd_error_d(
-        &self,
-        outputs: &LayerValues,
-        expected_outputs: &LayerValues,
-    ) -> Result<LayerValues> {
-        let mut error = vec![];
-        for (actual, expected) in outputs.iter().zip(expected_outputs.iter()) {
-            error.push((actual - expected) * 2.0);
-        }
-
-        Ok(LayerValues(error))
-    }
-
     pub fn node_weights<'a>(&'a self, node_index: usize) -> Result<&[f64]> {
         let n = self.size();
         let start = n * node_index;
@@ -409,6 +335,20 @@ impl LayerValues {
             0.0
         }
     }
+    pub fn position_max(&self) -> Option<usize> {
+        itertools::Itertools::position_max_by(self.iter(), |x, y| {
+            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+    pub fn rank_iter<'a>(&'a self) -> impl Iterator<Item = usize> + 'a {
+        use itertools::Itertools;
+        self.iter()
+            .enumerate()
+            .sorted_by(|x, y| y.1.partial_cmp(x.1).unwrap_or(std::cmp::Ordering::Equal))
+            .enumerate()
+            .sorted_by_key(|(_rank, (idx, _value))| *idx)
+            .map(|(rank, (_idx, _value))| rank + 1)
+    }
     pub fn normalized_dot_product(&self, rhs: &LayerValues) -> Option<NodeValue> {
         let (v1, v2) = (self, rhs);
         if v1.len() != v2.len() {
@@ -429,6 +369,60 @@ impl LayerValues {
         }
 
         Some(dot_product / (norm1 * norm2))
+    }
+
+    pub fn cross_entropy_error(&self, expected_outputs: &LayerValues) -> Result<LayerValues> {
+        expected_outputs
+            .iter()
+            .zip(self.iter())
+            .map(|(expected, actual)| {
+                if *expected == 1.0 {
+                    Ok(-actual.ln())
+                } else if *expected == 0.0 {
+                    Ok(-(1.0 - actual).ln())
+                } else {
+                    Err(anyhow!(
+                        "target outputs should be one-hot encoded: {expected_outputs:?}"
+                    ))
+                }
+            })
+            .collect()
+    }
+
+    pub fn msd_error(&self, expected_outputs: &LayerValues) -> Result<LayerValues> {
+        let mut error = vec![];
+        for (actual, expected) in self.iter().zip(expected_outputs.iter()) {
+            error.push((actual - expected).powi(2));
+        }
+
+        Ok(LayerValues(error))
+    }
+
+    pub fn cross_entropy_error_d(&self, expected_outputs: &LayerValues) -> Result<LayerValues> {
+        expected_outputs
+            .iter()
+            .zip(self.iter())
+            .map(|(&expected, &actual)| {
+                if expected == 0.0 {
+                    Ok(actual)
+                } else if expected == 1.0 {
+                    Ok(actual - 1.0)
+                } else {
+                    Err(anyhow!(
+                        "expected cross entropy outputs should be one-hot encoded"
+                    ))
+                }
+            })
+            .collect()
+    }
+
+    pub fn msd_error_d(&self, expected_outputs: &LayerValues) -> Result<LayerValues> {
+        let mut error = vec![];
+        for (actual, expected) in self.iter().zip(expected_outputs.iter()) {
+            error.push((actual - expected) * 2.0);
+        }
+
+        Ok(LayerValues(error))
     }
 }
 

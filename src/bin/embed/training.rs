@@ -390,7 +390,7 @@ where
         phrases = characterize_phrases(phrases, Some(config.input_stride_width), word_mode);
         testing_phrases =
             characterize_phrases(testing_phrases, Some(config.input_stride_width), word_mode);
-        vocab = compute_vocab(&phrases);
+        vocab = compute_vocab(&phrases, Some(&testing_phrases));
     }
 
     let token_count = |x: &Vec<Vec<String>>| x.iter().map(|phrase| phrase.len()).sum::<usize>();
@@ -506,7 +506,7 @@ pub fn init_phrases_and_vocab(
             .collect::<Vec<_>>()
     );
 
-    let vocab = compute_vocab(&phrases);
+    let vocab = compute_vocab(&phrases, None);
 
     plane::ml::ShuffleRng::shuffle_vec(&rng, &mut phrases);
 
@@ -519,9 +519,10 @@ pub fn init_phrases_and_vocab(
     (phrases, vocab)
 }
 
-fn compute_vocab(phrases: &Vec<Vec<String>>) -> HashSet<String> {
+fn compute_vocab(phrases: &Vec<Vec<String>>, testing_phrases: Option<&Vec<Vec<String>>>, ) -> HashSet<String> {
     phrases
         .iter()
+        .chain(testing_phrases.into_iter().flatten())
         .flat_map(|phrase| {
             phrase
                 .join(" ")

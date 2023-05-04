@@ -230,13 +230,12 @@ impl Network {
         inputs: LayerValues,
         target_outputs: &LayerValues,
     ) -> Result<LayerValues> {
-        let last_layer = self.layers.last().context("should have a final layer")?;
         let outputs = self.compute(inputs)?;
-        let errors = last_layer.calculate_error(
-            &outputs,
-            &target_outputs,
-            self.final_layer_activation()?.is_softmax(),
-        )?;
+        let errors = if self.final_layer_activation()?.is_softmax() {
+            outputs.cross_entropy_error_d(&target_outputs)?
+        } else {
+            outputs.msd_error(&target_outputs)?
+        };
         Ok(errors)
     }
 
@@ -248,15 +247,11 @@ impl Network {
         let last = layers_activations.last();
         let layer_output = last.expect("should have a final layer");
 
-        let output_layer_error = self
-            .layers
-            .last()
-            .context("should have final layer")?
-            .calculate_error(
-                &layer_output,
-                target_outputs,
-                self.final_layer_activation()?.is_softmax(),
-            )?;
+        let output_layer_error = if self.final_layer_activation()?.is_softmax() {
+            layer_output.cross_entropy_error_d(&target_outputs)?
+        } else {
+            layer_output.msd_error(&target_outputs)?
+        };
 
         Ok(output_layer_error.ave())
     }
@@ -457,9 +452,9 @@ impl Network {
 
                     match state.activation_mode {
                         NetworkActivationMode::SoftMaxCrossEntropy => {
-                            layer.cross_entropy_error_d(&layer_activations, &target_outputs)?
+                            layer_activations.cross_entropy_error_d(&target_outputs)?
                         }
-                        _ => layer.msd_error_d(&layer_activations, &target_outputs)?,
+                        _ => layer_activations.msd_error_d(&target_outputs)?,
                     }
                 }
             };

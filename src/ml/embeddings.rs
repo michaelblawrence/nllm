@@ -1229,7 +1229,8 @@ mod tests {
         fn should_report_round(round: usize, training_rounds: usize) -> bool {
             let round_1based = round + 1;
 
-            round_1based <= 50
+            round_1based <= 3
+                || (round_1based <= 100 && round_1based % 10 == 0)
                 || (round_1based <= 1000 && round_1based % 100 == 0)
                 || (round_1based <= 10000 && round_1based % 1000 == 0)
                 || (round_1based <= 100000 && round_1based % 10000 == 0)
@@ -1278,6 +1279,8 @@ mod tests {
             let mut total_first_word_predictions = 0;
 
             for testing_phrase in testing_phrases.iter() {
+                let error = embedding.compute_error(testing_phrase).unwrap();
+
                 for testing_phrase_window in
                     testing_phrase.windows(embedding.input_stride_width() + 1)
                 {
@@ -1316,7 +1319,6 @@ mod tests {
                         }
                     }
 
-                    let error = embedding.compute_error(testing_phrase).unwrap();
                     let nll = embedding.nll(&last_words, &actual).unwrap();
                     validation_errors.push((error, nll));
                     total_first_word_predictions += 1;
