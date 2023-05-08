@@ -166,12 +166,15 @@ pub mod decoder {
         }
 
         pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
-            for block in self.blocks.iter_mut() {
-                block.apply_gradients(optimizer)?;
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                block.apply_gradients(&*optimizer.with_index(i))?;
             }
-            self.token_embedding.apply_gradients(optimizer)?;
-            self.position_embedding.apply_gradients(optimizer)?;
-            self.output_dense.apply_gradients(optimizer)?;
+            self.token_embedding
+                .apply_gradients(&*optimizer.with_next_index())?;
+            self.position_embedding
+                .apply_gradients(&*optimizer.with_next_index())?;
+            self.output_dense
+                .apply_gradients(&*optimizer.with_next_index())?;
 
             Ok(())
         }
@@ -204,7 +207,7 @@ pub mod decoder {
             lazy_opt,
             ml::{
                 transformer::{
-                    solver::{self, Optimizer},
+                    solver::{self, source::DynamicOptimizerFactory, Optimizer},
                     tests::helpers::{assert_optimisation_converges, new_linear},
                 },
                 NodeValue, RngStrategy,
@@ -410,28 +413,34 @@ pub mod decoder {
             run_cycle("AdamOptimizer", solver::AdamOptimizer::new_cache(0.01));
             run_cycle(
                 "AdamOptimizerTuned",
-                solver::source::DefaultOptimizerCache::new(|param_count, param_dimension| {
-                    solver::AdamOptimizer::new_builder(param_count, param_dimension)
-                        .with_eta(0.01)
-                        .with_beta(0.89, 0.995)
-                        .build()
-                }),
+                solver::source::DefaultOptimizerCache::new(DynamicOptimizerFactory::new(
+                    |param_count, param_dimension| {
+                        solver::AdamOptimizer::new_builder(param_count, param_dimension)
+                            .with_eta(0.01)
+                            .with_beta(0.89, 0.995)
+                            .build()
+                    },
+                )),
             );
             run_cycle(
                 "RMSpropOptimizerTuned",
-                solver::source::DefaultOptimizerCache::new(|param_count, param_dimension| {
-                    solver::RMSpropOptimizer::new(param_count, param_dimension)
-                        .with_eta(0.01)
-                        .with_gamma(0.995)
-                }),
+                solver::source::DefaultOptimizerCache::new(DynamicOptimizerFactory::new(
+                    |param_count, param_dimension| {
+                        solver::RMSpropOptimizer::new(param_count, param_dimension)
+                            .with_eta(0.01)
+                            .with_gamma(0.995)
+                    },
+                )),
             );
             run_cycle(
                 "RMSpropOptimizerTuned_opt_gamma-0.999",
-                solver::source::DefaultOptimizerCache::new(|param_count, param_dimension| {
-                    solver::RMSpropOptimizer::new(param_count, param_dimension)
-                        .with_eta(0.01)
-                        .with_gamma(0.999)
-                }),
+                solver::source::DefaultOptimizerCache::new(DynamicOptimizerFactory::new(
+                    |param_count, param_dimension| {
+                        solver::RMSpropOptimizer::new(param_count, param_dimension)
+                            .with_eta(0.01)
+                            .with_gamma(0.999)
+                    },
+                )),
             );
             run_cycle(
                 "SGDOptimizer_rate-0.0002",
@@ -1225,7 +1234,6 @@ pub mod blocks {
                 .backward(&ff_network_inputs, &d_ff_network_output)?;
 
             let d_ff_network_inputs = d_skip_ff_output.iter().add(ff_gradients.iter()).collect();
-
             let (d_decoder_attention_inputs, d_encoder_output) = match encoder_output {
                 Some(encoder_output) => {
                     // forward pass
@@ -1284,12 +1292,21 @@ pub mod blocks {
         }
 
         pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
-            self.masked_self_attention.apply_gradients(optimizer)?;
-            self.encoder_attention.apply_gradients(optimizer)?;
-            self.network.apply_gradients(optimizer)?;
-            self.layer_norm.0.apply_gradients(optimizer)?;
-            self.layer_norm.1.apply_gradients(optimizer)?;
-            self.layer_norm.2.apply_gradients(optimizer)?;
+            self.masked_self_attention
+                .apply_gradients(&*optimizer.with_index(1))?;
+            self.encoder_attention
+                .apply_gradients(&*optimizer.with_index(2))?;
+            self.network
+                .apply_gradients(&*optimizer.with_next_index())?;
+            self.layer_norm
+                .0
+                .apply_gradients(&*optimizer.with_index(1))?;
+            self.layer_norm
+                .1
+                .apply_gradients(&*optimizer.with_index(2))?;
+            self.layer_norm
+                .2
+                .apply_gradients(&*optimizer.with_index(3))?;
 
             Ok(())
         }
@@ -1782,8 +1799,10 @@ pub mod layers {
         }
 
         pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
-            self.dense_layer.apply_gradients(optimizer)?;
-            self.attention.apply_gradients(optimizer)?;
+            self.dense_layer
+                .apply_gradients(&*optimizer.with_next_index())?;
+            self.attention
+                .apply_gradients(&*optimizer.with_next_index())?;
 
             Ok(())
         }
@@ -1893,8 +1912,10 @@ pub mod layers {
         }
 
         pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
-            self.dense_layer.apply_gradients(optimizer)?;
-            self.attention.apply_gradients(optimizer)?;
+            self.dense_layer
+                .apply_gradients(&*optimizer.with_next_index())?;
+            self.attention
+                .apply_gradients(&*optimizer.with_next_index())?;
 
             Ok(())
         }
@@ -1965,8 +1986,10 @@ pub mod layers {
         }
 
         pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
-            self.hidden_layer.apply_gradients(optimizer)?;
-            self.output_layer.apply_gradients(optimizer)?;
+            self.hidden_layer
+                .apply_gradients(&*optimizer.with_next_index())?;
+            self.output_layer
+                .apply_gradients(&*optimizer.with_next_index())?;
 
             Ok(())
         }
@@ -2328,7 +2351,9 @@ pub mod layers {
         use crate::ml::{
             transformer::{
                 solver,
-                tests::helpers::{assert_optimisation_converges, new_linear},
+                tests::helpers::{
+                    assert_optimisation_converges, compute_expected_dloss_dinput, new_linear,
+                },
             },
             RngStrategy,
         };
@@ -2367,6 +2392,55 @@ pub mod layers {
 
             assert_eq!(output.len(), seq_len);
             assert_eq!(output[0].len(), embed_dim);
+        }
+
+        #[test]
+        #[ignore = "failing.. LayerNormalization backward needs fixing first"]
+        fn layer_normalization_layer_can_compute_valid_gradients() {
+            let seq_len = 3;
+            let embed_dim = 12;
+
+            let rng = RngStrategy::testable(1234);
+            let epsilon = 1e-8;
+            let decimals = 4;
+
+            let inputs = new_linear(seq_len, embed_dim, &rng);
+            let target = new_linear(seq_len, embed_dim, &rng);
+
+            let mut layer_norm = LayerNormalization::new(seq_len);
+            let output = layer_norm.forward(&inputs).unwrap();
+
+            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
+            let dloss = dloss.collect();
+
+            let computed_dloss_dinput = layer_norm.backward(&inputs, &dloss).unwrap();
+            let expected_dloss_dinput = compute_expected_dloss_dinput(
+                |inputs| layer_norm.forward(inputs).unwrap(),
+                |output| {
+                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
+                    loss.values_iter().map(|(&x, ..)| x).sum()
+                },
+                inputs,
+                epsilon,
+            );
+
+            let delta_computed_dloss_dinput = computed_dloss_dinput
+                .iter()
+                .sub(expected_dloss_dinput.iter())
+                .round(decimals)
+                .collect();
+
+            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
+            assert_eq!(zeros, delta_computed_dloss_dinput);
+
+            let factor_computed_dloss_dinput = computed_dloss_dinput
+                .iter()
+                .div(expected_dloss_dinput.iter(), Some(epsilon))
+                .round(2)
+                .collect();
+
+            let ones = Linear::with_value(target.count(), target.stride(), 1.0);
+            assert_eq!(ones, factor_computed_dloss_dinput);
         }
 
         #[test]
@@ -2679,13 +2753,12 @@ pub mod attention {
                 None => scaled_attention_scores,
             };
 
+            let stride = attention_scores.stride();
+            let input_mask = input_mask.map(|mask| mask.iter().grow(stride));
             let attention_weights = match input_mask {
-                Some(mask) => {
-                    let mask = mask.iter().grow(attention_scores.stride());
-                    masked_attention_scores
-                        .set_mask(mask, NodeValue::NEG_INFINITY)
-                        .softmax()
-                }
+                Some(mask) => masked_attention_scores
+                    .set_mask(mask, NodeValue::NEG_INFINITY)
+                    .softmax(),
                 None => masked_attention_scores.softmax(),
             };
 
@@ -2738,7 +2811,7 @@ pub mod attention {
             };
 
             let dattention_scores = dscaled_attention_scores
-                .multiply_scalar(keys.count() as NodeValue)
+                .multiply_scalar(scale_factor)
                 .collect();
 
             let dqueries = dattention_scores.matrix_product(&keys);
@@ -2819,15 +2892,12 @@ pub mod attention {
 
     #[cfg(test)]
     mod tests {
-        use std::iter;
-
-        use crate::ml::{
-            transformer::{
-                layers::MultiHeadSelfAttentionLayer,
-                solver,
-                tests::helpers::{assert_optimisation_converges, new_linear},
+        use crate::ml::transformer::{
+            layers::MultiHeadSelfAttentionLayer,
+            solver,
+            tests::helpers::{
+                assert_optimisation_converges, compute_expected_dloss_dinput, new_linear,
             },
-            LayerValues,
         };
 
         use super::*;
@@ -2839,8 +2909,7 @@ pub mod attention {
 
             let rng = RngStrategy::testable(1234);
 
-            let inputs = new_inputs(seq_len, embed_dim, &rng);
-            let inputs = Linear::from_values(&inputs).unwrap();
+            let inputs = new_linear(seq_len, embed_dim, &rng);
             let attention_layer = AttentionHead::new(seq_len, embed_dim, &rng);
             let output = attention_layer.forward(&inputs).unwrap().to_values();
 
@@ -2856,8 +2925,7 @@ pub mod attention {
             let rng = RngStrategy::testable(1234);
             let strategy = LayerInitStrategy::KaimingZeroBias;
 
-            let inputs = new_inputs(seq_len, embed_dim, &rng);
-            let inputs = Linear::from_values(&inputs).unwrap();
+            let inputs = new_linear(seq_len, embed_dim, &rng);
             let attention_layer =
                 MultiHeadSelfAttentionLayer::new(seq_len, embed_dim, 3, &strategy, &strategy, &rng);
             let output = attention_layer.forward(&inputs).unwrap().to_values();
@@ -2890,8 +2958,7 @@ pub mod attention {
 
             let rng = RngStrategy::testable(1234);
 
-            let inputs = new_inputs(seq_len, embed_dim, &rng);
-            let inputs = Linear::from_values(&inputs).unwrap();
+            let inputs = new_linear(seq_len, embed_dim, &rng);
 
             let mut attention_layer = AttentionHead::new(seq_len, embed_dim, &rng);
             let output = attention_layer.forward(&inputs).unwrap().to_values();
@@ -2907,6 +2974,92 @@ pub mod attention {
 
             assert_eq!(grads.len(), output.len());
             assert_eq!(grads[0].len(), output[0].len());
+        }
+
+        #[test]
+        fn attention_can_compute_valid_gradients_for_single_head() {
+            let seq_len = 5;
+            let embed_dim = 12;
+
+            let rng = RngStrategy::testable(1234);
+            let epsilon = 1e-8;
+            let decimals = 4;
+
+            let inputs = new_linear(seq_len, embed_dim, &rng);
+            let target = new_linear(seq_len, embed_dim, &rng);
+
+            let mut attention_layer = AttentionHead::new(seq_len, embed_dim, &rng);
+            let output = attention_layer.forward(&inputs).unwrap();
+
+            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
+            let dloss = dloss.collect();
+
+            let computed_dloss_dinput = attention_layer.backward(&inputs, &dloss).unwrap();
+            let expected_dloss_dinput = compute_expected_dloss_dinput(
+                |inputs| attention_layer.forward(inputs).unwrap(),
+                |output| {
+                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
+                    loss.values_iter().map(|(&x, ..)| x).sum()
+                },
+                inputs,
+                epsilon,
+            );
+
+            let delta_computed_dloss_dinput = computed_dloss_dinput
+                .iter()
+                .sub(expected_dloss_dinput.iter())
+                .round(decimals)
+                .collect();
+
+            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
+            assert_eq!(zeros, delta_computed_dloss_dinput);
+        }
+
+        #[test]
+        fn attention_can_compute_valid_gradients_for_multi_head_layer() {
+            let seq_len = 3;
+            let embed_dim = 12;
+            let head_count = 3;
+
+            let rng = RngStrategy::testable(1234);
+            let epsilon = 1e-8;
+            let decimals = 4;
+
+            let inputs = new_linear(seq_len, embed_dim, &rng);
+            let target = new_linear(seq_len, embed_dim, &rng);
+
+            let mut attention_layer = MultiHeadSelfAttentionLayer::new(
+                seq_len,
+                embed_dim,
+                head_count,
+                &LayerInitStrategy::KaimingZeroBias,
+                &LayerInitStrategy::KaimingZeroBias,
+                &rng,
+            );
+            let output = attention_layer.forward(&inputs).unwrap();
+
+            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
+            let dloss = dloss.collect();
+
+            let computed_dloss_dinput = attention_layer.backward(&inputs, &dloss).unwrap();
+            let expected_dloss_dinput = compute_expected_dloss_dinput(
+                |inputs| attention_layer.forward(inputs).unwrap(),
+                |output| {
+                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
+                    loss.values_iter().map(|(&x, ..)| x).sum()
+                },
+                inputs,
+                epsilon,
+            );
+
+            let delta_computed_dloss_dinput = computed_dloss_dinput
+                .iter()
+                .sub(expected_dloss_dinput.iter())
+                .round(decimals)
+                .collect();
+
+            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
+            assert_eq!(zeros, delta_computed_dloss_dinput);
         }
 
         #[test]
@@ -2969,28 +3122,6 @@ pub mod attention {
                 },
                 total_iterations,
             );
-        }
-
-        fn new_inputs(
-            sequence_len: usize,
-            embedding_dimension: usize,
-            rng: &RngStrategy,
-        ) -> Vec<LayerValues> {
-            let init_strategy = LayerInitStrategy::Kaiming;
-
-            let mut inputs: Vec<LayerValues> =
-                iter::repeat(LayerValues::new(vec![0.0; embedding_dimension]))
-                    .take(sequence_len)
-                    .collect();
-
-            init_strategy.apply(
-                inputs.iter_mut().flat_map(|x| x.iter_mut()),
-                iter::empty(),
-                embedding_dimension,
-                &rng,
-            );
-
-            inputs
         }
     }
 }
@@ -3213,6 +3344,95 @@ pub mod dense {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::ml::transformer::tests::helpers::{compute_expected_dloss_dinput, new_linear};
+
+        use super::*;
+
+        #[test]
+        fn dense_can_compute_valid_gradients_for_simple_feed_forward() {
+            let delta_computed_dloss_dinput =
+                computed_dloss_dinput_delta(|_| (), LayerInitStrategy::Kaiming);
+
+            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
+            assert_eq!(zeros, delta_computed_dloss_dinput);
+        }
+
+        #[test]
+        fn dense_can_compute_valid_gradients_for_relu_feed_forward() {
+            let delta_computed_dloss_dinput = computed_dloss_dinput_delta(
+                |dense| dense.set_activation(NetworkActivationMode::RelU),
+                LayerInitStrategy::Kaiming,
+            );
+
+            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
+            assert_eq!(zeros, delta_computed_dloss_dinput);
+        }
+
+        #[test]
+        fn dense_can_compute_valid_gradients_for_tanh_feed_forward() {
+            let delta_computed_dloss_dinput = computed_dloss_dinput_delta(
+                |dense| dense.set_activation(NetworkActivationMode::Tanh),
+                LayerInitStrategy::Kaiming,
+            );
+
+            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
+            assert_eq!(zeros, delta_computed_dloss_dinput);
+        }
+
+        #[test]
+        fn dense_can_compute_valid_gradients_for_sigmoid_feed_forward() {
+            let delta_computed_dloss_dinput = computed_dloss_dinput_delta(
+                |dense| dense.set_activation(NetworkActivationMode::Sigmoid),
+                LayerInitStrategy::Kaiming,
+            );
+
+            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
+            assert_eq!(zeros, delta_computed_dloss_dinput);
+        }
+
+        fn computed_dloss_dinput_delta(
+            configure_fn: impl Fn(&mut Dense),
+            strategy: LayerInitStrategy,
+        ) -> Linear {
+            let seq_len = 4;
+            let embed_dim = 8;
+            let output_dim = 12;
+
+            let rng = RngStrategy::testable(1234);
+            let epsilon = 1e-8;
+            let decimals = 4;
+
+            let inputs = new_linear(seq_len, embed_dim, &rng);
+            let target = new_linear(seq_len, output_dim, &rng);
+
+            let mut dense = Dense::new(embed_dim, output_dim, &strategy, &rng);
+            configure_fn(&mut dense);
+
+            let output = dense.forward(&inputs).unwrap();
+            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
+            let dloss = dloss.collect();
+
+            let computed_dloss_dinput = dense.backward(&inputs, &dloss).unwrap();
+            let expected_dloss_dinput = compute_expected_dloss_dinput(
+                |inputs| dense.forward(inputs).unwrap(),
+                |output| {
+                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
+                    loss.values_iter().map(|(&x, ..)| x).sum()
+                },
+                inputs,
+                epsilon,
+            );
+
+            computed_dloss_dinput
+                .iter()
+                .sub(expected_dloss_dinput.iter())
+                .round(decimals)
+                .collect()
+        }
+    }
 }
 
 pub mod linear {
@@ -3394,6 +3614,45 @@ pub mod linear {
             self.inner.iter().all(|x| x.is_finite())
         }
 
+        pub fn show_heatmap_plot(&self, title: &'static str) {
+            use plotly::{common::ColorScalePalette, layout::Axis, HeatMap, Plot};
+
+            let rows = self
+                .rows_iter()
+                .map(|row| row.into_iter().copied().collect_vec())
+                .collect_vec();
+            let x_ticks = (0..self.stride).map(|x| x as f64).collect_vec();
+            let y_ticks = (0..self.count).map(|x| x as f64).collect_vec();
+
+            let mut plot = Plot::new();
+            let layout = plot.layout().clone();
+            let layout = layout
+                .x_axis(
+                    Axis::new()
+                        .tick_values(x_ticks)
+                        .title("col / stride".into()),
+                )
+                .y_axis(
+                    Axis::new()
+                        .tick_values(y_ticks)
+                        .title("row / count".into()),
+                )
+                .title(title.into())
+                .width(1000)
+                .height(800);
+
+            plot.set_layout(layout);
+            plot.add_trace(
+                HeatMap::new_z(rows)
+                    .name("block output")
+                    .x_axis("col / stride")
+                    .y_axis("row / count")
+                    .color_scale(ColorScalePalette::Blackbody.into())
+                    .auto_color_scale(false),
+            );
+            plot.show();
+        }
+
         pub fn to_values(self) -> Vec<LayerValues> {
             self.rows_iter()
                 .map(|x| LayerValues::new(x.to_vec()))
@@ -3518,6 +3777,14 @@ pub mod linear {
         pub fn powf_scalar(self, n: NodeValue) -> Self {
             Self {
                 inner: Box::new(self.inner.map(move |x| x.powf(n))),
+                stride: self.stride,
+                count: self.count,
+            }
+        }
+        pub fn round(self, decimals: u32) -> Self {
+            let mul = 10u32.pow(decimals) as f64;
+            Self {
+                inner: Box::new(self.inner.map(move |x| (x * mul).round() / mul)),
                 stride: self.stride,
                 count: self.count,
             }
@@ -3854,6 +4121,31 @@ pub mod linear {
             .unwrap();
             assert_eq!(expected, y);
         }
+
+        #[test]
+        fn can_linear_split_and_concat_again() {
+            let x = Linear::from_values(&[
+                [11.0, 12.0, 13.0, 21.0, 22.0, 23.0, 31.0, 32.0, 33.0].into(),
+                [11.1, 12.1, 13.1, 21.1, 22.1, 23.1, 31.1, 32.1, 33.1].into(),
+                [11.2, 12.2, 13.2, 21.2, 22.2, 23.2, 31.2, 32.2, 33.2].into(),
+            ])
+            .unwrap();
+
+            let split = x.split(3);
+            let expected_split = Linear::from_iter(
+                3,
+                [11.0, 12.0, 13.0, 11.1, 12.1, 13.1, 11.2, 12.2, 13.2].into_iter(),
+            )
+            .unwrap();
+            assert_eq!(3, split.len());
+            assert_eq!(expected_split, split[0]);
+
+            let joined = &split[0].concat(&split[1]).collect();
+            let joined = joined.concat(&split[2]).collect();
+            let expected_joined = x;
+
+            assert_eq!(expected_joined, joined);
+        }
     }
 }
 
@@ -3862,7 +4154,9 @@ pub mod solver {
 
     use crate::ml::NodeValue;
 
-    use self::source::{DefaultOptimizerCache, OptimizerSource};
+    use self::source::{
+        DefaultOptimizerCache, DynamicOptimizerFactory, OptimizerSource,
+    };
 
     use super::linear::Linear;
 
@@ -3893,10 +4187,18 @@ pub mod solver {
             builder::AdamOptimizerBuilder::new(param_count, param_dimension)
         }
 
-        pub fn new_cache(learn_rate: NodeValue) -> impl OptimizerSource {
-            DefaultOptimizerCache::new(move |param_count, param_dimension| {
-                Self::new(param_count, param_dimension, learn_rate)
-            })
+        pub fn set_eta(&mut self, eta: f64) {
+            self.eta = eta;
+        }
+
+        pub fn new_cache(
+            learn_rate: NodeValue,
+        ) -> DefaultOptimizerCache<DynamicOptimizerFactory<Self>, Self> {
+            DefaultOptimizerCache::new(DynamicOptimizerFactory::new(
+                move |param_count, param_dimension| {
+                    Self::new(param_count, param_dimension, learn_rate)
+                },
+            ))
         }
     }
 
@@ -3984,9 +4286,11 @@ pub mod solver {
         }
 
         pub fn new_cache(learn_rate: NodeValue) -> impl OptimizerSource {
-            DefaultOptimizerCache::new(move |param_count, param_dimension| {
-                Self::new(param_count, param_dimension).with_eta(learn_rate)
-            })
+            DefaultOptimizerCache::new(DynamicOptimizerFactory::new(
+                move |param_count, param_dimension| {
+                    Self::new(param_count, param_dimension).with_eta(learn_rate)
+                },
+            ))
         }
     }
 
@@ -4029,7 +4333,9 @@ pub mod solver {
         }
 
         pub fn new_cache(learn_rate: NodeValue) -> impl OptimizerSource {
-            DefaultOptimizerCache::new(move |_, _| Self::new(learn_rate))
+            DefaultOptimizerCache::new(DynamicOptimizerFactory::new(move |_, _| {
+                Self::new(learn_rate)
+            }))
         }
     }
 
@@ -4048,13 +4354,13 @@ pub mod solver {
     }
 
     pub mod source {
-        use std::{cell::RefCell, collections::HashMap, rc::Rc};
+        use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
         use tracing::debug;
 
         use super::{lazy::LazyOptimizer, Optimizer};
 
-        pub trait OptimizerSource
+        pub trait OptimizerSource: Clone
         where
             <Self as OptimizerSource>::Optimizer: Optimizer,
         {
@@ -4068,33 +4374,65 @@ pub mod solver {
             ) -> Self::Optimizer;
             fn create_lazy(&self) -> LazyOptimizer<Self::Optimizer>;
             fn create_lazy_named(&self, instance_name: String) -> LazyOptimizer<Self::Optimizer>;
+            fn with_next_index(&self) -> Box<Self> {
+                self.with_index(1)
+            }
+            fn with_index(&self, index: usize) -> Box<Self> {
+                _ = index;
+                Box::new(self.clone())
+            }
+        }
+
+        pub trait DefaultOptimizerFactory<O>: Clone {
+            fn create(&self, param_count: usize, param_dimension: usize) -> O;
         }
 
         pub struct DefaultOptimizerCache<F, O>
         where
-            F: Fn(usize, usize) -> O + 'static,
+            F: DefaultOptimizerFactory<O>,
         {
             factory: F,
-            instances: RefCell<HashMap<String, Rc<RefCell<O>>>>,
+            instances: Rc<RefCell<HashMap<String, Rc<RefCell<O>>>>>,
+            depth: usize,
         }
 
-        impl<'a, F: Fn(usize, usize) -> O + 'static, O> DefaultOptimizerCache<F, O> {
+        impl<F, O> Clone for DefaultOptimizerCache<F, O>
+        where
+            F: DefaultOptimizerFactory<O>,
+        {
+            fn clone(&self) -> Self {
+                Self {
+                    factory: self.factory.clone(),
+                    instances: self.instances.clone(),
+                    depth: self.depth.clone(),
+                }
+            }
+        }
+
+        impl<'a, F: DefaultOptimizerFactory<O>, O> DefaultOptimizerCache<F, O> {
             pub fn new(factory: F) -> Self {
                 Self {
                     factory,
-                    instances: RefCell::new(HashMap::new()),
+                    instances: Rc::new(RefCell::new(HashMap::new())),
+                    depth: 0,
                 }
             }
 
             fn new_instance(&self, param_count: usize, param_dimension: usize) -> O {
-                let factory = &self.factory;
-                factory(param_count, param_dimension)
+                self.factory.create(param_count, param_dimension)
+            }
+
+            pub fn for_each_mut<G: FnMut(&mut O) -> ()>(&mut self, mut f: G) {
+                self.instances
+                    .borrow_mut()
+                    .values()
+                    .for_each(|x| f(&mut (*x.borrow_mut())))
             }
         }
 
         impl<F, O> OptimizerSource for DefaultOptimizerCache<F, O>
         where
-            F: Fn(usize, usize) -> O + 'static,
+            F: DefaultOptimizerFactory<O>,
             O: Optimizer + 'static,
         {
             type Optimizer = OptimizerCacheEntry<O>;
@@ -4105,10 +4443,11 @@ pub mod solver {
                 param_dimension: usize,
                 instance_name: Option<String>,
             ) -> Self::Optimizer {
-                let name = instance_name.unwrap_or_else(|| {
+                let mut name = instance_name.unwrap_or_else(|| {
                     let id = self.instances.borrow().len();
-                    format!("unnamed_{id}")
+                    format!("unnamed_{id}_")
                 });
+                name.extend(self.depth.to_string().chars());
                 let value = self
                     .instances
                     .borrow_mut()
@@ -4134,6 +4473,15 @@ pub mod solver {
                     self.create(param_count, param_dimension, Some(instance_name))
                 })
             }
+
+            fn with_index(&self, index: usize) -> Box<Self> {
+                assert!(index < 10);
+                Box::new(Self {
+                    factory: self.factory.clone(),
+                    instances: self.instances.clone(),
+                    depth: (self.depth * 10) + index,
+                })
+            }
         }
 
         pub struct OptimizerCacheEntry<O>(Rc<RefCell<O>>);
@@ -4148,11 +4496,37 @@ pub mod solver {
             }
         }
 
+        pub struct DynamicOptimizerFactory<O> {
+            inner: Arc<dyn Fn(usize, usize) -> O>,
+        }
+
+        impl<O> Clone for DynamicOptimizerFactory<O> {
+            fn clone(&self) -> Self {
+                Self {
+                    inner: self.inner.clone(),
+                }
+            }
+        }
+
+        impl<O> DynamicOptimizerFactory<O> {
+            pub fn new<F: Fn(usize, usize) -> O + 'static>(inner: F) -> Self {
+                Self {
+                    inner: Arc::new(inner),
+                }
+            }
+        }
+
+        impl<O> DefaultOptimizerFactory<O> for DynamicOptimizerFactory<O> {
+            fn create(&self, param_count: usize, param_dimension: usize) -> O {
+                (self.inner)(param_count, param_dimension)
+            }
+        }
+
         #[macro_export]
         macro_rules! lazy_opt {
             ($opt:expr, $linear:expr) => {
                 $opt.create_lazy_named(format!(
-                    "f={},l={},c={}__{}_{}_{}",
+                    "f={},l={},c={}__{}_{}_{}_",
                     file!(),
                     line!(),
                     column!(),
@@ -4162,7 +4536,7 @@ pub mod solver {
                 ))
             };
             ($opt:expr) => {
-                $opt.create_lazy_named(format!("f={},l={},c={}", file!(), line!(), column!()))
+                $opt.create_lazy_named(format!("f={},l={},c={}_", file!(), line!(), column!()))
             };
         }
 
@@ -4170,7 +4544,7 @@ pub mod solver {
         macro_rules! cached_opt {
             ($opt:expr, $linear:expr) => {
                 $opt.create(format!(
-                    "f={},l={},c={}__{}_{}_{}",
+                    "f={},l={},c={}__{}_{}_{}_",
                     file!(),
                     line!(),
                     column!(),
@@ -4442,6 +4816,46 @@ mod tests {
                 initial_mean_loss,
                 mean_loss
             );
+        }
+
+        pub fn compute_expected_dloss_dinput(
+            forward_fn: impl Fn(&Linear) -> Linear,
+            loss_fn: impl Fn(&Linear) -> f64,
+            inputs: Linear,
+            epsilon: f64,
+        ) -> Linear {
+            let output = forward_fn(&inputs);
+            let original_loss = loss_fn(&output);
+            let stride = inputs.stride();
+
+            let inputs_vec: Vec<_> = inputs.values_iter().collect();
+            let mut dloss_dinput = vec![];
+
+            for (target_idx, (&source, ..)) in inputs_vec.iter().enumerate() {
+                let target = source + epsilon;
+                let perturbed = Linear::from_iter(
+                    stride,
+                    inputs_vec
+                        .iter()
+                        .enumerate()
+                        .map(|(source_idx, (&source, ..))| {
+                            if source_idx == target_idx {
+                                target
+                            } else {
+                                source
+                            }
+                        }),
+                );
+
+                let output = forward_fn(&perturbed.unwrap());
+                let loss = loss_fn(&output);
+                let loss_delta = loss - original_loss;
+                let dinput = loss_delta / epsilon;
+
+                dloss_dinput.push(dinput);
+            }
+
+            Linear::from_iter(stride, dloss_dinput.into_iter()).unwrap()
         }
 
         pub fn new_linear(seq_len: usize, embedding_dimension: usize, rng: &RngStrategy) -> Linear {
