@@ -6,3 +6,5 @@
 !/res/scripts
 !/res/tiny*.txt
 .DS_Store
+flamegraph*.svg
+cargo-flamegraph*.stacks
