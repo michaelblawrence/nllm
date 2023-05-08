@@ -1,19 +1,28 @@
-use std::{cell::UnsafeCell, ops::Deref, rc::Rc};
+use std::{collections::HashMap, hash::Hash, ops::Deref, rc::Rc};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::ml::NodeValue;
 
+use self::{store::GlobalRngStore, cell::RngCell};
+
 #[derive(Clone, Serialize, Deserialize)]
 pub enum RngStrategy {
     Default,
+
     Debug {
         seed: u32,
     },
+
     #[serde(serialize_with = "serialize_cached")]
     #[serde(skip_deserializing)]
     Cached(Rc<dyn RNG>, Box<RngStrategy>),
+
+    #[serde(alias = "Cached")]
+    #[serde(serialize_with = "serialize_unknown")]
+    #[serde(deserialize_with = "deserialize_unknown")]
+    Unknown(Option<Box<RngStrategy>>),
 }
 
 impl Default for RngStrategy {
@@ -44,6 +53,7 @@ impl RngStrategy {
     pub fn to_rc(&self) -> Rc<dyn RNG> {
         match self {
             RngStrategy::Cached(instance, _) => instance.clone(),
+            RngStrategy::Unknown(Some(restored)) => GlobalRngStore::get(restored).to_rc(),
             rng => rng.factory().unwrap().into(),
         }
     }
@@ -51,6 +61,7 @@ impl RngStrategy {
     pub fn with_rng<F: Fn(&dyn RNG) -> O, O>(&self, func: F) -> O {
         match self {
             RngStrategy::Cached(instance, _) => func(instance.as_ref()),
+            RngStrategy::Unknown(Some(restored)) => GlobalRngStore::get(restored).with_rng(func),
             rng => func(&*rng.factory().unwrap()),
         }
     }
@@ -58,18 +69,45 @@ impl RngStrategy {
     pub fn upgrade(self) -> Self {
         match self {
             RngStrategy::Cached(instance, strategy) => RngStrategy::Cached(instance, strategy),
+            RngStrategy::Unknown(None) => RngStrategy::Default.upgrade(),
+            RngStrategy::Unknown(Some(restored)) => {
+                (*GlobalRngStore::get(&restored)).clone().upgrade()
+            }
             rng => RngStrategy::Cached(rng.to_rc(), Box::new(rng)),
         }
     }
 
     fn factory(&self) -> Option<Box<dyn RNG>> {
         match self {
-            RngStrategy::Default => Some(Box::new(JsRng::default())),
+            RngStrategy::Default | RngStrategy::Unknown(_) => Some(Box::new(JsRng::default())),
             RngStrategy::Debug { seed } => Some(Box::new(SeedableTestRng::new(*seed))),
             RngStrategy::Cached(_, _) => None,
         }
     }
+
+    /// Returns `true` if the rng strategy is [`Cached`].
+    ///
+    /// [`Cached`]: RngStrategy::Cached
+    #[must_use]
+    pub fn is_cached(&self) -> bool {
+        matches!(self, Self::Cached(..))
+    }
+
+    /// Returns `true` if the rng strategy is [`Debug`].
+    ///
+    /// [`Debug`]: RngStrategy::Debug
+    #[must_use]
+    pub fn is_debug(&self) -> bool {
+        match self {
+            Self::Debug { .. } => true,
+            Self::Cached(_, inner) => inner.is_debug(),
+            Self::Unknown(Some(restored)) => restored.is_debug(),
+            _ => false,
+        }
+    }
 }
+
+unsafe impl Send for RngStrategy {}
 
 fn serialize_cached<S>(
     _: &Rc<dyn RNG>,
@@ -79,7 +117,35 @@ fn serialize_cached<S>(
 where
     S: serde::Serializer,
 {
+    let mut inner = inner;
+    while let RngStrategy::Cached(_, child) = &**inner {
+        inner = child;
+    }
     inner.serialize(serializer)
+}
+
+fn serialize_unknown<S>(
+    inner: &Option<Box<RngStrategy>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if let Some(child) = &inner {
+        child.serialize(serializer)
+    } else {
+        inner.serialize(serializer)
+    }
+}
+
+fn deserialize_unknown<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Box<RngStrategy>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rng = RngStrategy::deserialize(deserializer)?;
+    Ok(Some(Box::new(rng)))
 }
 
 impl std::fmt::Debug for RngStrategy {
@@ -87,7 +153,8 @@ impl std::fmt::Debug for RngStrategy {
         match self {
             Self::Default => write!(f, "Default"),
             Self::Debug { seed } => f.debug_struct("Debug").field("seed", seed).finish(),
-            Self::Cached (_, inner) => f.debug_struct("Cached").field("inner", inner).finish(),
+            Self::Cached(_, inner) => f.debug_struct("Cached").field("inner", inner).finish(),
+            Self::Unknown(inner) => f.debug_struct("Unknown").field("inner", inner).finish(),
         }
     }
 }
@@ -112,40 +179,135 @@ impl RNG for JsRng {
     }
 }
 
-pub struct SeedableTestRng(UnsafeCell<algo::mersenne_twister::MersenneTwister>);
+mod cell {
+    #[cfg(feature = "threadpool")]
+    use std::sync::Mutex;
+    #[cfg(not(feature = "threadpool"))]
+    use std::cell::UnsafeCell;
+
+    // TODO: evaluate perf for 'threadpool' feature
+    #[cfg(feature = "threadpool")]
+    pub(crate) struct RngCell<T>(Mutex<T>);
+
+    #[cfg(feature = "threadpool")]
+    impl<'a, T> RngCell<T> {
+        pub fn new(value: T) -> Self {
+            Self(Mutex::new(value))
+        }
+
+        pub fn with_inner<F: Fn(&mut T) -> O, O>(&'a self, func: F) -> O {
+            let mut cell = self.0.lock().unwrap();
+            func(&mut *cell)
+        }
+    }
+
+    #[cfg(not(feature = "threadpool"))]
+    pub(crate) struct RngCell<T>(UnsafeCell<T>);
+
+    #[cfg(not(feature = "threadpool"))]
+    impl<'a, T> RngCell<T> {
+        pub fn new(value: T) -> Self {
+            Self(UnsafeCell::new(value))
+        }
+
+        pub fn with_inner<F: Fn(&mut T) -> O, O>(&'a self, func: F) -> O {
+            let inner = unsafe { &mut *self.0.get() };
+            func(inner)
+        }
+    }
+}
+
+mod store {
+    use super::*;
+    use std::cell::RefCell;
+    thread_local! {
+        static FOO: RefCell<HashMap<u64, Rc<RngStrategy>>> = RefCell::new(HashMap::default());
+    }
+
+    #[derive(Debug)]
+    struct GlobalRngStoreEntry<'a>(&'a RngStrategy);
+
+    impl<'a> GlobalRngStoreEntry<'a> {
+        fn to_hash(&self) -> u64 {
+            use std::hash::Hasher;
+
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.hash(&mut hasher);
+            hasher.finish()
+        }
+    }
+
+    impl<'a> Eq for GlobalRngStoreEntry<'a> {}
+
+    impl<'a> PartialEq for GlobalRngStoreEntry<'a> {
+        fn eq(&self, other: &Self) -> bool {
+            let hash1 = self.to_hash();
+            let hash2 = other.to_hash();
+            hash1 == hash2
+        }
+    }
+
+    impl<'a> Hash for GlobalRngStoreEntry<'a> {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            match self.0 {
+                RngStrategy::Default => "default".hash(state),
+                RngStrategy::Debug { seed } => ("no_upgrade_debug", seed).hash(state),
+                RngStrategy::Cached(_, inner) => Self(&inner).hash(state),
+                RngStrategy::Unknown(Some(inner)) => {
+                    ("no_upgrade", Self(&inner).hash(state)).hash(state)
+                }
+                RngStrategy::Unknown(None) => "unknown".hash(state),
+            }
+        }
+    }
+
+    pub struct GlobalRngStore;
+
+    impl GlobalRngStore {
+        pub fn get(rng: &RngStrategy) -> Rc<RngStrategy> {
+            let entry = GlobalRngStoreEntry(rng);
+            FOO.with(|foo| {
+                foo.borrow_mut()
+                    .entry(entry.to_hash())
+                    .or_insert_with(|| Rc::new(rng.clone().upgrade()))
+                    .clone()
+            })
+        }
+    }
+}
+
+pub struct SeedableTestRng(RngCell<algo::mersenne_twister::MersenneTwister>);
 
 impl SeedableTestRng {
     pub fn new(seed: u32) -> Self {
-        Self(UnsafeCell::new(
-            algo::mersenne_twister::MersenneTwister::new(seed),
-        ))
+        Self(RngCell::new(algo::mersenne_twister::MersenneTwister::new(
+            seed,
+        )))
     }
 }
 
 impl RNG for SeedableTestRng {
     fn rand(&self) -> NodeValue {
         let rand = {
-            let inner = unsafe { &mut *self.0.get() };
-            let rand = inner.rand() - 1;
+            let rand = self.0.with_inner(|inner| inner.rand() - 1);
             rand as NodeValue
         };
         rand * algo::mersenne_twister::F64_MULTIPLIER
     }
 }
 
-pub struct FastSeedableTestRng(UnsafeCell<algo::park_miller::ParkMiller>);
+pub struct FastSeedableTestRng(RngCell<algo::park_miller::ParkMiller>);
 
 impl FastSeedableTestRng {
     pub fn new(seed: u64) -> Self {
-        Self(UnsafeCell::new(algo::park_miller::ParkMiller::new(seed)))
+        Self(RngCell::new(algo::park_miller::ParkMiller::new(seed)))
     }
 }
 
 impl RNG for FastSeedableTestRng {
     fn rand(&self) -> NodeValue {
         let rand = {
-            let inner = unsafe { &mut *self.0.get() };
-            let rand = inner.rand() - 1;
+            let rand = self.0.with_inner(|inner| inner.rand() - 1);
             rand as NodeValue
         };
         rand * algo::park_miller::F64_MULTIPLIER
@@ -155,6 +317,85 @@ impl RNG for FastSeedableTestRng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rng_strategy_can_be_serialized() {
+        // default rng
+        let rng_from_variant = RngStrategy::Default;
+        let json = serde_json::to_string(&rng_from_variant).unwrap();
+        assert!(!json.is_empty());
+
+        let rng_upgraded = rng_from_variant.upgrade();
+        let json = serde_json::to_string(&rng_upgraded).unwrap();
+        assert!(!json.is_empty());
+
+        let rng_from_factory = RngStrategy::default();
+        let json = serde_json::to_string(&rng_from_factory).unwrap();
+        assert!(!json.is_empty());
+
+        // seeded rng
+        let rng_from_variant = RngStrategy::Debug { seed: 1234 };
+        let json = serde_json::to_string(&rng_from_variant).unwrap();
+        assert!(!json.is_empty());
+
+        let rng_upgraded = rng_from_variant.upgrade();
+        let json = serde_json::to_string(&rng_upgraded).unwrap();
+        assert!(!json.is_empty());
+
+        let rng_from_factory = RngStrategy::testable(1234);
+        let json = serde_json::to_string(&rng_from_factory).unwrap();
+        assert!(!json.is_empty());
+    }
+
+    #[test]
+    fn rng_strategy_can_be_deserialized() {
+        // default rng
+        let src_rng = RngStrategy::default();
+        let json = serde_json::to_string(&src_rng).unwrap();
+        let rng_from_json: RngStrategy = serde_json::from_str(dbg!(&json)).unwrap();
+        let rng = rng_from_json.upgrade();
+        assert!(rng.is_cached());
+        assert!(!rng.is_debug());
+
+        // seeded rng
+        let src_rng = RngStrategy::testable(1234);
+        let json = serde_json::to_string(&src_rng).unwrap();
+        let rng_from_json: RngStrategy = serde_json::from_str(dbg!(&json)).unwrap();
+        let rng = rng_from_json.upgrade();
+        assert!(rng.is_cached());
+        assert!(rng.is_debug());
+    }
+
+    #[test]
+    fn rng_strategy_can_be_deserialized_and_joined() {
+        // seeded rng
+        let src_rng = RngStrategy::testable(1234);
+        let json = serde_json::to_string(&src_rng).unwrap();
+        let rng_from_json_1: RngStrategy = serde_json::from_str(dbg!(&json)).unwrap();
+        let rng_from_json_2: RngStrategy = serde_json::from_str(dbg!(&json)).unwrap();
+
+        let sample1 = rng_from_json_1.rand_range(0, 1000);
+        let sample2 = rng_from_json_2.rand_range(0, 1000);
+
+        assert_ne!(sample1, sample2);
+        assert!(rng_from_json_1.is_debug());
+        assert!(rng_from_json_2.is_debug());
+    }
+
+    #[test]
+    fn rng_strategy_can_be_deserialized_repeatedly() {
+        // seeded rng
+        let src_rng = RngStrategy::testable(1234);
+
+        let json_1 = serde_json::to_string(&src_rng).unwrap();
+        let rng_from_json_1: RngStrategy = serde_json::from_str(dbg!(&json_1)).unwrap();
+
+        let json_2 = serde_json::to_string(&rng_from_json_1).unwrap();
+        let rng_from_json_2: RngStrategy = serde_json::from_str(dbg!(&json_2)).unwrap();
+
+        assert!(rng_from_json_1.is_debug());
+        assert!(rng_from_json_2.is_debug());
+    }
 
     #[test]
     fn seedable_test_rng_samples_uniformly() {
