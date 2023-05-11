@@ -3,16 +3,15 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use std::{
-    sync::mpsc,
+    sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
 
 use plane::ml::{
-    embeddings::{builder::EmbeddingBuilder, Embedding},
-    NodeValue,
+    embeddings::builder::EmbeddingBuilder, seq2seq::transformer::CharacterTransformer, NodeValue,
 };
 
-use crate::training;
+use crate::{model::MLModel, training};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TrainerMessage {
@@ -38,12 +37,13 @@ pub enum TrainerMessage {
     PlotTrainingLossGraphDispatch(TrainerStateMetadata),
     NoOp,
     UnpauseForSingleIteration,
+    PlotHeatMapGraphs,
 }
 
 impl TrainerMessage {
-    pub fn apply(
+    pub fn apply<M: MLModel>(
         self,
-        embedding: &Embedding,
+        model: &M,
         config: &crate::config::TrainEmbeddingConfig,
     ) -> TrainerHandleActions {
         match self {
@@ -70,7 +70,7 @@ impl TrainerMessage {
                 TrainerHandleActions::DispatchWithMetadata(TrainerMessage::PlotTrainingLossGraph)
             }
             TrainerMessage::PlotTrainingLossGraphDispatch(metadata) => {
-                training::writer::plot_training_loss(&embedding, &config, &metadata);
+                training::writer::plot_training_loss(&config, &metadata);
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::RenameOutputLabel(output_label) => {
@@ -81,7 +81,7 @@ impl TrainerMessage {
             }
             TrainerMessage::WriteModelAndMetadataToDisk(metadata) => {
                 let path = training::writer::write_model_to_disk(
-                    &embedding,
+                    model,
                     &config,
                     &metadata,
                     "embed",
@@ -92,25 +92,35 @@ impl TrainerMessage {
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::WriteStatsToDisk => {
-                training::writer::write_results_to_disk(&embedding, "embed");
+                match model.as_embedding() {
+                    Some(embedding) => training::writer::write_results_to_disk(&embedding, "embed"),
+                    None => todo!("not yet implement for s2s"),
+                };
                 info!("Results written to disk");
                 TrainerHandleActions::Nothing
             }
             // TODO: dispatch back metadata for consistent output label handling
             TrainerMessage::WriteEmbeddingTsvToDisk => {
-                training::writer::write_embedding_tsv_to_disk(
-                    &embedding,
-                    "embed",
-                    &config.output_dir,
-                    &config.output_label,
-                );
+                match model.as_embedding() {
+                    Some(embedding) => training::writer::write_embedding_tsv_to_disk(
+                        &embedding,
+                        "embed",
+                        &config.output_dir,
+                        &config.output_label,
+                    ),
+                    None => todo!("not yet implement for s2s"),
+                };
                 info!("Embedding TSV written to disk");
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::PredictRandomPhrase => {
                 let sep = if config.use_character_tokens { "" } else { " " };
-                let generated_phrase = embedding.generate_sequence_string(sep);
+                let generated_phrase = model.generate_sequence_string(sep);
                 info!("Generated a new phrase:  {}", generated_phrase);
+                TrainerHandleActions::Nothing
+            }
+            TrainerMessage::PlotHeatMapGraphs => {
+                // plane::ml::transformer::linear::Linear::show_all_heatmap_plots();
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::NoOp => TrainerHandleActions::Nothing,
@@ -150,13 +160,11 @@ pub enum TrainerHandleActions {
 }
 
 impl TrainerHandleActions {
-    pub fn apply<F>(
+    pub fn apply<M: MLModel>(
         self,
-        state: &mut training::TrainerState,
-        handle: &TrainerHandle<TrainerMessage, F>,
-    ) where
-        F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions,
-    {
+        state: &mut training::TrainerState<M>,
+        handle: &TrainerHandle<TrainerMessage, M>,
+    ) {
         match self {
             TrainerHandleActions::Nothing => (),
             TrainerHandleActions::LearnRateMulMut(factor) => {
@@ -195,12 +203,16 @@ impl TrainerHandleActions {
             TrainerHandleActions::ReloadFromSnapshot => {
                 let state_recovered = if let Some(snapshot) = &state.snapshot.0 {
                     info!("Recovering state from snapshot..");
-                    match EmbeddingBuilder::from_snapshot(&snapshot).and_then(|x| x.build()) {
-                        Ok(embedding) => {
-                            state.embedding = embedding;
-                            Ok(())
+                    if let Some(_) = state.model.as_embedding() {
+                        match EmbeddingBuilder::from_snapshot(&snapshot).and_then(|x| x.build()) {
+                            Ok(model) => {
+                                state.model = model.into();
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
+                    } else {
+                        panic!("can not reload s2s yet")
                     }
                 } else {
                     Err(anyhow!(
@@ -217,7 +229,7 @@ impl TrainerHandleActions {
                 };
             }
             TrainerHandleActions::ForceSnapshot => {
-                let json = state.embedding.snapshot().unwrap();
+                let json = state.model.snapshot().unwrap();
                 state.snapshot = (Some(json), Instant::now());
                 info!("Forced snapshot save to memory");
             }
@@ -242,22 +254,31 @@ impl TrainerHandleActions {
                 state.set_output_label(output_label);
             }
             TrainerHandleActions::ReplaceEmbeddingState(snapshot, new_state) => {
-                let (new_embedding, build_ctx) = EmbeddingBuilder::from_snapshot(&snapshot)
-                    .unwrap()
-                    .with_hidden_layer_custom_shape(state.hidden_layer_shape())
-                    .with_input_stride_width(state.input_stride_width())
-                    .build_advanced()
-                    .unwrap();
+                let new_model = if let Some(embedding) = state.model.as_embedding() {
+                    let (new_embedding, build_ctx) = EmbeddingBuilder::from_snapshot(&snapshot)
+                        .unwrap()
+                        .with_hidden_layer_custom_shape(state.hidden_layer_shape())
+                        .with_input_stride_width(state.input_stride_width())
+                        .build_advanced()
+                        .unwrap();
 
-                if build_ctx.rebuilt_network {
-                    let old_shape = state.embedding.shape().desc_pretty();
-                    let new_shape = new_embedding.shape().desc_pretty();
-                    info!("Built new hidden model from restored snapshot embedding data with shape = [{}] (previously [{}])",
+                    if build_ctx.rebuilt_network {
+                        let old_shape = embedding.shape().desc_pretty();
+                        let new_shape = new_embedding.shape().desc_pretty();
+                        info!("Built new hidden model from restored snapshot embedding data with shape = [{}] (previously [{}])",
                         new_shape, old_shape
                     );
-                }
+                    }
+                    new_embedding.into()
+                } else if let Some(_) = state.model.as_s2s() {
+                    let new_s2s = serde_json::from_str::<CharacterTransformer>(&snapshot).unwrap();
+                    M::from_s2s(new_s2s, new_state.learn_rate)
+                } else {
+                    panic!("can not restore unknown model");
+                };
 
-                state.set_embedding(new_embedding, new_state);
+                state.set_model(new_model, new_state);
+
                 state.pause();
                 info!("Restored loaded model and state, pausing...");
             }
@@ -267,21 +288,32 @@ impl TrainerHandleActions {
 
 pub type TrainerHandleSender<T> = mpsc::Sender<T>;
 
-pub struct TrainerHandle<Message: Send, F> {
+pub struct TrainerHandle<Message: Send, M> {
     pub tx: TrainerHandleSender<Message>,
     pub rx: mpsc::Receiver<Message>,
-    pub handler: F,
+    pub handler: Arc<dyn Fn(&M, Message) -> TrainerHandleActions>,
 }
 
-impl<Message, F> TrainerHandle<Message, F>
+unsafe impl<Message: Send, M> Send for TrainerHandle<Message, M> {}
+
+impl<Message, M> TrainerHandle<Message, M>
 where
     Message: Send,
-    F: Fn(&Embedding, Message) -> TrainerHandleActions,
 {
-    pub fn new(handler: F) -> (TrainerHandleSender<Message>, Self) {
+    pub fn new<F>(handler: F) -> (TrainerHandleSender<Message>, Self)
+    where
+        F: Fn(&M, Message) -> TrainerHandleActions + 'static,
+    {
         let (tx, rx) = mpsc::channel();
 
-        (tx.clone(), Self { tx, rx, handler })
+        (
+            tx.clone(),
+            Self {
+                tx,
+                rx,
+                handler: Arc::new(handler),
+            },
+        )
     }
 
     pub fn send(&self, t: Message) -> Result<(), mpsc::SendError<Message>> {
@@ -310,7 +342,7 @@ where
         }
     }
 
-    pub fn run(&self, embedding: &Embedding, msg: Message) -> TrainerHandleActions {
+    pub fn run(&self, embedding: &M, msg: Message) -> TrainerHandleActions {
         let handler = &self.handler;
         handler(&embedding, msg)
     }

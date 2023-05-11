@@ -9,6 +9,7 @@ use messages::{TrainerMessage, TrainerHandleSender};
 mod bounded;
 mod config;
 mod messages;
+mod model;
 mod training;
 
 #[cfg(not(feature = "thread"))]
@@ -19,7 +20,7 @@ fn main() -> Result<()> {
     let (config, resumed_state) = parse_cli_args()?;
 
     let config_clone = config.clone();
-    let (tx, handle) = messages::TrainerHandle::new(move |embedding, msg: TrainerMessage| {
+    let (tx, handle) = messages::TrainerHandle::new(move |embedding: &EmbedModel, msg: TrainerMessage| {
         let handle_action = msg.apply(embedding, &config_clone);
         handle_action
     });
@@ -41,12 +42,14 @@ fn main() -> Result<()> {
 
 #[cfg(feature = "thread")]
 fn main() -> Result<()> {
+    use model::EmbedModel;
+
     configure_logging();
     let (config, resumed_state) = parse_cli_args()?;
 
     let config_clone = config.clone();
-    let (tx, handle) = messages::TrainerHandle::new(move |embedding, msg: TrainerMessage| {
-        let handle_action = msg.apply(embedding, &config_clone);
+    let (tx, handle) = messages::TrainerHandle::new(move |model: &EmbedModel, msg: TrainerMessage| {
+        let handle_action = msg.apply(model, &config_clone);
         handle_action
     });
 
@@ -92,6 +95,7 @@ fn parse_repl_char(
         'x' => tx.send(TrainerMessage::ReloadFromSnapshot)?,
         'z' => tx.send(TrainerMessage::ForceSnapshot)?,
         'g' => tx.send(TrainerMessage::PlotTrainingLossGraph)?,
+        'G' => tx.send(TrainerMessage::PlotHeatMapGraphs)?, //tmp
         'n' => tx.send(TrainerMessage::PredictRandomPhrase)?,
         'w' => tx.send(TrainerMessage::WriteStatsToDisk)?,
         'W' => tx.send(TrainerMessage::WriteEmbeddingTsvToDisk)?,
@@ -119,6 +123,7 @@ fn parse_repl_char(
                         'n' => print new random phrase
                         'x' => reload from auto-save snapshot
                         'z' => force snapshot
+                        'G' => open next heatmap plots in browser (tmp)
                         'g' => open training plot in browser
                         'w' => write stats to disk
                         'W' => write embedding tsv to disk

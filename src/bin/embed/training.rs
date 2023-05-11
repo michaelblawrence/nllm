@@ -7,6 +7,8 @@ use std::{
 
 use plane::ml::{
     embeddings::{Embedding, TrainBatchConfig},
+    seq2seq::transformer::CharacterTransformer,
+    transformer::decoder::builder::DecoderBuilder,
     NodeValue, RngStrategy, RNG,
 };
 
@@ -19,12 +21,13 @@ use crate::{
     bounded::BoundedValueLogger,
     config::TrainEmbeddingConfig,
     messages::{
-        TrainerHandle, TrainerHandleActions, TrainerMessage, TrainerReport, TrainerStateMetadata, TrainerHandleSender,
+        TrainerHandle, TrainerHandleSender, TrainerMessage, TrainerReport, TrainerStateMetadata,
     },
+    model::MLModel,
 };
 
-pub struct TrainerState {
-    pub embedding: Embedding,
+pub struct TrainerState<M> {
+    pub model: M,
     pub handle_tx: TrainerHandleSender<TrainerMessage>,
     pub output_label: Option<String>,
     pub learn_rate: f64,
@@ -46,14 +49,14 @@ pub struct TrainerState {
     inital_config: TrainEmbeddingConfig,
 }
 
-impl TrainerState {
+impl<M: MLModel> TrainerState<M> {
     fn new(
-        embedding: Embedding,
+        model: M,
         config: &TrainEmbeddingConfig,
         handle_tx: &TrainerHandleSender<TrainerMessage>,
     ) -> Self {
         Self {
-            embedding,
+            model,
             handle_tx: handle_tx.clone(),
             inital_config: config.clone(),
             output_label: config.output_label.clone(),
@@ -82,7 +85,7 @@ impl TrainerState {
         }
         let started = Instant::now();
 
-        let train_error = self.embedding.train(phrases, self.learn_rate, batch_size);
+        let train_error = self.model.train(phrases, self.learn_rate, batch_size);
 
         let train_duration = started.elapsed();
         self.total_train_time += train_duration;
@@ -186,7 +189,7 @@ impl TrainerState {
     }
 
     fn perform_snapshot(&mut self) {
-        let json = self.embedding.snapshot().unwrap();
+        let json = self.model.snapshot().unwrap();
         self.snapshot = (Some(json), Instant::now());
     }
 
@@ -255,21 +258,8 @@ impl TrainerState {
         Self::build_hidden_layer_shape(&self.inital_config)
     }
 
-    pub fn build_hidden_layer_shape(config: &TrainEmbeddingConfig) -> Vec<usize> {
-        let layer_node_counts = [config.hidden_layer_nodes];
-        let layer_node_counts = layer_node_counts.into_iter().chain(
-            config
-                .hidden_deep_layer_nodes
-                .iter()
-                .flat_map(|csv| csv.split(','))
-                .filter_map(|x| x.trim().parse::<usize>().ok()),
-        );
-
-        layer_node_counts.collect()
-    }
-
-    pub fn set_embedding(&mut self, embedding: Embedding, metadata: TrainerStateMetadata) {
-        self.embedding = embedding;
+    pub fn set_model(&mut self, model: M, metadata: TrainerStateMetadata) {
+        self.model = model;
         self.round = metadata.current_round;
         self.training_rounds = metadata.training_rounds;
         self.learn_rate = metadata.learn_rate;
@@ -321,13 +311,65 @@ impl TrainerState {
     }
 }
 
-pub fn setup_and_train_embeddings_v2<F>(
+impl<M> TrainerState<M> {
+    pub fn build_hidden_layer_shape(config: &TrainEmbeddingConfig) -> Vec<usize> {
+        let layer_node_counts = [config.hidden_layer_nodes];
+        let layer_node_counts = layer_node_counts.into_iter().chain(
+            config
+                .hidden_deep_layer_nodes
+                .iter()
+                .flat_map(|csv| csv.split(','))
+                .filter_map(|x| x.trim().parse::<usize>().ok()),
+        );
+
+        layer_node_counts.collect()
+    }
+    
+    pub fn join_phrases(phrases: &Vec<Vec<String>>, char_tokens: Option<bool>) -> String {
+        let char_tokens =
+            char_tokens.unwrap_or_else(|| phrases.first().unwrap().iter().all(|x| x.len() <= 1));
+        {
+            use std::fmt::Write;
+
+            if char_tokens {
+                let vec = phrases
+                    .iter()
+                    .flat_map(|phrase| phrase.iter().flat_map(|p| p.chars().next()).chain(['\n']))
+                    .collect_vec();
+
+                vec.into_iter().collect()
+            } else {
+                let ref mut iter = phrases
+                    .iter()
+                    .flat_map(|phrase| {
+                        let separator = " ";
+                        Itertools::intersperse(phrase.iter().map(|p| p.as_str()), separator)
+                            .chain(["\n"])
+                    })
+                    .filter(|x| x.len() > 0);
+
+                match iter.next() {
+                    None => String::new(),
+                    Some(first_elt) => {
+                        // estimate lower bound of capacity needed
+                        let (lower, _) = iter.size_hint();
+                        let mut result = String::with_capacity(lower);
+                        write!(&mut result, "{}", first_elt).unwrap();
+                        iter.for_each(|elt| {
+                            write!(&mut result, "{}", elt).unwrap();
+                        });
+                        result
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn setup_and_train_embeddings_v2<M: MLModel>(
     config: TrainEmbeddingConfig,
-    handle: TrainerHandle<TrainerMessage, F>,
-) -> Embedding
-where
-    F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions,
-{
+    handle: TrainerHandle<TrainerMessage, M>,
+) -> M {
     let (phrases, testing_phrases, mut state) = init_embedding_state(config, &handle);
     let batch_size = state.batch_size();
 
@@ -336,7 +378,7 @@ where
         let recv_timeout = state.training_paused().then_some(Duration::from_secs(1));
 
         while let Ok(msg) = handle.try_recv(recv_timeout) {
-            let action = handle.run(&state.embedding, msg);
+            let action = handle.run(&state.model, msg);
             action.apply(&mut state, &handle);
         }
 
@@ -364,15 +406,15 @@ where
         state.complete_round();
     }
 
-    state.embedding
+    state.model
 }
 
-fn init_embedding_state<F>(
+fn init_embedding_state<M>(
     config: TrainEmbeddingConfig,
-    handle: &TrainerHandle<TrainerMessage, F>,
-) -> (Vec<Vec<String>>, Vec<Vec<String>>, TrainerState)
+    handle: &TrainerHandle<TrainerMessage, M>,
+) -> (Vec<Vec<String>>, Vec<Vec<String>>, TrainerState<M>)
 where
-    F: Fn(&Embedding, TrainerMessage) -> TrainerHandleActions,
+    M: MLModel,
 {
     info!("Initialising vocab and train/test sets");
     let rng: RngStrategy = Default::default();
@@ -403,29 +445,75 @@ where
         token_count(&testing_phrases), testing_phrases.len()
     );
 
-    let hidden_layer_shape = TrainerState::build_hidden_layer_shape(&config);
+    let model: M = if config.use_character_tokens && config.use_transformer {
+        info!("Using CharacterTransformer (S2S)...");
+        let builder = DecoderBuilder::new(
+            config.input_stride_width,
+            config.embedding_size,
+            vocab.len(),
+        );
+        let builder = builder
+            .with_dropout_rate(0.0)
+            .with_feed_forward_hidden_dimension(config.hidden_layer_nodes);
 
-    let embedding = Embedding::new_builder(vocab)
-        .with_embedding_dimensions(config.embedding_size)
-        .with_hidden_layer_custom_shape(hidden_layer_shape)
-        .with_input_stride_width(config.input_stride_width)
-        .with_activation_mode(config.activation_mode.into())
-        .with_rng(rng)
-        .build()
+        let builder = if let Some(block_count) = config
+            .hidden_deep_layer_nodes
+            .as_ref()
+            .and_then(|x| x.parse::<usize>().ok())
+        {
+            builder.with_block_count(block_count)
+        } else {
+            builder
+        };
+
+        let s2s = CharacterTransformer::from_builder(
+            builder,
+            vocab
+                .into_iter()
+                .map(|c| c.chars().next().unwrap())
+                .chain(['\n'])
+                .collect(),
+            rng,
+        )
         .unwrap();
 
-    let state = TrainerState::new(embedding, &config, &handle.tx);
+        s2s.into()
+    } else {
+        info!("Using Embedding...");
+        let hidden_layer_shape = TrainerState::<()>::build_hidden_layer_shape(&config);
+
+        let embedding = Embedding::new_builder(vocab)
+            .with_embedding_dimensions(config.embedding_size)
+            .with_hidden_layer_custom_shape(hidden_layer_shape)
+            .with_input_stride_width(config.input_stride_width)
+            .with_activation_mode(config.activation_mode.into())
+            .with_rng(rng)
+            .build()
+            .unwrap();
+
+        embedding.into()
+    };
+    let state = TrainerState::new(model, &config, &handle.tx);
 
     (phrases, testing_phrases, state)
 }
 
-fn report_round(
-    state: &mut TrainerState,
+fn report_round<M: MLModel>(
+    state: &mut TrainerState<M>,
     testing_phrases: &Vec<Vec<String>>,
     training_error: Option<f64>,
     label: Option<&str>,
 ) {
-    match validate::validate_embeddings(&state.embedding, testing_phrases) {
+    let validation_results = if let Some(embedding) = state.model.as_embedding() {
+        validate::validate_embeddings(embedding, testing_phrases)
+    } else if let Some(s2s) = state.model.as_s2s() {
+        let testing_phrases = TrainerState::<M>::join_phrases(&testing_phrases, Some(true));
+        Ok(validate::validate_s2s(s2s, &testing_phrases))
+    } else {
+        panic!("unknown model type: unable to run validation")
+    };
+
+    match validation_results {
         Ok((validation_errors, predictions_pct)) => {
             let report = validate::generate_training_report(
                 state.round,
@@ -519,7 +607,10 @@ pub fn init_phrases_and_vocab(
     (phrases, vocab)
 }
 
-fn compute_vocab(phrases: &Vec<Vec<String>>, testing_phrases: Option<&Vec<Vec<String>>>, ) -> HashSet<String> {
+fn compute_vocab(
+    phrases: &Vec<Vec<String>>,
+    testing_phrases: Option<&Vec<Vec<String>>>,
+) -> HashSet<String> {
     phrases
         .iter()
         .chain(testing_phrases.into_iter().flatten())
@@ -642,7 +733,7 @@ mod validate {
     use anyhow::{Context, Result};
     use tracing::info;
 
-    use plane::ml::{embeddings::Embedding, NodeValue};
+    use plane::ml::{embeddings::Embedding, seq2seq::transformer::CharacterTransformer, NodeValue};
 
     use crate::messages::TrainerReport;
 
@@ -713,7 +804,7 @@ mod validate {
         let mut total_first_word_predictions = 0;
 
         // TODO: take batch_size num of phrases or of training pairs randomly to validate..
-        // once perf hit is ngligable, run on each train iter and save/plot data 
+        // once perf hit is ngligable, run on each train iter and save/plot data
         for testing_phrase in testing_phrases.iter() {
             for testing_phrase_window in testing_phrase.windows(embedding.input_stride_width() + 1)
             {
@@ -745,6 +836,44 @@ mod validate {
         Ok((validation_errors, predictions_pct))
     }
 
+    pub fn validate_s2s(
+        transformer: &CharacterTransformer,
+        testing_phrases: &str,
+    ) -> (Vec<(f64, f64)>, f64) {
+        use itertools::Itertools;
+
+        let mut validation_errors = vec![];
+        let mut correct_first_word_predictions = 0;
+        let mut total_first_word_predictions = 0;
+
+        for testing_phrase_window in testing_phrases
+            .chars()
+            .chunks(transformer.input_stride_width() + 1)
+            .into_iter()
+        {
+            let testing_phrase_window = testing_phrase_window.collect_vec();
+            let (&last_token, context_tokens) = testing_phrase_window.split_last().unwrap();
+
+            let predicted = transformer.predict_next(&context_tokens).unwrap();
+            let actual = last_token;
+
+            if predicted == actual {
+                correct_first_word_predictions += 1;
+            }
+
+            let error = transformer
+                .compute_error(&[context_tokens, &[actual]].concat())
+                .unwrap();
+            let nll = transformer.nll(&context_tokens, actual).unwrap();
+            validation_errors.push((error, nll));
+            total_first_word_predictions += 1;
+        }
+
+        let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
+            / total_first_word_predictions as NodeValue;
+        (validation_errors, predictions_pct)
+    }
+
     pub fn should_report_round(round: usize, training_rounds: usize) -> bool {
         let round_1based = round + 1;
 
@@ -771,13 +900,9 @@ pub mod writer {
 
     use plane::ml::embeddings::Embedding;
 
-    use crate::{config::TrainEmbeddingConfig, messages::TrainerStateMetadata};
+    use crate::{config::TrainEmbeddingConfig, messages::TrainerStateMetadata, model::MLModel};
 
-    pub fn plot_training_loss(
-        _embedding: &Embedding,
-        config: &&TrainEmbeddingConfig,
-        metadata: &TrainerStateMetadata,
-    ) {
+    pub fn plot_training_loss(config: &&TrainEmbeddingConfig, metadata: &TrainerStateMetadata) {
         use plotly::{Plot, Scatter};
 
         let x_points = metadata
@@ -830,8 +955,8 @@ pub mod writer {
         Ok((snapshot, config, state))
     }
 
-    pub fn write_model_to_disk(
-        embedding: &Embedding,
+    pub fn write_model_to_disk<M: MLModel>(
+        embedding: &M,
         config: &TrainEmbeddingConfig,
         state: &TrainerStateMetadata,
         label: &str,

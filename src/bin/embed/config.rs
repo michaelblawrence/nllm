@@ -31,6 +31,10 @@ pub struct TrainEmbeddingConfig {
     #[serde(default)]
     pub use_character_tokens: bool,
 
+    #[arg(short = 'L', long, default_value_t = false)]
+    #[serde(default)]
+    pub use_transformer: bool,
+
     #[arg(short = 'r', long, default_value_t = 1e-3)]
     pub train_rate: NodeValue,
 
