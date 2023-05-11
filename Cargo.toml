@@ -8,6 +8,8 @@ edition = "2021"
 [[bin]]
 name = "embed"
 required-features = ["args", "threadrng"]
+[profile.release.overrides.embed]
+debug = true
 
 [[bin]]
 name = "upload"

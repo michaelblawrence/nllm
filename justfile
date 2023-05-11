@@ -50,6 +50,11 @@ cargo-respond input_file:
   cargo run --features="threadrng" --release --bin respond -- \
     {{input_file}}
 
+cargo-flamegraph input_file:
+  sudo cargo flamegraph --features="single_threaded thread" --bin=embed -- \
+    load out/labelled/train/dev-model-qa-e24-L64x1/model-r24957-41pct.json \
+    --repl="pr"
+
 run input_file="./res/tinyshakespeare.txt" rounds="100000":
   embed --quit-on-complete \
     --single-batch-iterations --char --train-rate 0.0016 --batch-size 256 \
