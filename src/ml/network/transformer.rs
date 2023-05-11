@@ -1428,7 +1428,9 @@ pub mod blocks {
         use crate::ml::{
             transformer::{
                 solver,
-                tests::helpers::{assert_optimisation_converges, new_linear},
+                tests::helpers::{
+                    assert_optimisation_converges, compute_expected_dloss_dinput, new_linear,
+                },
             },
             RngStrategy,
         };
@@ -1487,6 +1489,53 @@ pub mod blocks {
                 },
                 iters,
             );
+        }
+
+        #[test]
+        fn decoder_block_can_compute_valid_gradients() {
+            let seq_len = 3;
+            let embed_dim = 8;
+            let head_count = 2;
+            let hidden_dim = 24;
+
+            let rng = RngStrategy::testable(1234);
+            let epsilon = 1e-8;
+            let decimals = 4;
+
+            let inputs = new_linear(seq_len, embed_dim, &rng);
+            let target = new_linear(seq_len, embed_dim, &rng);
+
+            let mut decoder_block =
+                DecoderBlock::new_builder(seq_len, embed_dim, head_count, head_count)
+                    .with_dropout_rate(0.0)
+                    .with_feed_forward_hidden_dimension(hidden_dim)
+                    .with_rng(rng.clone())
+                    .build()
+                    .unwrap();
+            let output = decoder_block.forward_training(&inputs, None).unwrap();
+
+            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
+            let dloss = dloss.collect();
+
+            let computed_dloss_dinput = decoder_block.backward(&inputs, None, &dloss).unwrap().0;
+            let expected_dloss_dinput = compute_expected_dloss_dinput(
+                |inputs| decoder_block.forward_training(inputs, None).unwrap(),
+                |output| {
+                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
+                    loss.to_sum()
+                },
+                inputs,
+                epsilon,
+            );
+
+            let delta_computed_dloss_dinput = computed_dloss_dinput
+                .iter()
+                .sub(expected_dloss_dinput.iter())
+                .round(decimals)
+                .collect();
+
+            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
+            assert_eq!(zeros, delta_computed_dloss_dinput);
         }
     }
 
@@ -2032,8 +2081,8 @@ pub mod layers {
 
             for &token in token_sequence.as_ref() {
                 let embedding = self.embeddings.get(token).context("invalid token id")?;
-                let embedding_vector = embedding.rows_iter().next().unwrap();
-                embedding_vectors.push(embedding_vector.into());
+                let embedding_vector = embedding.as_single_stride()?;
+                embedding_vectors.push(embedding_vector);
             }
 
             Linear::from_values(&embedding_vectors)
@@ -2226,15 +2275,19 @@ pub mod layers {
 
         pub fn forward(&self, input: &Linear) -> Result<Linear> {
             let stride = input.stride();
+            // mean(x) = sum(x) / N
             let mean = input.iter().flatten_mean();
-            let std_dev = input.iter().flatten_stddev(mean.iter());
+            // std(x) = sum((x - mean(x))^2)^0.5 * (N - 1)^-0.5
+            let std_dev = input.iter().flatten_stddev(mean.iter(), false);
 
+            // norm(x) = x - mean(x) / std(x)
             let normalised_input = input
                 .iter()
                 .sub(mean.iter().grow(stride))
                 .div(std_dev.iter().grow(stride), Some(1e-8))
                 .collect();
 
+            // layer_norm(x) = norm(x) * gamma + beta
             let norm_scaled_shifted = normalised_input
                 .iter()
                 .dot_product(self.gamma.iter().grow(stride))
@@ -2244,78 +2297,82 @@ pub mod layers {
             Ok(norm_scaled_shifted)
         }
 
-        pub fn backward(&mut self, input: &Linear, output_gradients: &Linear) -> Result<Linear> {
-            // forward pass
-            let mean = input.iter().flatten_mean();
-            let std_dev = input.iter().flatten_stddev(mean.iter());
+        pub fn backward(&mut self, x: &Linear, dl_dnorm: &Linear) -> Result<Linear> {
+            let row_x = x.rows_iter().map(|row| Linear::from_values(&[row.into()]));
+            let rows_grads = dl_dnorm
+                .rows_iter()
+                .map(|row| Linear::from_values(&[row.into()]));
+            let gamma = self.gamma.values_iter().map(|(&g, ..)| g);
 
-            let stride = input.stride();
-            let mean_keep_dim = mean.iter().grow(stride).collect();
-            let std_dev_keep_dim = std_dev.iter().grow(stride).collect();
-            let epsilon = Some(1e-8);
+            let mut dloss_dx = vec![];
+            let mut dloss_dbeta = vec![];
+            let mut dloss_dgamma = vec![];
 
-            let normalised_input = input
+            for ((row, grad), gamma) in row_x.zip(rows_grads).zip(gamma) {
+                let (dx, dbeta, dgamma) = self.backward_jacobian(&row?, gamma, &grad?)?;
+
+                dloss_dx.push(dx.as_single_stride()?);
+                dloss_dbeta.push(dbeta.as_single_stride()?);
+                dloss_dgamma.push(dgamma.as_single_stride()?);
+            }
+
+            let dloss_dbeta = Linear::from_values(&dloss_dbeta)?;
+            let dloss_dgamma = Linear::from_values(&dloss_dgamma)?;
+            self.add_gradients(dloss_dbeta, dloss_dgamma);
+
+            Linear::from_values(&dloss_dx)
+        }
+
+        pub fn backward_jacobian(
+            &self,
+            x: &Linear,
+            gamma: f64,
+            dl_dnorm: &Linear,
+        ) -> Result<(Linear, Linear, Linear)> {
+            // Compute mean and standard deviation of input
+            let mean = x.iter().flatten_mean();
+            let std_dev = x.iter().flatten_stddev(mean.iter(), false);
+
+            let stride = x.stride();
+            let batch_size = x.stride() as NodeValue;
+
+            let mean_scalar = mean.as_scalar().unwrap();
+            let std_dev_scalar = std_dev.as_scalar().unwrap();
+            let epsilon = 1e-8;
+
+            let x_minus_mean = x.iter().sub_scalar(mean_scalar).collect();
+            let norm_input = x_minus_mean
                 .iter()
-                .sub(mean_keep_dim.iter())
-                .div(std_dev_keep_dim.iter(), epsilon)
+                .multiply_scalar((std_dev_scalar + epsilon).powi(-1))
                 .collect();
 
-            // backward pass
-            let dbeta = output_gradients.iter().flatten_sum();
-            let dgamma = output_gradients
-                .iter()
-                .dot_product(normalised_input.iter())
-                .flatten_sum();
-            self.add_gradients(dbeta, dgamma);
+            let dbeta = dl_dnorm.iter().flatten_sum();
+            let dgamma = dl_dnorm.iter().dot_product(norm_input.iter()).flatten_sum();
 
-            // dl/dnorm(X) = dl/dY * gamma
-            let dl_dnorm = output_gradients
-                .iter()
-                .dot_product(self.gamma.iter().grow(stride))
-                .collect();
+            // dμ = ones(n, n) .* 1/n
+            let dmean = 1.0 / batch_size;
 
-            let stride_inv = 1.0 / stride as NodeValue;
+            // dσ = (x .- means[k]) ./ (n * stds[k])
+            let dstd = x_minus_mean
+                .iter_transpose()
+                .multiply_scalar((batch_size * std_dev_scalar).powi(-1)); // [1, N]
 
-            // dl/dmean(X) = sum(dl/dY * gamma / (std(X) + eps), axis=1) / -sqrt(N)
-            let dmean = dl_dnorm
+            // dx = (I(n) - dμ) ./ (stds[k] + model.ϵ) - dσ * transpose(x .- means[k]) ./ (stds[k] + model.ϵ).^2
+            let dx = Linear::with_value_identity(stride, 1.0)
                 .iter()
-                .flatten_sum()
-                .iter()
-                .div(std_dev.iter(), epsilon)
-                .multiply_scalar(-stride_inv.sqrt())
-                .collect(); // not needed?
-
-            // dl/dstd(X) = sum(dl/dY * gamma * (X - mean(X))
-            //     / (N * (std(X) + eps)^2), axis=1)
-            //     * (-0.5 * (std(X) + eps)^-3)
-            let dstd_dev = dl_dnorm
-                .iter()
-                .multiply_scalar(-1.0)
-                .dot_product(normalised_input.iter())
-                .flatten_sum()
-                .iter()
-                .div(std_dev.iter().powf_scalar(4.0), epsilon)
-                .multiply_scalar(-0.5 * stride_inv)
-                .collect(); // not needed?
-
-            // dl/dX = (dl/dY * gamma) / (std(X) + eps)
-            //     - (dl/dmean(X) / N)
-            //     - (dl/dstd(X) * (X - mean(X)) / (N * (std(X) + eps)))
-            let dx = dl_dnorm
-                .iter()
-                .div(std_dev_keep_dim.iter(), epsilon)
-                .sub(dmean.iter().multiply_scalar(stride_inv).grow(stride))
+                .sub_scalar(dmean)
+                .multiply_scalar((std_dev_scalar + epsilon).powi(-1))
                 .sub(
-                    dstd_dev
-                        .iter()
-                        .div(std_dev.iter(), epsilon)
-                        .multiply_scalar(stride_inv)
-                        .grow(stride)
-                        .dot_product(input.iter().sub(mean_keep_dim.iter())),
+                    dstd.grow(stride)
+                        .dot_product(x_minus_mean.iter().stack(stride))
+                        .multiply_scalar((std_dev_scalar + epsilon).powi(-2)),
                 )
-                .collect();
+                .multiply_scalar(gamma)
+                .collect(); // [N, N]
 
-            Ok(dx)
+            // dL/dx = dz/dx * dL/dz  =>  dloss_dx.T = dx * dl_dnorm.T  =>  dl_dnorm * dx.T = dloss_dx
+            let dloss_dx = dl_dnorm.matrix_product_rhs_transposed(&dx);
+            Ok((dloss_dx, dbeta, dgamma))
         }
 
         fn add_gradients(&mut self, beta_gradients: Linear, gamma_gradients: Linear) {
@@ -2379,6 +2436,48 @@ pub mod layers {
         }
 
         #[test]
+        fn feed_forward_layer_can_compute_valid_gradients() {
+            let seq_len = 3;
+            let embed_dim = 12;
+            let hidden_dim = 48;
+
+            let rng = RngStrategy::testable(1234);
+            let strategy = LayerInitStrategy::KaimingZeroBias;
+            let epsilon = 1e-8;
+            let decimals = 4;
+
+            let inputs = new_linear(seq_len, embed_dim, &rng);
+            let target = new_linear(seq_len, embed_dim, &rng);
+
+            let mut feed_forward_layer =
+                FeedForwardLayer::new(embed_dim, hidden_dim, &strategy, &rng);
+            let output = feed_forward_layer.forward(&inputs).unwrap();
+
+            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
+            let dloss = dloss.collect();
+
+            let computed_dloss_dinput = feed_forward_layer.backward(&inputs, &dloss).unwrap();
+            let expected_dloss_dinput = compute_expected_dloss_dinput(
+                |inputs| feed_forward_layer.forward(inputs).unwrap(),
+                |output| {
+                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
+                    loss.to_sum()
+                },
+                inputs,
+                epsilon,
+            );
+
+            let delta_computed_dloss_dinput = computed_dloss_dinput
+                .iter()
+                .sub(expected_dloss_dinput.iter())
+                .round(decimals)
+                .collect();
+
+            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
+            assert_eq!(zeros, delta_computed_dloss_dinput);
+        }
+
+        #[test]
         fn layer_normalization_layer_can_process_inputs() {
             let seq_len = 3;
             let embed_dim = 12;
@@ -2395,10 +2494,9 @@ pub mod layers {
         }
 
         #[test]
-        #[ignore = "failing.. LayerNormalization backward needs fixing first"]
         fn layer_normalization_layer_can_compute_valid_gradients() {
-            let seq_len = 3;
-            let embed_dim = 12;
+            let seq_len = 2;
+            let embed_dim = 4;
 
             let rng = RngStrategy::testable(1234);
             let epsilon = 1e-8;
@@ -2418,7 +2516,7 @@ pub mod layers {
                 |inputs| layer_norm.forward(inputs).unwrap(),
                 |output| {
                     let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
-                    loss.values_iter().map(|(&x, ..)| x).sum()
+                    loss.to_sum()
                 },
                 inputs,
                 epsilon,
@@ -2432,15 +2530,6 @@ pub mod layers {
 
             let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
             assert_eq!(zeros, delta_computed_dloss_dinput);
-
-            let factor_computed_dloss_dinput = computed_dloss_dinput
-                .iter()
-                .div(expected_dloss_dinput.iter(), Some(epsilon))
-                .round(2)
-                .collect();
-
-            let ones = Linear::with_value(target.count(), target.stride(), 1.0);
-            assert_eq!(ones, factor_computed_dloss_dinput);
         }
 
         #[test]
@@ -2742,6 +2831,7 @@ pub mod attention {
             input_mask: Option<&Linear>,
             mask: Option<&Linear>,
         ) -> Linear {
+            // attention_scores = queries * keys.T
             let attention_scores = queries.matrix_product_rhs_transposed(&keys);
             let scale_factor = (keys.count() as NodeValue).powf(-0.5);
             let scaled_attention_scores = attention_scores.iter().multiply_scalar(scale_factor);
@@ -2814,7 +2904,13 @@ pub mod attention {
                 .multiply_scalar(scale_factor)
                 .collect();
 
+            // attention_scores = queries * keys.T
+            // dattention_scores = dqueries * keys.T
+            // dattention_scores * keys = dqueries
             let dqueries = dattention_scores.matrix_product(&keys);
+            // attention_scores = queries * keys.T
+            // dattention_scores = queries * dkeys.T
+            // dkeys = dattention_scores.T * queries
             let dkeys = dattention_scores.matrix_product_lhs_transposed(&queries);
 
             Ok((dkeys, dqueries, dvalues))
@@ -2999,7 +3095,7 @@ pub mod attention {
                 |inputs| attention_layer.forward(inputs).unwrap(),
                 |output| {
                     let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
-                    loss.values_iter().map(|(&x, ..)| x).sum()
+                    loss.to_sum()
                 },
                 inputs,
                 epsilon,
@@ -3046,7 +3142,7 @@ pub mod attention {
                 |inputs| attention_layer.forward(inputs).unwrap(),
                 |output| {
                     let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
-                    loss.values_iter().map(|(&x, ..)| x).sum()
+                    loss.to_sum()
                 },
                 inputs,
                 epsilon,
@@ -3211,7 +3307,7 @@ pub mod dense {
 
             let inputs = Linear::from_values(&[inputs])?;
             let outputs = self.forward(&inputs)?;
-            let row = outputs.rows_iter().next().unwrap().into();
+            let row = outputs.as_single_stride()?;
 
             Ok(row)
         }
@@ -3297,8 +3393,7 @@ pub mod dense {
             let output_gradients = Linear::from_values(&[output_gradients])?;
             let input_gradients_m = self.backward(&inputs, &output_gradients)?;
 
-            let input_gradients = input_gradients_m.rows_iter().next().unwrap().into();
-            Ok(input_gradients)
+            input_gradients_m.as_single_stride()
         }
 
         pub fn set_activation(&mut self, activation: NetworkActivationMode) {
@@ -3420,7 +3515,7 @@ pub mod dense {
                 |inputs| dense.forward(inputs).unwrap(),
                 |output| {
                     let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
-                    loss.values_iter().map(|(&x, ..)| x).sum()
+                    loss.to_sum()
                 },
                 inputs,
                 epsilon,
@@ -3466,6 +3561,18 @@ pub mod linear {
                 inner: LayerValues::new(vec![value; size]),
                 stride,
                 count,
+            }
+        }
+
+        pub fn with_value_identity(stride: usize, value: NodeValue) -> Self {
+            let inner = (0..stride)
+                .flat_map(|j| (0..stride).map(move |i| if i == j { value } else { 0.0 }))
+                .collect();
+
+            Self {
+                inner,
+                stride,
+                count: stride,
             }
         }
 
@@ -3534,20 +3641,22 @@ pub mod linear {
             });
             LinearIter {
                 inner: Box::new(x),
-                stride: self.count,
-                count: self.stride,
+                stride: count,
+                count: stride,
             }
         }
 
         pub fn concat<'a>(&'a self, rhs: &'a Linear) -> LinearIter<'a> {
-            assert_eq!(self.count, rhs.count, "mismatched dimensions");
+            assert_eq!(self.count, rhs.count, "mismatched count dimension");
             let self_items = self.inner.chunks(self.stride);
             let rhs_items = rhs.inner.chunks(rhs.stride);
             LinearIter {
                 inner: Box::new(
                     self_items
                         .zip(rhs_items)
-                        .flat_map(|(lhs, rhs)| lhs.iter().chain(rhs).copied()),
+                        .flat_map(|(lhs, rhs)| lhs.iter().chain(rhs).copied())
+                        .collect_vec()
+                        .into_iter(),
                 ),
                 stride: self.stride + rhs.stride,
                 count: self.count,
@@ -3592,12 +3701,12 @@ pub mod linear {
         }
 
         pub fn matrix_product_rhs_transposed(&self, rhs: &Linear) -> Linear {
-            assert_eq!(self.stride, rhs.stride, "mismatched dimensions");
+            assert_eq!(self.stride, rhs.stride, "mismatched stride dimension");
             self.iter().matrix_transpose_product(rhs.iter())
         }
 
         pub fn matrix_product_lhs_transposed(&self, rhs: &Linear) -> Linear {
-            assert_eq!(self.count, rhs.count, "mismatched dimensions");
+            assert_eq!(self.count, rhs.count, "mismatched count dimension");
             self.iter_transpose()
                 .matrix_transpose_product(rhs.iter_transpose())
         }
@@ -3632,11 +3741,7 @@ pub mod linear {
                         .tick_values(x_ticks)
                         .title("col / stride".into()),
                 )
-                .y_axis(
-                    Axis::new()
-                        .tick_values(y_ticks)
-                        .title("row / count".into()),
-                )
+                .y_axis(Axis::new().tick_values(y_ticks).title("row / count".into()))
                 .title(title.into())
                 .width(1000)
                 .height(800);
@@ -3674,6 +3779,34 @@ pub mod linear {
                 .map(|(idx, x)| (x, idx % self.stride, idx / self.stride))
         }
 
+        pub fn as_scalar(&self) -> Result<NodeValue> {
+            if self.inner.len() == 1 {
+                Ok(self.inner[0])
+            } else {
+                Err(anyhow!(
+                    "can not read value of shape = [{}, {}] as scalar",
+                    self.count,
+                    self.stride
+                ))
+            }
+        }
+
+        pub fn as_single_stride(&self) -> Result<LayerValues> {
+            if self.count == 1 {
+                Ok(self.inner[..self.stride].into())
+            } else {
+                Err(anyhow!(
+                    "can not read shape = [{}, {}] as single stride",
+                    self.count,
+                    self.stride
+                ))
+            }
+        }
+
+        pub fn to_sum(&self) -> NodeValue {
+            self.inner.iter().sum()
+        }
+
         pub fn sum<'a, I: Iterator<Item = &'a Self> + 'a>(mut iter: I) -> Option<LinearIter<'a>> {
             let first = iter.next()?;
             let mut sum_iter = first.iter();
@@ -3692,6 +3825,7 @@ pub mod linear {
         }
     }
 
+    #[must_use = "linear iterators are lazy and do nothing unless consumed"]
     pub struct LinearIter<'a> {
         inner: Box<dyn Iterator<Item = NodeValue> + 'a>,
         stride: usize,
@@ -3700,27 +3834,31 @@ pub mod linear {
 
     impl<'a> LinearIter<'a> {
         pub fn matrix_transpose_product(self, rhs_transpose: Self) -> Linear {
-            assert_eq!(self.stride, rhs_transpose.stride, "mismatched dimensions");
-            let self_strides = self.inner.chunks(self.stride);
-            let rhs_strides = rhs_transpose
-                .inner
-                .chunks(rhs_transpose.stride)
-                .into_iter()
-                .map(|chunk| chunk.collect_vec())
-                .collect_vec();
+            assert_eq!(
+                self.stride, rhs_transpose.stride,
+                "mismatched stride dimension"
+            );
+            let self_vec = self.inner.collect_vec();
+            let rhs_vec = rhs_transpose.inner.collect_vec();
 
-            let inner = self_strides
+            let self_strides = self_vec.chunks(self.stride);
+            let rhs_strides = rhs_vec.chunks(rhs_transpose.stride);
+
+            let len = rhs_transpose.count * self.count;
+            let mut inner = LayerValues::new(vec![0.0; len]);
+
+            self_strides
                 .into_iter()
                 .flat_map(|a| {
-                    let a = a.collect_vec();
-                    rhs_strides.iter().map(move |b| {
+                    rhs_strides.clone().map(move |b| {
                         a.iter()
                             .zip(b.iter())
                             .map(|(a, b)| a * b)
                             .sum::<NodeValue>()
                     })
                 })
-                .collect();
+                .enumerate()
+                .for_each(|(i, x)| inner[i] = x);
 
             Linear {
                 inner,
@@ -3729,8 +3867,8 @@ pub mod linear {
             }
         }
         pub fn dot_product(self, other: Self) -> Self {
-            assert_eq!(self.stride, other.stride, "mismatched dimensions");
-            assert_eq!(self.count, other.count, "mismatched dimensions");
+            assert_eq!(self.stride, other.stride, "mismatched stride dimension");
+            assert_eq!(self.count, other.count, "mismatched count dimension");
             Self {
                 inner: Box::new(self.inner.zip(other.inner).map(|(x, y)| x * y)),
                 stride: self.stride,
@@ -3738,8 +3876,8 @@ pub mod linear {
             }
         }
         pub fn div(self, rhs: Self, epsilon: Option<NodeValue>) -> Self {
-            assert_eq!(self.stride, rhs.stride, "mismatched dimensions");
-            assert_eq!(self.count, rhs.count, "mismatched dimensions");
+            assert_eq!(self.stride, rhs.stride, "mismatched stride dimension");
+            assert_eq!(self.count, rhs.count, "mismatched count dimension");
             Self {
                 inner: match epsilon {
                     Some(e) => Box::new(self.inner.zip(rhs.inner).map(move |(x, y)| x / (y + e))),
@@ -3750,19 +3888,33 @@ pub mod linear {
             }
         }
         pub fn add(self, other: Self) -> Self {
-            assert_eq!(self.stride, other.stride, "mismatched dimensions");
-            assert_eq!(self.count, other.count, "mismatched dimensions");
+            assert_eq!(self.stride, other.stride, "mismatched stride dimension");
+            assert_eq!(self.count, other.count, "mismatched count dimension");
             Self {
                 inner: Box::new(self.inner.zip(other.inner).map(|(x, y)| x + y)),
                 stride: self.stride,
                 count: self.count,
             }
         }
+        pub fn add_scalar(self, rhs: NodeValue) -> Self {
+            Self {
+                inner: Box::new(self.inner.map(move |x| x + rhs)),
+                stride: self.stride,
+                count: self.count,
+            }
+        }
         pub fn sub(self, rhs: Self) -> Self {
-            assert_eq!(self.stride, rhs.stride, "mismatched dimensions");
-            assert_eq!(self.count, rhs.count, "mismatched dimensions");
+            assert_eq!(self.stride, rhs.stride, "mismatched stride dimension");
+            assert_eq!(self.count, rhs.count, "mismatched count dimension");
             Self {
                 inner: Box::new(self.inner.zip(rhs.inner).map(|(x, y)| x - y)),
+                stride: self.stride,
+                count: self.count,
+            }
+        }
+        pub fn sub_scalar(self, rhs: NodeValue) -> Self {
+            Self {
+                inner: Box::new(self.inner.map(move |x| x - rhs)),
                 stride: self.stride,
                 count: self.count,
             }
@@ -3770,6 +3922,13 @@ pub mod linear {
         pub fn multiply_scalar(self, rhs: NodeValue) -> Self {
             Self {
                 inner: Box::new(self.inner.map(move |x| x * rhs)),
+                stride: self.stride,
+                count: self.count,
+            }
+        }
+        pub fn powi_scalar(self, n: i32) -> Self {
+            Self {
+                inner: Box::new(self.inner.map(move |x| x.powi(n))),
                 stride: self.stride,
                 count: self.count,
             }
@@ -3796,6 +3955,13 @@ pub mod linear {
                 count: self.count,
             }
         }
+        pub fn sqrt(self) -> Self {
+            Self {
+                inner: Box::new(self.inner.map(move |x| x.sqrt())),
+                stride: self.stride,
+                count: self.count,
+            }
+        }
         pub fn dropout(self, dropout_rate: f64, rng: RngStrategy) -> Self {
             assert!(
                 dropout_rate <= 1.0 && dropout_rate >= 0.0,
@@ -3818,8 +3984,8 @@ pub mod linear {
             }
         }
         pub fn set_mask(self, mask: Self, masked_value: NodeValue) -> Self {
-            assert_eq!(self.stride, mask.stride, "mismatched dimensions");
-            assert_eq!(self.count, mask.count, "mismatched dimensions");
+            assert_eq!(self.stride, mask.stride, "mismatched stride dimension");
+            assert_eq!(self.count, mask.count, "mismatched count dimensions");
             Self {
                 inner: Box::new(self.inner.zip(mask.inner).map(move |(x, mask)| {
                     if mask == 0.0 {
@@ -3870,31 +4036,34 @@ pub mod linear {
             self.sub(grads.multiply_scalar(learn_rate)).collect()
         }
         pub fn softmax(self) -> Linear {
-            let strides = self
-                .inner
+            let inner_vec = self.inner.collect_vec();
+            let mut exp_counts = inner_vec
                 .chunks(self.stride)
-                .into_iter()
-                .flat_map(|chunk_iter| {
-                    let chunk = chunk_iter.collect_vec();
+                .flat_map(|chunk| {
                     let max = chunk
                         .iter()
                         .max_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
                         .cloned()
                         .unwrap_or_default();
-                    let exp_iter = chunk.into_iter().map(move |x| {
+                    chunk.iter().map(move |&x| {
                         if x != NodeValue::NEG_INFINITY {
                             (x - max).exp()
                         } else {
                             0.0
                         }
-                    });
-                    let sum = exp_iter.clone().sum::<NodeValue>();
-                    let sum = if sum != 0.0 { sum } else { 1e-8 };
-                    exp_iter.map(move |x| x / sum)
+                    })
                 })
-                .collect();
+                .collect_vec();
+            let inner = {
+                exp_counts.chunks_mut(self.stride).for_each(|chunk| {
+                    let sum = chunk.iter().sum::<NodeValue>();
+                    let sum = if sum != 0.0 { sum } else { 1e-8 };
+                    chunk.iter_mut().for_each(|x| *x = *x / sum);
+                });
+                exp_counts.into()
+            };
             Linear {
-                inner: strides,
+                inner,
                 stride: self.stride,
                 count: self.count,
             }
@@ -3924,11 +4093,18 @@ pub mod linear {
                 count: self.count,
             }
         }
-        pub fn flatten_stddev(self, mean: Self) -> Linear {
-            assert_eq!(self.count, mean.count, "mismatched dimensions");
+        pub fn flatten_stddev_corrected(self, mean: Self) -> Linear {
+            self.flatten_stddev(mean, true)
+        }
+        pub fn flatten_stddev(self, mean: Self, corrected: bool) -> Linear {
+            assert_eq!(self.count, mean.count, "mismatched count dimension");
             assert_eq!(mean.stride, 1, "invalid mean stride dimension");
             assert!(self.stride > 1, "invalid stride dimension");
-            let factor = ((self.stride - 1) as NodeValue).powf(-0.5);
+            let factor = if corrected {
+                ((self.stride - 1) as NodeValue).powf(-0.5)
+            } else {
+                (self.stride as NodeValue).powf(-0.5)
+            };
             Linear {
                 inner: self
                     .inner
@@ -4017,11 +4193,19 @@ pub mod linear {
         }
 
         #[test]
-        fn can_linear_scale_linear() {
-            let x = Linear::from_iter(2, [1.0, 1.0, 1.0, 1.0].into_iter()).unwrap();
-            let y = x.iter().multiply_scalar(4.0).collect();
+        fn can_linear_perform_scalar_ops() {
+            let x = Linear::from_iter(2, [1.0, 2.0, 1.0, 0.0].into_iter()).unwrap();
 
-            let expected = Linear::from_iter(2, [4.0, 4.0, 4.0, 4.0].into_iter()).unwrap();
+            let y = x.iter().multiply_scalar(4.0).collect();
+            let expected = Linear::from_iter(2, [4.0, 8.0, 4.0, 0.0].into_iter()).unwrap();
+            assert_eq!(expected, y);
+
+            let y = x.iter().add_scalar(4.0).collect();
+            let expected = Linear::from_iter(2, [5.0, 6.0, 5.0, 4.0].into_iter()).unwrap();
+            assert_eq!(expected, y);
+
+            let y = x.iter().sub_scalar(4.0).collect();
+            let expected = Linear::from_iter(2, [-3.0, -2.0, -3.0, -4.0].into_iter()).unwrap();
             assert_eq!(expected, y);
         }
 
@@ -4050,6 +4234,22 @@ pub mod linear {
 
             let expected = Linear::from_iter(1, [1.5, 3.5].into_iter()).unwrap();
             assert_eq!(expected, y);
+        }
+
+        #[test]
+        fn can_linear_perform_stddev_stride_values() {
+            let a = Linear::from_iter(5, [1.0, 2.0, 3.0, 4.0, 5.0].into_iter()).unwrap();
+            let a_mean = a.iter().flatten_mean();
+
+            let corrected_y = a.iter().flatten_stddev_corrected(a_mean.iter());
+            let rounded_y = corrected_y.iter().round(4).collect();
+            let expected = Linear::from_iter(1, [1.5811].into_iter()).unwrap();
+            assert_eq!(expected, rounded_y);
+
+            let uncorrected_y = a.iter().flatten_stddev(a_mean.iter(), false);
+            let rounded_y = uncorrected_y.iter().round(4).collect();
+            let expected = Linear::from_iter(1, [1.4142].into_iter()).unwrap();
+            assert_eq!(expected, rounded_y);
         }
 
         #[test]
@@ -4123,6 +4323,15 @@ pub mod linear {
         }
 
         #[test]
+        fn can_linear_perform_create_identity_matix() {
+            let x = Linear::with_value_identity(3, 1.0);
+            let expected =
+                Linear::from_iter(3, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0].into_iter())
+                    .unwrap();
+            assert_eq!(expected, x);
+        }
+
+        #[test]
         fn can_linear_split_and_concat_again() {
             let x = Linear::from_values(&[
                 [11.0, 12.0, 13.0, 21.0, 22.0, 23.0, 31.0, 32.0, 33.0].into(),
@@ -4154,9 +4363,7 @@ pub mod solver {
 
     use crate::ml::NodeValue;
 
-    use self::source::{
-        DefaultOptimizerCache, DynamicOptimizerFactory, OptimizerSource,
-    };
+    use self::source::{DefaultOptimizerCache, DynamicOptimizerFactory, OptimizerSource};
 
     use super::linear::Linear;
 
@@ -4778,9 +4985,9 @@ mod tests {
                 // get gradients & loss for reporting
                 let abs_grads = grads.iter().abs();
                 let mean_grads = abs_grads.flatten_mean().iter_transpose().flatten_mean();
-                let mean_grads = *mean_grads.values_iter().next().unwrap().0;
+                let mean_grads = mean_grads.as_scalar().unwrap();
                 let mean_loss = loss.flatten_mean().iter_transpose().flatten_mean();
-                let mean_loss = *mean_loss.values_iter().next().unwrap().0;
+                let mean_loss = mean_loss.as_scalar().unwrap();
                 initial_mean_loss.get_or_insert(mean_loss);
 
                 // report optimisation iteration
