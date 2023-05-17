@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     fs::File,
     io::{self, Read, Write},
@@ -10,7 +10,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use itertools::Itertools;
-use plane::ml::{embeddings::builder::EmbeddingBuilder, RngStrategy, SamplingRng};
+use plane::ml::{
+    embeddings::{builder::EmbeddingBuilder, Embedding},
+    seq2seq::transformer::CharacterTransformer,
+    LayerValues, RngStrategy, SamplingRng,
+};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -18,6 +22,82 @@ fn main() {
     let mut fpath_arg = fpath_arg.cloned();
 
     while run(&mut fpath_arg) {}
+}
+
+enum RespondModel {
+    Embedding(Embedding),
+    S2S(CharacterTransformer),
+}
+
+impl RespondModel {
+    fn from_snapshot(use_transformer: bool, json: &str) -> Result<Self> {
+        if use_transformer {
+            Ok(Self::S2S(serde_json::from_str(json)?))
+        } else {
+            let rng = RngStrategy::default();
+            Ok(Self::Embedding(
+                EmbeddingBuilder::from_snapshot(&json)
+                    .context("failed to rebuild state from snapshot")?
+                    .with_rng(rng.clone())
+                    .build()?,
+            ))
+        }
+    }
+    fn description(&self) -> &str {
+        match self {
+            RespondModel::Embedding(_) => "Embedding",
+            RespondModel::S2S(_) => "CharacterTransformer",
+        }
+    }
+    fn vocab(&self) -> HashMap<String, usize> {
+        match self {
+            RespondModel::Embedding(embedding) => embedding.vocab().clone(),
+            RespondModel::S2S(s2s) => s2s
+                .vocab()
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect(),
+        }
+    }
+    pub fn predict_from_iter<'a>(
+        &'a self,
+        seed_tokens: &[&str],
+    ) -> Box<dyn Iterator<Item = String> + 'a> {
+        match self {
+            RespondModel::Embedding(embedding) => {
+                Box::new(embedding.predict_from_iter(seed_tokens))
+            }
+            RespondModel::S2S(s2s) => Box::new(
+                s2s.predict_from_iter(&to_chars(seed_tokens))
+                    .map(|c| c.to_string()),
+            ),
+        }
+    }
+
+    pub fn predict_next(&self, last_words: &[&str]) -> Result<String> {
+        match self {
+            RespondModel::Embedding(embedding) => embedding.predict_next(last_words),
+            RespondModel::S2S(s2s) => Ok(s2s.predict_next(&to_chars(last_words))?.to_string()),
+        }
+    }
+
+    fn control_vocab(&self) -> String {
+        match self {
+            RespondModel::Embedding(embedding) => embedding.control_vocab().to_string(),
+            RespondModel::S2S(s2s) => s2s.control_vocab().to_string(),
+        }
+    }
+
+    pub fn sample_probabilities(&self, context_tokens: &[&str]) -> Result<LayerValues> {
+        match self {
+            RespondModel::Embedding(embedding) => embedding.sample_probabilities(context_tokens),
+            RespondModel::S2S(s2s) => s2s.sample_probabilities(&to_chars(context_tokens)),
+        }
+    }
+}
+
+fn to_chars(value: &[&str]) -> Vec<char> {
+    value.iter().flat_map(|x| x.chars().next()).collect_vec()
 }
 
 fn run(model_fpath: &mut Option<String>) -> bool {
@@ -29,24 +109,28 @@ fn run(model_fpath: &mut Option<String>) -> bool {
     let (json, state) = extract_config(json).expect("failed to parse config");
     let rng = RngStrategy::default();
 
-    let embedding = EmbeddingBuilder::from_snapshot(&json)
-        .expect("failed to rebuild state from snapshot")
-        .with_rng(rng.clone())
-        .build()
+    let model = RespondModel::from_snapshot(state.use_transformer, &json)
         .expect("failed to rebuild instance from snapshot state");
+
+    // let embedding = EmbeddingBuilder::from_snapshot(&json)
+    //     .expect("failed to rebuild state from snapshot")
+    //     .with_rng(rng.clone())
+    //     .build()
+    //     .expect("failed to rebuild instance from snapshot state");
 
     println!("..");
     println!(
-        "Loaded model from '{}'",
+        "Loaded {} model from '{}'",
+        model.description(),
         model_fpath.clone().unwrap_or_default()
     );
 
-    let char_mode = embedding
+    let char_mode = model
         .vocab()
         .iter()
         .all(|(token, id)| *id == 0 || token.len() == 1);
 
-    let append_space = char_mode && embedding.vocab().contains_key(" ");
+    let append_space = char_mode && model.vocab().contains_key(" ");
 
     println!("Starting... (character input mode = {char_mode})");
     println!("   - Commands available: [ '.load <path>' | '.reload' | '.supervise' | '.reset' | '.quit' ]");
@@ -90,7 +174,7 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             to_context_tokens(&input_txt, char_mode, append_space).collect();
         let context_tokens: Vec<&str> = context_tokens.iter().map(|x| x.as_str()).collect();
 
-        match embedding.predict_next(&context_tokens) {
+        match model.predict_next(&context_tokens) {
             Err(e) => {
                 println!("Error retrieving response: ({e})");
                 continue;
@@ -102,15 +186,9 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             vocab.as_ref(),
             char_mode && vocab_supervised_predictions_enabled,
         ) {
-            predict_supervised(
-                &embedding,
-                &context_tokens,
-                vocab,
-                default_min_word_len,
-                &rng,
-            )
+            predict_supervised(&model, &context_tokens, vocab, default_min_word_len, &rng)
         } else {
-            embedding.predict_from_iter(&context_tokens).collect()
+            model.predict_from_iter(&context_tokens).collect()
         };
 
         let response = if char_mode {
@@ -178,24 +256,24 @@ fn to_context_tokens<'a>(
 }
 
 fn predict_supervised(
-    embedding: &plane::ml::embeddings::Embedding,
+    model: &RespondModel,
     context_tokens: &Vec<&str>,
     vocab: &HashSet<String>,
     min_word_len: usize,
     rng: &RngStrategy,
 ) -> Vec<String> {
-    let ctrl_token = embedding.control_vocab();
+    let ctrl_token = model.control_vocab();
     let word_separator_token = " ".to_string();
     let max_vocab_len: usize = vocab.iter().map(|x| x.len()).max().unwrap();
 
     let mut context_queue = VecDeque::from_iter(context_tokens.iter().map(|x| x.to_string()));
     let mut word_queue = vec![];
     let mut generated_queue = vec![];
-    let mut last_token = context_tokens.last().cloned().unwrap_or(ctrl_token);
+    let mut last_token = context_tokens.last().cloned().unwrap_or(&ctrl_token);
 
-    while last_token != ctrl_token {
+    while last_token != &ctrl_token {
         let context_tokens_str: Vec<&str> = context_queue.iter().map(|x| x.as_str()).collect();
-        let generated_token = match embedding.predict_next(&context_tokens_str) {
+        let generated_token = match model.predict_next(&context_tokens_str) {
             Ok(token) => token,
             Err(e) => {
                 println!("Error retrieving response: ({e})");
@@ -205,7 +283,7 @@ fn predict_supervised(
 
         if !is_token_alphabetic(&generated_token) {
             word_queue.clear();
-        } else if &generated_token == ctrl_token {
+        } else if &generated_token == &ctrl_token {
             break;
         } else {
             word_queue.push(generated_token.to_string());
@@ -247,7 +325,7 @@ fn predict_supervised(
 
             let context_tokens_str: Vec<&str> = context_queue.iter().map(|x| x.as_str()).collect();
             let word_separator_token =
-                match predict_word_separator_token(embedding, rng, &context_tokens_str) {
+                match predict_word_separator_token(model, rng, &context_tokens_str) {
                     Ok(token) => token,
                     Err(e) => {
                         println!("Error sampling separator token: ({e})");
@@ -262,7 +340,7 @@ fn predict_supervised(
         last_token = &context_queue.back().unwrap();
     }
 
-    while generated_queue.last().unwrap() != ctrl_token {
+    while generated_queue.last().unwrap() != &ctrl_token {
         generated_queue.pop();
     }
 
@@ -270,13 +348,13 @@ fn predict_supervised(
 }
 
 fn predict_word_separator_token(
-    embedding: &plane::ml::embeddings::Embedding,
+    model: &RespondModel,
     rng: &RngStrategy,
     context_tokens_str: &[&str],
 ) -> Result<String> {
-    let token_probabilites = embedding.sample_probabilities(&context_tokens_str)?;
-    let ordered_tokens: Vec<_> = embedding
-        .vocab()
+    let token_probabilites = model.sample_probabilities(&context_tokens_str)?;
+    let vocab = model.vocab();
+    let ordered_tokens: Vec<_> = vocab
         .iter()
         .sorted_by_key(|(_, &id)| id)
         .map(|(token, _)| token)
@@ -364,6 +442,7 @@ fn print_prompt_response(response: &str) {
 
 struct ExtractedModelConfig {
     input_txt_path: Option<String>,
+    use_transformer: bool,
 }
 
 fn extract_config(json: String) -> Result<(String, ExtractedModelConfig)> {
@@ -380,8 +459,15 @@ fn extract_config(json: String) -> Result<(String, ExtractedModelConfig)> {
     let snapshot = serde_json::to_string(&snapshot)?;
 
     let input_txt_path = config["input_txt_path"].as_str().map(|x| x.to_string());
+    let use_transformer = config["use_transformer"].as_bool().unwrap_or_default();
 
-    Ok((snapshot, ExtractedModelConfig { input_txt_path }))
+    Ok((
+        snapshot,
+        ExtractedModelConfig {
+            input_txt_path,
+            use_transformer,
+        },
+    ))
 }
 
 enum CliReplActions {
