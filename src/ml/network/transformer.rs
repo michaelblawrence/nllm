@@ -1429,7 +1429,8 @@ pub mod blocks {
             transformer::{
                 solver,
                 tests::helpers::{
-                    assert_optimisation_converges, compute_expected_dloss_dinput, new_linear,
+                    assert_input_gradients,
+                    assert_optimisation_converges, new_linear,
                 },
             },
             RngStrategy,
@@ -1492,50 +1493,57 @@ pub mod blocks {
         }
 
         #[test]
+        fn encoder_block_can_compute_valid_gradients() {
+            let seq_len = 3;
+            let embed_dim = 8;
+            let head_count = 2;
+            let hidden_dim = 24;
+
+            assert_input_gradients(
+                &move |rng| {
+                    let encoder_block = EncoderBlock::new_builder(seq_len, embed_dim, head_count)
+                        .with_dropout_rate(0.0)
+                        .with_feed_forward_hidden_dimension(hidden_dim)
+                        .with_rng(rng.clone())
+                        .build();
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (encoder_block, inputs, target)
+                },
+                &move |encoder_block, inputs| encoder_block.forward_training(&inputs).unwrap(),
+                &move |encoder_block, inputs, dloss| {
+                    encoder_block.backward(&inputs, &dloss).unwrap()
+                },
+            );
+        }
+
+        #[test]
         fn decoder_block_can_compute_valid_gradients() {
             let seq_len = 3;
             let embed_dim = 8;
             let head_count = 2;
             let hidden_dim = 24;
 
-            let rng = RngStrategy::testable(1234);
-            let epsilon = 1e-8;
-            let decimals = 4;
-
-            let inputs = new_linear(seq_len, embed_dim, &rng);
-            let target = new_linear(seq_len, embed_dim, &rng);
-
-            let mut decoder_block =
-                DecoderBlock::new_builder(seq_len, embed_dim, head_count, head_count)
-                    .with_dropout_rate(0.0)
-                    .with_feed_forward_hidden_dimension(hidden_dim)
-                    .with_rng(rng.clone())
-                    .build()
-                    .unwrap();
-            let output = decoder_block.forward_training(&inputs, None).unwrap();
-
-            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
-            let dloss = dloss.collect();
-
-            let computed_dloss_dinput = decoder_block.backward(&inputs, None, &dloss).unwrap().0;
-            let expected_dloss_dinput = compute_expected_dloss_dinput(
-                |inputs| decoder_block.forward_training(inputs, None).unwrap(),
-                |output| {
-                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
-                    loss.to_sum()
+            assert_input_gradients(
+                &move |rng| {
+                    let decoder_block =
+                        DecoderBlock::new_builder(seq_len, embed_dim, head_count, head_count)
+                            .with_dropout_rate(0.0)
+                            .with_feed_forward_hidden_dimension(hidden_dim)
+                            .with_rng(rng.clone())
+                            .build()
+                            .unwrap();
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (decoder_block, inputs, target)
                 },
-                inputs,
-                epsilon,
+                &move |decoder_block, inputs| {
+                    decoder_block.forward_training(&inputs, None).unwrap()
+                },
+                &move |decoder_block, inputs, dloss| {
+                    decoder_block.backward(&inputs, None, &dloss).unwrap().0
+                },
             );
-
-            let delta_computed_dloss_dinput = computed_dloss_dinput
-                .iter()
-                .sub(expected_dloss_dinput.iter())
-                .round(decimals)
-                .collect();
-
-            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
-            assert_eq!(zeros, delta_computed_dloss_dinput);
         }
     }
 
@@ -2409,7 +2417,8 @@ pub mod layers {
             transformer::{
                 solver,
                 tests::helpers::{
-                    assert_optimisation_converges, compute_expected_dloss_dinput, new_linear,
+                    assert_input_gradients,
+                    assert_optimisation_converges, new_linear,
                 },
             },
             RngStrategy,
@@ -2436,48 +2445,6 @@ pub mod layers {
         }
 
         #[test]
-        fn feed_forward_layer_can_compute_valid_gradients() {
-            let seq_len = 3;
-            let embed_dim = 12;
-            let hidden_dim = 48;
-
-            let rng = RngStrategy::testable(1234);
-            let strategy = LayerInitStrategy::KaimingZeroBias;
-            let epsilon = 1e-8;
-            let decimals = 4;
-
-            let inputs = new_linear(seq_len, embed_dim, &rng);
-            let target = new_linear(seq_len, embed_dim, &rng);
-
-            let mut feed_forward_layer =
-                FeedForwardLayer::new(embed_dim, hidden_dim, &strategy, &rng);
-            let output = feed_forward_layer.forward(&inputs).unwrap();
-
-            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
-            let dloss = dloss.collect();
-
-            let computed_dloss_dinput = feed_forward_layer.backward(&inputs, &dloss).unwrap();
-            let expected_dloss_dinput = compute_expected_dloss_dinput(
-                |inputs| feed_forward_layer.forward(inputs).unwrap(),
-                |output| {
-                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
-                    loss.to_sum()
-                },
-                inputs,
-                epsilon,
-            );
-
-            let delta_computed_dloss_dinput = computed_dloss_dinput
-                .iter()
-                .sub(expected_dloss_dinput.iter())
-                .round(decimals)
-                .collect();
-
-            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
-            assert_eq!(zeros, delta_computed_dloss_dinput);
-        }
-
-        #[test]
         fn layer_normalization_layer_can_process_inputs() {
             let seq_len = 3;
             let embed_dim = 12;
@@ -2494,42 +2461,39 @@ pub mod layers {
         }
 
         #[test]
+        fn feed_forward_layer_can_compute_valid_gradients() {
+            let seq_len = 3;
+            let embed_dim = 12;
+            let hidden_dim = 48;
+            let strategy = LayerInitStrategy::KaimingZeroBias;
+
+            assert_input_gradients(
+                &move |rng| {
+                    let ff_layer = FeedForwardLayer::new(embed_dim, hidden_dim, &strategy, &rng);
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (ff_layer, inputs, target)
+                },
+                &move |ff_layer, inputs| ff_layer.forward(&inputs).unwrap(),
+                &move |ff_layer, inputs, dloss| ff_layer.backward(&inputs, &dloss).unwrap(),
+            );
+        }
+
+        #[test]
         fn layer_normalization_layer_can_compute_valid_gradients() {
             let seq_len = 2;
             let embed_dim = 4;
 
-            let rng = RngStrategy::testable(1234);
-            let epsilon = 1e-8;
-            let decimals = 4;
-
-            let inputs = new_linear(seq_len, embed_dim, &rng);
-            let target = new_linear(seq_len, embed_dim, &rng);
-
-            let mut layer_norm = LayerNormalization::new(seq_len);
-            let output = layer_norm.forward(&inputs).unwrap();
-
-            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
-            let dloss = dloss.collect();
-
-            let computed_dloss_dinput = layer_norm.backward(&inputs, &dloss).unwrap();
-            let expected_dloss_dinput = compute_expected_dloss_dinput(
-                |inputs| layer_norm.forward(inputs).unwrap(),
-                |output| {
-                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
-                    loss.to_sum()
+            assert_input_gradients(
+                &move |rng| {
+                    let layer_norm = LayerNormalization::new(seq_len);
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (layer_norm, inputs, target)
                 },
-                inputs,
-                epsilon,
+                &move |layer_norm, inputs| layer_norm.forward(&inputs).unwrap(),
+                &move |layer_norm, inputs, dloss| layer_norm.backward(&inputs, &dloss).unwrap(),
             );
-
-            let delta_computed_dloss_dinput = computed_dloss_dinput
-                .iter()
-                .sub(expected_dloss_dinput.iter())
-                .round(decimals)
-                .collect();
-
-            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
-            assert_eq!(zeros, delta_computed_dloss_dinput);
         }
 
         #[test]
@@ -2992,7 +2956,8 @@ pub mod attention {
             layers::MultiHeadSelfAttentionLayer,
             solver,
             tests::helpers::{
-                assert_optimisation_converges, compute_expected_dloss_dinput, new_linear,
+                assert_input_gradients, assert_optimisation_converges,
+                new_linear,
             },
         };
 
@@ -3077,38 +3042,18 @@ pub mod attention {
             let seq_len = 5;
             let embed_dim = 12;
 
-            let rng = RngStrategy::testable(1234);
-            let epsilon = 1e-8;
-            let decimals = 4;
-
-            let inputs = new_linear(seq_len, embed_dim, &rng);
-            let target = new_linear(seq_len, embed_dim, &rng);
-
-            let mut attention_layer = AttentionHead::new(seq_len, embed_dim, &rng);
-            let output = attention_layer.forward(&inputs).unwrap();
-
-            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
-            let dloss = dloss.collect();
-
-            let computed_dloss_dinput = attention_layer.backward(&inputs, &dloss).unwrap();
-            let expected_dloss_dinput = compute_expected_dloss_dinput(
-                |inputs| attention_layer.forward(inputs).unwrap(),
-                |output| {
-                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
-                    loss.to_sum()
+            assert_input_gradients(
+                &move |rng| {
+                    let attention_layer = AttentionHead::new(seq_len, embed_dim, &rng);
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (attention_layer, inputs, target)
                 },
-                inputs,
-                epsilon,
+                &move |attention_layer, inputs| attention_layer.forward(&inputs).unwrap(),
+                &move |attention_layer, inputs, dloss| {
+                    attention_layer.backward(&inputs, &dloss).unwrap()
+                },
             );
-
-            let delta_computed_dloss_dinput = computed_dloss_dinput
-                .iter()
-                .sub(expected_dloss_dinput.iter())
-                .round(decimals)
-                .collect();
-
-            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
-            assert_eq!(zeros, delta_computed_dloss_dinput);
         }
 
         #[test]
@@ -3117,45 +3062,25 @@ pub mod attention {
             let embed_dim = 12;
             let head_count = 3;
 
-            let rng = RngStrategy::testable(1234);
-            let epsilon = 1e-8;
-            let decimals = 4;
-
-            let inputs = new_linear(seq_len, embed_dim, &rng);
-            let target = new_linear(seq_len, embed_dim, &rng);
-
-            let mut attention_layer = MultiHeadSelfAttentionLayer::new(
-                seq_len,
-                embed_dim,
-                head_count,
-                &LayerInitStrategy::KaimingZeroBias,
-                &LayerInitStrategy::KaimingZeroBias,
-                &rng,
-            );
-            let output = attention_layer.forward(&inputs).unwrap();
-
-            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
-            let dloss = dloss.collect();
-
-            let computed_dloss_dinput = attention_layer.backward(&inputs, &dloss).unwrap();
-            let expected_dloss_dinput = compute_expected_dloss_dinput(
-                |inputs| attention_layer.forward(inputs).unwrap(),
-                |output| {
-                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
-                    loss.to_sum()
+            assert_input_gradients(
+                &move |rng| {
+                    let attention_layer = MultiHeadSelfAttentionLayer::new(
+                        seq_len,
+                        embed_dim,
+                        head_count,
+                        &LayerInitStrategy::KaimingZeroBias,
+                        &LayerInitStrategy::KaimingZeroBias,
+                        &rng,
+                    );
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (attention_layer, inputs, target)
                 },
-                inputs,
-                epsilon,
+                &move |attention_layer, inputs| attention_layer.forward(&inputs).unwrap(),
+                &move |attention_layer, inputs, dloss| {
+                    attention_layer.backward(&inputs, &dloss).unwrap()
+                },
             );
-
-            let delta_computed_dloss_dinput = computed_dloss_dinput
-                .iter()
-                .sub(expected_dloss_dinput.iter())
-                .round(decimals)
-                .collect();
-
-            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
-            assert_eq!(zeros, delta_computed_dloss_dinput);
         }
 
         #[test]
@@ -3442,90 +3367,60 @@ pub mod dense {
 
     #[cfg(test)]
     mod tests {
-        use crate::ml::transformer::tests::helpers::{compute_expected_dloss_dinput, new_linear};
+        use crate::ml::transformer::tests::helpers::{
+            assert_input_gradients, new_linear,
+        };
 
         use super::*;
 
         #[test]
         fn dense_can_compute_valid_gradients_for_simple_feed_forward() {
-            let delta_computed_dloss_dinput =
-                computed_dloss_dinput_delta(|_| (), LayerInitStrategy::Kaiming);
-
-            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
-            assert_eq!(zeros, delta_computed_dloss_dinput);
+            computed_dloss_dinput_delta(|_| (), LayerInitStrategy::Kaiming);
         }
 
         #[test]
         fn dense_can_compute_valid_gradients_for_relu_feed_forward() {
-            let delta_computed_dloss_dinput = computed_dloss_dinput_delta(
+            computed_dloss_dinput_delta(
                 |dense| dense.set_activation(NetworkActivationMode::RelU),
                 LayerInitStrategy::Kaiming,
             );
-
-            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
-            assert_eq!(zeros, delta_computed_dloss_dinput);
         }
 
         #[test]
         fn dense_can_compute_valid_gradients_for_tanh_feed_forward() {
-            let delta_computed_dloss_dinput = computed_dloss_dinput_delta(
+            computed_dloss_dinput_delta(
                 |dense| dense.set_activation(NetworkActivationMode::Tanh),
                 LayerInitStrategy::Kaiming,
             );
-
-            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
-            assert_eq!(zeros, delta_computed_dloss_dinput);
         }
 
         #[test]
         fn dense_can_compute_valid_gradients_for_sigmoid_feed_forward() {
-            let delta_computed_dloss_dinput = computed_dloss_dinput_delta(
+            computed_dloss_dinput_delta(
                 |dense| dense.set_activation(NetworkActivationMode::Sigmoid),
                 LayerInitStrategy::Kaiming,
             );
-
-            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
-            assert_eq!(zeros, delta_computed_dloss_dinput);
         }
 
         fn computed_dloss_dinput_delta(
             configure_fn: impl Fn(&mut Dense),
             strategy: LayerInitStrategy,
-        ) -> Linear {
+        ) {
             let seq_len = 4;
             let embed_dim = 8;
             let output_dim = 12;
 
-            let rng = RngStrategy::testable(1234);
-            let epsilon = 1e-8;
-            let decimals = 4;
-
-            let inputs = new_linear(seq_len, embed_dim, &rng);
-            let target = new_linear(seq_len, output_dim, &rng);
-
-            let mut dense = Dense::new(embed_dim, output_dim, &strategy, &rng);
-            configure_fn(&mut dense);
-
-            let output = dense.forward(&inputs).unwrap();
-            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
-            let dloss = dloss.collect();
-
-            let computed_dloss_dinput = dense.backward(&inputs, &dloss).unwrap();
-            let expected_dloss_dinput = compute_expected_dloss_dinput(
-                |inputs| dense.forward(inputs).unwrap(),
-                |output| {
-                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
-                    loss.to_sum()
+            assert_input_gradients(
+                &move |rng| {
+                    let mut dense = Dense::new(embed_dim, output_dim, &strategy, &rng);
+                    configure_fn(&mut dense);
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, embed_dim, &rng);
+                    (dense, inputs, target)
                 },
-                inputs,
-                epsilon,
+                &move |dense, inputs| dense.forward(&inputs).unwrap(),
+                &move |dense, inputs, dloss| dense.backward(&inputs, &dloss).unwrap(),
             );
-
-            computed_dloss_dinput
-                .iter()
-                .sub(expected_dloss_dinput.iter())
-                .round(decimals)
-                .collect()
         }
     }
 }
@@ -5023,6 +4918,41 @@ mod tests {
                 initial_mean_loss,
                 mean_loss
             );
+        }
+
+        pub fn assert_input_gradients<T>(
+            create: &dyn Fn(RngStrategy) -> (T, Linear, Linear),
+            forward: &dyn Fn(&T, &Linear) -> Linear,
+            backward: &dyn Fn(&mut T, &Linear, Linear) -> Linear,
+        ) {
+            let rng = RngStrategy::testable(12345);
+            let epsilon = 1e-8;
+            let decimals = 4;
+
+            let (mut testable_instance, inputs, target) = create(rng.clone());
+            let output = forward(&testable_instance, &inputs);
+
+            let dloss = output.iter().sub(target.iter()).multiply_scalar(2.0);
+
+            let computed_dloss_dinput = backward(&mut testable_instance, &inputs, dloss.collect());
+            let expected_dloss_dinput = compute_expected_dloss_dinput(
+                |inputs| forward(&testable_instance, inputs),
+                |output| {
+                    let loss = output.iter().sub(target.iter()).powf_scalar(2.0).collect();
+                    loss.to_sum()
+                },
+                inputs,
+                epsilon,
+            );
+
+            let delta_computed_dloss_dinput = computed_dloss_dinput
+                .iter()
+                .sub(expected_dloss_dinput.iter())
+                .round(decimals)
+                .collect();
+
+            let zeros = Linear::with_dimensions(&delta_computed_dloss_dinput);
+            assert_eq!(zeros, delta_computed_dloss_dinput);
         }
 
         pub fn compute_expected_dloss_dinput(
