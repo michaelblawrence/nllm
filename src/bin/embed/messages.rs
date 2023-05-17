@@ -4,7 +4,7 @@ use tracing::info;
 
 use std::{
     sync::{mpsc, Arc},
-    time::{Duration, Instant},
+    time::{Duration, Instant}, ops::ControlFlow,
 };
 
 use plane::ml::{
@@ -164,7 +164,7 @@ impl TrainerHandleActions {
         self,
         state: &mut training::TrainerState<M>,
         handle: &TrainerHandle<TrainerMessage, M>,
-    ) {
+    ) -> ControlFlow<()> {
         match self {
             TrainerHandleActions::Nothing => (),
             TrainerHandleActions::LearnRateMulMut(factor) => {
@@ -179,6 +179,7 @@ impl TrainerHandleActions {
             TrainerHandleActions::UnpauseForSingleIteration => {
                 info!("Pausing after next round...");
                 state.defer_pause(1);
+                return ControlFlow::Break(());
             }
             TrainerHandleActions::TogglePause => {
                 if state.training_paused() {
@@ -283,6 +284,7 @@ impl TrainerHandleActions {
                 info!("Restored loaded model and state, pausing...");
             }
         }
+        ControlFlow::Continue(())
     }
 }
 

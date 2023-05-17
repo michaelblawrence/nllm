@@ -324,7 +324,7 @@ impl<M> TrainerState<M> {
 
         layer_node_counts.collect()
     }
-    
+
     pub fn join_phrases(phrases: &Vec<Vec<String>>, char_tokens: Option<bool>) -> String {
         let char_tokens =
             char_tokens.unwrap_or_else(|| phrases.first().unwrap().iter().all(|x| x.len() <= 1));
@@ -366,11 +366,11 @@ impl<M> TrainerState<M> {
     }
 }
 
-pub fn setup_and_train_embeddings_v2<M: MLModel>(
+pub fn setup_and_train_model_v2<M: MLModel>(
     config: TrainEmbeddingConfig,
     handle: TrainerHandle<TrainerMessage, M>,
 ) -> M {
-    let (phrases, testing_phrases, mut state) = init_embedding_state(config, &handle);
+    let (phrases, testing_phrases, mut state) = init_model_state(config, &handle);
     let batch_size = state.batch_size();
 
     loop {
@@ -379,7 +379,10 @@ pub fn setup_and_train_embeddings_v2<M: MLModel>(
 
         while let Ok(msg) = handle.try_recv(recv_timeout) {
             let action = handle.run(&state.model, msg);
-            action.apply(&mut state, &handle);
+            match action.apply(&mut state, &handle) {
+                std::ops::ControlFlow::Continue(()) => continue,
+                std::ops::ControlFlow::Break(()) => break,
+            }
         }
 
         if state.should_report_round() {
@@ -409,7 +412,7 @@ pub fn setup_and_train_embeddings_v2<M: MLModel>(
     state.model
 }
 
-fn init_embedding_state<M>(
+fn init_model_state<M>(
     config: TrainEmbeddingConfig,
     handle: &TrainerHandle<TrainerMessage, M>,
 ) -> (Vec<Vec<String>>, Vec<Vec<String>>, TrainerState<M>)
@@ -417,7 +420,12 @@ where
     M: MLModel,
 {
     info!("Initialising vocab and train/test sets");
-    let rng: RngStrategy = Default::default();
+    let phrase_split_seed = config.phrase_split_seed.unwrap_or_default();
+    let rng: RngStrategy = if phrase_split_seed >= 0 {
+        RngStrategy::testable(phrase_split_seed as u32)
+    } else {
+        RngStrategy::default()
+    };
     let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, rng.to_rc());
     let mut testing_phrases = match config.phrase_test_set_split_pct.filter(|x| *x > 0.0) {
         Some(pct) => {
@@ -426,26 +434,41 @@ where
         None => phrases.clone(),
     };
 
-    if config.use_character_tokens {
+    let (char_vocab, str_vocab) = if config.use_character_tokens {
         info!("Tranforming vocab and train/test sets to character-level tokens");
-        let word_mode = false; // TODO config?
-        phrases = characterize_phrases(phrases, Some(config.input_stride_width), word_mode);
-        testing_phrases =
-            characterize_phrases(testing_phrases, Some(config.input_stride_width), word_mode);
+        phrases = characterize_phrases(phrases);
+        testing_phrases = characterize_phrases(testing_phrases);
         vocab = compute_vocab(&phrases, Some(&testing_phrases));
-    }
+        let char_vocab = vocab
+            .into_iter()
+            .map(|c| c.chars().next().unwrap())
+            .chain(['\n'])
+            .collect::<Vec<_>>();
+
+        (Some(char_vocab), None)
+    } else {
+        let str_vocab = vocab.into_iter().collect::<Vec<_>>();
+
+        (None, Some(str_vocab))
+    };
 
     let token_count = |x: &Vec<Vec<String>>| x.iter().map(|phrase| phrase.len()).sum::<usize>();
+    let char_token_len = char_vocab.as_ref().map(|x| x.len());
+    let str_token_len = str_vocab.as_ref().map(|x| x.len());
+    let token_len = char_token_len.or(str_token_len).unwrap_or_default();
     info!(
         "Completed token initialisation: (vocab size = {} tokens)",
-        vocab.len()
+        token_len
     );
     info!("Loaded: [ tokens(train_set) = {}, sequences(train_set) = {}, tokens(test_set) = {}, sequences(test_set) = {} ]",
         token_count(&phrases), phrases.len(),
         token_count(&testing_phrases), testing_phrases.len()
     );
 
-    let model: M = if config.use_character_tokens && config.use_transformer {
+    let model: M = if let (true, Some(vocab)) = (
+        config.use_character_tokens && config.use_transformer,
+        char_vocab,
+    ) {
         info!("Using CharacterTransformer (S2S)...");
         let builder = DecoderBuilder::new(
             config.input_stride_width,
@@ -456,9 +479,14 @@ where
             .with_dropout_rate(0.0)
             .with_feed_forward_hidden_dimension(config.hidden_layer_nodes);
 
-        let builder = if let Some(block_count) = config
+        let hidden_deep_layer_nodes = config
             .hidden_deep_layer_nodes
             .as_ref()
+            .map(|x| x.split(',').collect_vec());
+
+        let builder = if let Some(block_count) = hidden_deep_layer_nodes
+            .as_ref()
+            .and_then(|x| x.get(0))
             .and_then(|x| x.parse::<usize>().ok())
         {
             builder.with_block_count(block_count)
@@ -466,23 +494,24 @@ where
             builder
         };
 
-        let s2s = CharacterTransformer::from_builder(
-            builder,
-            vocab
-                .into_iter()
-                .map(|c| c.chars().next().unwrap())
-                .chain(['\n'])
-                .collect(),
-            rng,
-        )
-        .unwrap();
+        let builder = if let Some(head_count) = hidden_deep_layer_nodes
+            .as_ref()
+            .and_then(|x| x.get(1))
+            .and_then(|x| x.parse::<usize>().ok())
+        {
+            builder.with_head_count(head_count)
+        } else {
+            builder
+        };
+
+        let s2s = CharacterTransformer::from_builder_ordered(builder, &vocab, rng).unwrap();
 
         s2s.into()
-    } else {
+    } else if let Some(vocab) = str_vocab {
         info!("Using Embedding...");
         let hidden_layer_shape = TrainerState::<()>::build_hidden_layer_shape(&config);
 
-        let embedding = Embedding::new_builder(vocab)
+        let embedding = Embedding::new_builder_ordered(&vocab)
             .with_embedding_dimensions(config.embedding_size)
             .with_hidden_layer_custom_shape(hidden_layer_shape)
             .with_input_stride_width(config.input_stride_width)
@@ -492,6 +521,8 @@ where
             .unwrap();
 
         embedding.into()
+    } else {
+        panic!("invalid config build state");
     };
     let state = TrainerState::new(model, &config, &handle.tx);
 
@@ -541,10 +572,13 @@ fn report_round<M: MLModel>(
     }
 }
 
+type DeterministicHashSet<T> =
+    HashSet<T, std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
+
 pub fn init_phrases_and_vocab(
     config: &TrainEmbeddingConfig,
     rng: Rc<dyn RNG>,
-) -> (Vec<Vec<String>>, HashSet<String>) {
+) -> (Vec<Vec<String>>, DeterministicHashSet<String>) {
     let phrases = parse_phrases(&config);
 
     let (min_len, max_len) = config.phrase_word_length_bounds;
@@ -610,7 +644,7 @@ pub fn init_phrases_and_vocab(
 fn compute_vocab(
     phrases: &Vec<Vec<String>>,
     testing_phrases: Option<&Vec<Vec<String>>>,
-) -> HashSet<String> {
+) -> DeterministicHashSet<String> {
     phrases
         .iter()
         .chain(testing_phrases.into_iter().flatten())
@@ -624,25 +658,14 @@ fn compute_vocab(
         .collect()
 }
 
-fn characterize_phrases(
-    phrases: Vec<Vec<String>>,
-    min_word_len: Option<usize>,
-    word_mode: bool,
-) -> Vec<Vec<String>> {
+fn characterize_phrases(phrases: Vec<Vec<String>>) -> Vec<Vec<String>> {
     let separator = " ".to_string();
     phrases
         .into_iter()
-        .filter_map(|phrase| match min_word_len {
-            Some(min_word_len)
-                if word_mode && phrase.iter().any(|word| word.len() < min_word_len) =>
-            {
-                None
-            }
-            _ => Some(
-                Itertools::intersperse(phrase.into_iter(), separator.clone())
-                    .flat_map(|word| word.chars().map(|c| c.to_string()).collect_vec())
-                    .collect_vec(),
-            ),
+        .map(|phrase| {
+            Itertools::intersperse(phrase.into_iter(), separator.clone())
+                .flat_map(|word| word.chars().map(|c| c.to_string()).collect_vec())
+                .collect_vec()
         })
         .collect_vec()
 }
@@ -780,7 +803,7 @@ mod validate {
     pub fn log_training_round(report: &TrainerReport) {
         let ms_per_round = report
             .ms_per_round
-            .map(|ms_per_round| format!("(ms/round={ms_per_round:<4.1})"))
+            .map(|ms_per_round| format!("(ms/round={ms_per_round:>4.1})"))
             .unwrap_or_default();
 
         let label = report

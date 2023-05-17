@@ -31,6 +31,10 @@ pub struct TrainEmbeddingConfig {
     #[serde(default)]
     pub use_character_tokens: bool,
 
+    #[arg(short = 'N', long, default_value_t = false)]
+    #[serde(default)]
+    pub sample_from_newline: bool,
+
     #[arg(short = 'L', long, default_value_t = false)]
     #[serde(default)]
     pub use_transformer: bool,
@@ -81,6 +85,10 @@ pub struct TrainEmbeddingConfig {
     #[arg(short = 'W', long, default_value = None)]
     #[serde(default)]
     pub phrase_test_set_max_tokens: Option<usize>,
+
+    #[arg(short = 'w', long, default_value = None)]
+    #[serde(default)]
+    pub phrase_split_seed: Option<isize>,
 
     #[arg(short = 'm', long, value_enum, default_value_t = LayerActivationConfig::Tanh)]
     pub activation_mode: LayerActivationConfig,

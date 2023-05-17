@@ -45,6 +45,10 @@ impl Embedding {
         builder::EmbeddingBuilder::new(vocab)
     }
 
+    pub fn new_builder_ordered(vocab: &[String]) -> builder::EmbeddingBuilder {
+        builder::EmbeddingBuilder::new_ordered(vocab)
+    }
+
     pub fn snapshot(&self) -> Result<String> {
         Ok(serde_json::to_string(self)?)
     }
@@ -92,7 +96,11 @@ impl Embedding {
     }
 
     #[instrument(level = "info", skip_all)]
-    fn into_batches(&self, phrases: &Vec<Vec<String>>, batch_size: TrainBatchConfig) -> Vec<Vec<(LayerValues, LayerValues)>> {
+    fn into_batches(
+        &self,
+        phrases: &Vec<Vec<String>>,
+        batch_size: TrainBatchConfig,
+    ) -> Vec<Vec<(LayerValues, LayerValues)>> {
         // reduce phrase count for processing on small batches
         let phrases: Box<dyn Iterator<Item = &Vec<String>>> = match &batch_size {
             &TrainBatchConfig::SingleBatch(batch_size) => {
@@ -522,6 +530,19 @@ pub mod builder {
         pub fn new(vocab: HashSet<String>) -> Self {
             Self {
                 vocab,
+                ..Default::default()
+            }
+        }
+
+        pub fn new_ordered(vocab: impl AsRef<[String]>) -> EmbeddingBuilder {
+            let override_vocab = [&CONTROL_VOCAB.to_string()]
+                .into_iter()
+                .chain(vocab.as_ref())
+                .enumerate()
+                .map(|(i, word)| (word.clone(), i))
+                .collect();
+            Self {
+                override_vocab: Some(override_vocab),
                 ..Default::default()
             }
         }

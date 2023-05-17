@@ -1,4 +1,4 @@
-use std::{io::Write, thread};
+use std::{io::Write, thread, ops::ControlFlow};
 
 use anyhow::{anyhow, Result};
 use tracing::metadata::LevelFilter;
@@ -36,7 +36,7 @@ fn main() -> Result<()> {
         }
     }
 
-    training::setup_and_train_embeddings_v2(config, handle);
+    training::setup_and_train_model_v2(config, handle);
     Ok(())
 }
 
@@ -55,7 +55,7 @@ fn main() -> Result<()> {
 
     let config_clone = config.clone();
     let thread = thread::spawn(move || {
-        let _embedding = training::setup_and_train_embeddings_v2(config_clone, handle);
+        let _embedding = training::setup_and_train_model_v2(config_clone, handle);
     });
 
     if let Some((snapshot, state)) = resumed_state {
@@ -66,8 +66,12 @@ fn main() -> Result<()> {
     let ui_thread = thread::spawn(move || {
         if let Some(repl) = config.repl {
             for c in repl.chars() {
-                parse_repl_char(c, &tx, &config_clone)
+                let control_flow = parse_repl_char(c, &tx, &config_clone)
                     .expect("config repl character caused startup to halt");
+
+                if let ControlFlow::Break(()) = control_flow {
+                    return;
+                }
             }
         }
 
@@ -85,7 +89,7 @@ fn parse_repl_char(
     c: char,
     tx: &TrainerHandleSender<TrainerMessage>,
     config: &TrainEmbeddingConfig,
-) -> Result<()> {
+) -> Result<ControlFlow<()>> {
     match c {
         'r' => tx.send(TrainerMessage::PrintStatus)?,
         'o' => tx.send(TrainerMessage::PrintTrainingStatus)?,
@@ -110,7 +114,7 @@ fn parse_repl_char(
         }))?,
         'q' => {
             tx.send(TrainerMessage::Halt)?;
-            Err(anyhow!("Application Halted"))?
+            return Ok(ControlFlow::Break(()));
         }
         'h' => {
             println!(
@@ -141,11 +145,11 @@ fn parse_repl_char(
         }
         _ => (),
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
 #[cfg(feature = "cli")]
-fn block_on_key_press<F: Fn(char) -> Result<()>>(
+fn block_on_key_press<F: Fn(char) -> Result<ControlFlow<()>>>(
     key_press_callback: F,
     tx: &TrainerHandleSender<TrainerMessage>,
 ) {
@@ -163,7 +167,7 @@ fn block_on_key_press<F: Fn(char) -> Result<()>>(
             Err(_) => return,
         };
         if let Event::Key(KeyEvent { code: Char(c), .. }) = event::read().unwrap() {
-            if let Err(_) = key_press_callback(c) {
+            if let Err(_) | Ok(ControlFlow::Break(())) = key_press_callback(c) {
                 return;
             }
         }

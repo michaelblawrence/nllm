@@ -44,13 +44,7 @@ pub mod transformer {
             rng: RngStrategy,
         ) -> Result<Self> {
             let context_length = builder.sequence_len();
-            let vocab: HashMap<char, usize> = [CONTROL_VOCAB]
-                .into_iter()
-                .chain(vocab.into_iter().copied())
-                .enumerate()
-                .map(|(i, word)| (word, i))
-                .collect();
-
+            let vocab = Self::from_oredered_vocab(vocab);
             let builder = builder.with_target_vocab_size(vocab.len());
             Ok(Self {
                 network: builder.build()?,
@@ -58,6 +52,15 @@ pub mod transformer {
                 rng,
                 context_length,
             })
+        }
+
+        fn from_oredered_vocab(vocab: &[char]) -> HashMap<char, usize> {
+            [CONTROL_VOCAB]
+                .into_iter()
+                .chain(vocab.into_iter().copied())
+                .enumerate()
+                .map(|(i, word)| (word, i))
+                .collect()
         }
 
         pub fn snapshot(&self) -> Result<String> {
@@ -366,6 +369,10 @@ pub mod transformer {
             let errors = LayerValues::new(errors);
             Ok(errors.ave())
         }
+
+        pub fn vocab(&self) -> &HashMap<char, usize> {
+            &self.vocab
+        }
     }
 
     #[cfg(test)]
@@ -444,20 +451,24 @@ pub mod transformer {
             println!("[(0,BLOCKS),(1,ROUNDS),(2,---),(3,EMBEDIM),(4,HIDNDIM),(5,HEADS)]");
             let inject_env_values = inject_env_values();
             // let optimizer = solver::AdamOptimizer::new_cache(0.001);
-            let optimizer = solver::source::DefaultOptimizerCache::new(solver::source::DynamicOptimizerFactory::new(
-                move |param_count, param_dimension| {
-                    solver::AdamOptimizer::new_builder(param_count, param_dimension)
-                        .with_beta(0.9, 0.98)
-                        .with_epsilon(1e-9)
-                        .build()
-                },
-            ));
+            let optimizer = solver::source::DefaultOptimizerCache::new(
+                solver::source::DynamicOptimizerFactory::new(
+                    move |param_count, param_dimension| {
+                        solver::AdamOptimizer::new_builder(param_count, param_dimension)
+                            .with_beta(0.9, 0.98)
+                            .with_epsilon(1e-9)
+                            .build()
+                    },
+                ),
+            );
             // let optimizer = solver::AdamOptimizer::new_cache(*inject_env_values.get(2).unwrap_or(&0.01));
             // let optimizer = solver::SGDOptimizer::new_cache(*inject_env_values.get(2).unwrap_or(&0.01));
             let model_dimension = *inject_env_values.get(3).unwrap_or(&12.0) as usize;
             let builder = DecoderBuilder::new(3, model_dimension, vocab.len())
                 .with_block_count(*inject_env_values.get(0).unwrap_or(&1.0) as usize)
-                .with_feed_forward_hidden_dimension(*inject_env_values.get(4).unwrap_or(&64.0) as usize)
+                .with_feed_forward_hidden_dimension(
+                    *inject_env_values.get(4).unwrap_or(&64.0) as usize
+                )
                 .with_head_count(*inject_env_values.get(5).unwrap_or(&3.0) as usize)
                 .with_dropout_rate(0.0)
                 .with_embedding_init_strategy(LayerInitStrategy::KaimingZeroBias)
