@@ -3415,7 +3415,7 @@ pub mod dense {
                     let mut dense = Dense::new(embed_dim, output_dim, &strategy, &rng);
                     configure_fn(&mut dense);
                     let inputs = new_linear(seq_len, embed_dim, &rng);
-                    let target = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, output_dim, &rng);
                     (dense, inputs, target)
                 },
                 &move |dense, inputs| dense.forward(&inputs).unwrap(),
