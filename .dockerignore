@@ -2,6 +2,5 @@
 /dist
 /out
 /res
-!/res/tinyimdb.txt
-!/res/tinyshakespeare.txt
+!/res/tiny*.txt
 /target
