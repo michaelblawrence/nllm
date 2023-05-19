@@ -97,7 +97,7 @@ pub mod decoder {
         }
 
         pub fn backward<T: AsRef<[usize]>>(
-            &mut self,
+            &self,
             input_sequence: T,
             encoder_output: Option<&Linear>,
             encoder_mask: Option<&Linear>,
@@ -135,7 +135,7 @@ pub mod decoder {
                 .backward(&block_output, &output_gradients)?;
 
             let mut encoder_output_grads = vec![];
-            for (block, inputs) in self.blocks.iter_mut().zip(block_inputs.iter()).rev() {
+            for (block, inputs) in self.blocks.iter().zip(block_inputs.iter()).rev() {
                 let (block_input_gradients, encoder_output_gradients) = block.backward_with_mask(
                     inputs,
                     encoder_output,
@@ -1182,7 +1182,7 @@ pub mod blocks {
         }
 
         pub fn backward_with_mask(
-            &mut self,
+            &self,
             inputs: &Linear,
             encoder_output: Option<&Linear>,
             mask: Option<&Linear>,
@@ -1429,8 +1429,7 @@ pub mod blocks {
             transformer::{
                 solver,
                 tests::helpers::{
-                    assert_input_gradients,
-                    assert_optimisation_converges, new_linear,
+                    assert_input_gradients, assert_optimisation_converges, new_linear,
                 },
             },
             RngStrategy,
@@ -1763,21 +1762,22 @@ pub mod blocks {
 }
 
 pub mod layers {
+
     use anyhow::{anyhow, Context, Result};
     use itertools::Itertools;
     use serde::{Deserialize, Serialize};
 
-    use crate::{
-        lazy_opt,
-        ml::{layer::LayerInitStrategy, NetworkActivationMode, NodeValue, RngStrategy},
-    };
+    use crate::ml::{layer::LayerInitStrategy, NetworkActivationMode, NodeValue, RngStrategy};
 
     use super::{
         attention::MultiHeadAttention,
         dense::Dense,
-        gradients::{self, LossGradients},
         linear::Linear,
-        solver::{source::OptimizerSource, Optimizer},
+        params::{
+            keys::{EmbeddingVector, LayerNormalizationBeta, LayerNormalizationGamma},
+            TrainableParameter, TrainableCollection, TrainableLinear,
+        },
+        solver::source::OptimizerSource,
     };
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1835,7 +1835,7 @@ pub mod layers {
         }
 
         pub fn backward_with_mask(
-            &mut self,
+            &self,
             inputs: &Linear,
             mask: Option<&Linear>,
             output_gradients: &Linear,
@@ -1941,7 +1941,7 @@ pub mod layers {
         }
 
         pub fn backward_with_mask(
-            &mut self,
+            &self,
             kv_inputs: &Linear,
             q_inputs: &Linear,
             mask: Option<&Linear>,
@@ -2029,7 +2029,7 @@ pub mod layers {
             Ok(layer_output)
         }
 
-        pub fn backward(&mut self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
+        pub fn backward(&self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
             let final_layer_inputs = self.hidden_layer.forward(&inputs)?;
             let final_layer_gradients = self
                 .output_layer
@@ -2054,11 +2054,19 @@ pub mod layers {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct EmbeddingLayer {
-        embeddings: Vec<Linear>,
+        embeddings: Vec<TrainableLinear>,
         vocab_size: usize,
         model_dimensions: usize,
-        #[serde(skip)]
-        gradients: Option<LossGradients>,
+    }
+
+    impl TrainableCollection<EmbeddingVector> for EmbeddingLayer {
+        fn store(&self, index: usize) -> Option<super::params::ParameterStore> {
+            Some(self.embeddings.get(index)?.parameters())
+        }
+
+        fn param_mut(&mut self) -> Option<&mut [TrainableLinear]> {
+            Some(&mut self.embeddings)
+        }
     }
 
     impl EmbeddingLayer {
@@ -2073,14 +2081,13 @@ pub mod layers {
             let embeddings = linear
                 .to_values()
                 .into_iter()
-                .map(|row| Linear::from_values(&[row]).unwrap())
+                .map(|row| Linear::from_values(&[row]).unwrap().into())
                 .collect();
 
             Self {
                 embeddings,
                 vocab_size,
                 model_dimensions,
-                gradients: None,
             }
         }
 
@@ -2089,7 +2096,7 @@ pub mod layers {
 
             for &token in token_sequence.as_ref() {
                 let embedding = self.embeddings.get(token).context("invalid token id")?;
-                let embedding_vector = embedding.as_single_stride()?;
+                let embedding_vector = embedding.value().as_single_stride()?;
                 embedding_vectors.push(embedding_vector);
             }
 
@@ -2097,62 +2104,24 @@ pub mod layers {
         }
 
         pub fn backward<T: AsRef<[usize]>>(
-            &mut self,
+            &self,
             token_sequence: T,
             output_gradients: &Linear,
         ) -> Result<()> {
-            let mut embedding_weight_gradients = vec![];
-
             for (&token, grad) in token_sequence
                 .as_ref()
                 .iter()
                 .zip(output_gradients.rows_iter())
             {
                 let grad = Linear::from_iter(grad.len(), grad.iter().copied()).unwrap();
-                embedding_weight_gradients.push((token, grad));
+                self.queue_gradients(EmbeddingVector, token, grad.iter());
             }
 
-            self.add_gradients(embedding_weight_gradients);
             Ok(())
         }
 
-        fn add_gradients(&mut self, embedding_weight_gradients: Vec<(usize, Linear)>) {
-            let gradients =
-                self.gradients
-                    .get_or_insert_with(|| gradients::LossGradients::Embedding {
-                        dweights: self
-                            .embeddings
-                            .iter()
-                            .map(|_| Linear::new(1, self.model_dimensions))
-                            .collect(),
-                    });
-
-            if let gradients::LossGradients::Embedding { dweights } = gradients {
-                for (token_idx, gradients) in &embedding_weight_gradients
-                    .into_iter()
-                    .map(|(idx, grads)| (idx, grads))
-                    .group_by(|(idx, ..)| *idx)
-                {
-                    let dweights = &mut dweights[token_idx];
-                    let gradients = gradients.collect_vec();
-
-                    *dweights = gradients
-                        .iter()
-                        .fold(dweights.iter(), |iter, grads| iter.add(grads.1.iter()))
-                        .collect();
-                }
-            }
-        }
-
         pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
-            // could mutate in-place these values back to zero rather than take
-            let gradients = self.gradients.take();
-            let mut opt = lazy_opt!(optimizer, self.embeddings.first().unwrap());
-            if let Some(gradients::LossGradients::Embedding { dweights }) = gradients {
-                for (embedding, gradient) in self.embeddings.iter_mut().zip(&dweights) {
-                    opt.update(embedding, &gradient)?;
-                }
-            }
+            self.apply_param_gradients(EmbeddingVector, optimizer)?;
             Ok(())
         }
 
@@ -2208,7 +2177,7 @@ pub mod layers {
         }
 
         pub fn backward(
-            &mut self,
+            &self,
             start_index: usize,
             count: usize,
             output_gradients: &Linear,
@@ -2235,20 +2204,21 @@ pub mod layers {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct DropoutLayer {
         dropout_rate: NodeValue,
-        rng: RngStrategy,
+        // rng: RngStrategy,
     }
 
     impl DropoutLayer {
         pub fn new(dropout_rate: NodeValue, rng: &RngStrategy) -> Self {
-            let rng = rng.clone().upgrade();
-            Self { dropout_rate, rng }
+            // let rng = rng.clone().upgrade();
+            Self {
+                dropout_rate,
+                // rng
+            }
         }
 
         pub fn forward(&self, input: &Linear) -> Result<Linear> {
-            Ok(input
-                .iter()
-                .dropout(self.dropout_rate, self.rng.clone())
-                .collect())
+            let rng = RngStrategy::default();
+            Ok(input.iter().dropout(self.dropout_rate, rng).collect())
         }
 
         pub fn forward_if_enabled(&self, input: Linear, enabled: bool) -> Result<Linear> {
@@ -2266,18 +2236,15 @@ pub mod layers {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct LayerNormalization {
-        beta: Linear,
-        gamma: Linear,
-        #[serde(skip)]
-        gradients: Option<LossGradients>,
+        beta: TrainableLinear,
+        gamma: TrainableLinear,
     }
 
     impl LayerNormalization {
         pub fn new(seq_len: usize) -> Self {
             Self {
-                beta: Linear::with_value(seq_len, 1, 0.0),
-                gamma: Linear::with_value(seq_len, 1, 1.0),
-                gradients: None,
+                beta: Linear::with_value(seq_len, 1, 0.0).into(),
+                gamma: Linear::with_value(seq_len, 1, 1.0).into(),
             }
         }
 
@@ -2305,12 +2272,12 @@ pub mod layers {
             Ok(norm_scaled_shifted)
         }
 
-        pub fn backward(&mut self, x: &Linear, dl_dnorm: &Linear) -> Result<Linear> {
+        pub fn backward(&self, x: &Linear, dl_dnorm: &Linear) -> Result<Linear> {
             let row_x = x.rows_iter().map(|row| Linear::from_values(&[row.into()]));
             let rows_grads = dl_dnorm
                 .rows_iter()
                 .map(|row| Linear::from_values(&[row.into()]));
-            let gamma = self.gamma.values_iter().map(|(&g, ..)| g);
+            let gamma = self.gamma.value().values_iter().map(|(&g, ..)| g);
 
             let mut dloss_dx = vec![];
             let mut dloss_dbeta = vec![];
@@ -2326,7 +2293,8 @@ pub mod layers {
 
             let dloss_dbeta = Linear::from_values(&dloss_dbeta)?;
             let dloss_dgamma = Linear::from_values(&dloss_dgamma)?;
-            self.add_gradients(dloss_dbeta, dloss_dgamma);
+            self.queue_gradients(LayerNormalizationBeta, dloss_dbeta.iter());
+            self.queue_gradients(LayerNormalizationGamma, dloss_dgamma.iter());
 
             Linear::from_values(&dloss_dx)
         }
@@ -2383,31 +2351,30 @@ pub mod layers {
             Ok((dloss_dx, dbeta, dgamma))
         }
 
-        fn add_gradients(&mut self, beta_gradients: Linear, gamma_gradients: Linear) {
-            let gradients = self.gradients.get_or_insert_with(|| {
-                gradients::LossGradients::LayerNormalization {
-                    dbeta: Linear::with_dimensions(&beta_gradients),
-                    dgamma: Linear::with_dimensions(&gamma_gradients),
-                }
-            });
+        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
+            self.apply_param_gradients(LayerNormalizationBeta, optimizer)?;
+            self.apply_param_gradients(LayerNormalizationGamma, optimizer)?;
+            Ok(())
+        }
+    }
 
-            if let gradients::LossGradients::LayerNormalization { dbeta, dgamma } = gradients {
-                *dbeta = dbeta.iter().add(beta_gradients.iter()).collect();
-                *dgamma = dgamma.iter().add(gamma_gradients.iter()).collect();
-            }
+    impl TrainableParameter<LayerNormalizationBeta> for LayerNormalization {
+        fn store(&self) -> Option<super::params::ParameterStore> {
+            Some(self.beta.parameters())
         }
 
-        pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
-            // could mutate in-place these values back to zero rather than take
-            let gradients = self.gradients.take();
-            let mut opt_beta = lazy_opt!(optimizer, self.beta);
-            let mut opt_gamma = lazy_opt!(optimizer, self.gamma);
-            if let Some(gradients::LossGradients::LayerNormalization { dbeta, dgamma }) = gradients
-            {
-                opt_beta.update(&mut self.beta, &dbeta)?;
-                opt_gamma.update(&mut self.gamma, &dgamma)?;
-            }
-            Ok(())
+        fn param_mut(&mut self) -> Option<&mut TrainableLinear> {
+            Some(&mut self.beta)
+        }
+    }
+
+    impl TrainableParameter<LayerNormalizationGamma> for LayerNormalization {
+        fn store(&self) -> Option<super::params::ParameterStore> {
+            Some(self.gamma.parameters())
+        }
+
+        fn param_mut(&mut self) -> Option<&mut TrainableLinear> {
+            Some(&mut self.gamma)
         }
     }
 
@@ -2417,8 +2384,7 @@ pub mod layers {
             transformer::{
                 solver,
                 tests::helpers::{
-                    assert_input_gradients,
-                    assert_optimisation_converges, new_linear,
+                    assert_input_gradients, assert_optimisation_converges, new_linear,
                 },
             },
             RngStrategy,
@@ -2562,15 +2528,15 @@ pub mod attention {
     use anyhow::{anyhow, Result};
     use serde::{Deserialize, Serialize};
 
-    use crate::{
-        lazy_opt,
-        ml::{layer::LayerInitStrategy, NetworkActivationMode, NodeValue, RngStrategy},
-    };
+    use crate::ml::{layer::LayerInitStrategy, NetworkActivationMode, NodeValue, RngStrategy};
 
     use super::{
-        gradients::{self, LossGradients},
         linear::Linear,
-        solver::{source::OptimizerSource, Optimizer},
+        params::{
+            keys::{AttentionKeyWeights, AttentionQueryWeights, AttentionValueWeights},
+            TrainableParameter, TrainableLinear,
+        },
+        solver::source::OptimizerSource,
     };
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2634,7 +2600,7 @@ pub mod attention {
         }
 
         pub fn backward(
-            &mut self,
+            &self,
             key_inputs: &Linear,
             query_inputs: &Linear,
             value_inputs: &Linear,
@@ -2645,7 +2611,7 @@ pub mod attention {
 
             let mut kqv_input_grads = vec![];
 
-            for (head, output_gradients) in self.heads.iter_mut().zip(&head_output_gradients) {
+            for (head, output_gradients) in self.heads.iter().zip(&head_output_gradients) {
                 let head_input_gradients = head.backward_advanced(
                     key_inputs,
                     query_inputs,
@@ -2669,14 +2635,12 @@ pub mod attention {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct AttentionHead {
-        key_weights: Linear,
-        query_weights: Linear,
-        value_weights: Linear,
+        key_weights: TrainableLinear,
+        query_weights: TrainableLinear,
+        value_weights: TrainableLinear,
         mask: Option<Linear>,
         embedding_dimension: usize,
         sequence_len: usize,
-        #[serde(skip)]
-        gradients: Option<LossGradients>,
     }
 
     impl AttentionHead {
@@ -2706,7 +2670,6 @@ pub mod attention {
                 mask: None,
                 embedding_dimension,
                 sequence_len,
-                gradients: None,
             }
         }
 
@@ -2732,15 +2695,15 @@ pub mod attention {
             value_inputs: &Linear,
             mask: Option<&Linear>,
         ) -> Result<Linear> {
-            let keys = key_inputs.matrix_product(&self.key_weights);
-            let queries = query_inputs.matrix_product(&self.query_weights);
-            let values = value_inputs.matrix_product(&self.value_weights);
+            let keys = key_inputs.matrix_product(self.key_weights.value());
+            let queries = query_inputs.matrix_product(self.query_weights.value());
+            let values = value_inputs.matrix_product(self.value_weights.value());
 
             let output = Self::scaled_attention(&keys, &queries, &values, mask, self.mask.as_ref());
             Ok(output)
         }
 
-        pub fn backward(&mut self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
+        pub fn backward(&self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
             let kqv_grads =
                 self.backward_advanced(&inputs, &inputs, &inputs, None, output_gradients)?;
 
@@ -2751,7 +2714,7 @@ pub mod attention {
         }
 
         pub fn backward_advanced(
-            &mut self,
+            &self,
             key_inputs: &Linear,
             query_inputs: &Linear,
             value_inputs: &Linear,
@@ -2762,9 +2725,9 @@ pub mod attention {
                 Err(anyhow!("mismatched ouput vector size"))?;
             }
 
-            let keys = key_inputs.matrix_product(&self.key_weights);
-            let queries = query_inputs.matrix_product(&self.query_weights);
-            let values = value_inputs.matrix_product(&self.value_weights);
+            let keys = key_inputs.matrix_product(self.key_weights.value());
+            let queries = query_inputs.matrix_product(self.query_weights.value());
+            let values = value_inputs.matrix_product(self.value_weights.value());
 
             let (dkeys, dqueries, dvalues) = Self::scaled_attention_d(
                 &keys,
@@ -2779,11 +2742,13 @@ pub mod attention {
             let dquery_weights = query_inputs.matrix_product_lhs_transposed(&dqueries);
             let dvalue_weights = value_inputs.matrix_product_lhs_transposed(&dvalues);
 
-            self.add_gradients((dkey_weights, dquery_weights, dvalue_weights));
+            self.queue_gradients(AttentionKeyWeights, dkey_weights.iter());
+            self.queue_gradients(AttentionQueryWeights, dquery_weights.iter());
+            self.queue_gradients(AttentionValueWeights, dvalue_weights.iter());
 
-            let dkey_inputs = dkeys.matrix_product_rhs_transposed(&self.key_weights);
-            let dquery_inputs = dqueries.matrix_product_rhs_transposed(&self.query_weights);
-            let dvalue_inputs = dvalues.matrix_product_rhs_transposed(&self.value_weights);
+            let dkey_inputs = dkeys.matrix_product_rhs_transposed(self.key_weights.value());
+            let dquery_inputs = dqueries.matrix_product_rhs_transposed(self.query_weights.value());
+            let dvalue_inputs = dvalues.matrix_product_rhs_transposed(self.value_weights.value());
 
             Ok((dkey_inputs, dvalue_inputs, dquery_inputs))
         }
@@ -2880,45 +2845,10 @@ pub mod attention {
             Ok((dkeys, dqueries, dvalues))
         }
 
-        fn add_gradients(&mut self, kqv_weight_gradients: (Linear, Linear, Linear)) {
-            let (dkey_weights, dquery_weights, dvalue_weights) = kqv_weight_gradients;
-
-            let gradients =
-                self.gradients
-                    .get_or_insert_with(|| gradients::LossGradients::AttentionHead {
-                        dkeys: Linear::with_dimensions(&dkey_weights),
-                        dqueries: Linear::with_dimensions(&dquery_weights),
-                        dvalues: Linear::with_dimensions(&dvalue_weights),
-                    });
-
-            if let gradients::LossGradients::AttentionHead {
-                dkeys,
-                dqueries,
-                dvalues,
-            } = gradients
-            {
-                *dkeys = dkeys.iter().add(dkey_weights.iter()).collect();
-                *dqueries = dqueries.iter().add(dquery_weights.iter()).collect();
-                *dvalues = dvalues.iter().add(dvalue_weights.iter()).collect();
-            }
-        }
-
         pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
-            // could mutate in-place these values back to zero rather than take
-            let gradients = self.gradients.take();
-            let mut opt_key = lazy_opt!(optimizer, self.key_weights);
-            let mut opt_query = lazy_opt!(optimizer, self.query_weights);
-            let mut opt_value = lazy_opt!(optimizer, self.value_weights);
-            if let Some(gradients::LossGradients::AttentionHead {
-                dkeys,
-                dqueries,
-                dvalues,
-            }) = gradients
-            {
-                opt_key.update(&mut self.key_weights, &dkeys)?;
-                opt_query.update(&mut self.query_weights, &dqueries)?;
-                opt_value.update(&mut self.value_weights, &dvalues)?;
-            }
+            self.apply_param_gradients(AttentionKeyWeights, optimizer)?;
+            self.apply_param_gradients(AttentionQueryWeights, optimizer)?;
+            self.apply_param_gradients(AttentionValueWeights, optimizer)?;
             Ok(())
         }
 
@@ -2927,10 +2857,10 @@ pub mod attention {
             head_dimension: usize,
             strategy: &LayerInitStrategy,
             rng: &RngStrategy,
-        ) -> Linear {
+        ) -> TrainableLinear {
             let mut linear = Linear::new(embedding_dimension, head_dimension);
             linear.initialize_as_layer(&strategy, &rng);
-            linear
+            linear.into()
         }
 
         pub fn set_mask(&mut self, mask: Option<Linear>) {
@@ -2950,15 +2880,42 @@ pub mod attention {
         )
     }
 
+    impl TrainableParameter<AttentionKeyWeights> for AttentionHead {
+        fn store(&self) -> Option<super::params::ParameterStore> {
+            Some(self.key_weights.parameters())
+        }
+
+        fn param_mut(&mut self) -> Option<&mut TrainableLinear> {
+            Some(&mut self.key_weights)
+        }
+    }
+
+    impl TrainableParameter<AttentionQueryWeights> for AttentionHead {
+        fn store(&self) -> Option<super::params::ParameterStore> {
+            Some(self.query_weights.parameters())
+        }
+
+        fn param_mut(&mut self) -> Option<&mut TrainableLinear> {
+            Some(&mut self.query_weights)
+        }
+    }
+
+    impl TrainableParameter<AttentionValueWeights> for AttentionHead {
+        fn store(&self) -> Option<super::params::ParameterStore> {
+            Some(self.value_weights.parameters())
+        }
+
+        fn param_mut(&mut self) -> Option<&mut TrainableLinear> {
+            Some(&mut self.value_weights)
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use crate::ml::transformer::{
             layers::MultiHeadSelfAttentionLayer,
             solver,
-            tests::helpers::{
-                assert_input_gradients, assert_optimisation_converges,
-                new_linear,
-            },
+            tests::helpers::{assert_input_gradients, assert_optimisation_converges, new_linear},
         };
 
         use super::*;
@@ -3021,7 +2978,7 @@ pub mod attention {
 
             let inputs = new_linear(seq_len, embed_dim, &rng);
 
-            let mut attention_layer = AttentionHead::new(seq_len, embed_dim, &rng);
+            let attention_layer = AttentionHead::new(seq_len, embed_dim, &rng);
             let output = attention_layer.forward(&inputs).unwrap().to_values();
 
             let output_gradients = &new_linear(seq_len, embed_dim, &rng);
@@ -3147,54 +3104,28 @@ pub mod attention {
     }
 }
 
-pub mod gradients {
-    use super::linear::Linear;
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum LossGradients {
-        Dense {
-            weights: Linear,
-            bias: Option<Linear>,
-        },
-        AttentionHead {
-            dkeys: Linear,
-            dvalues: Linear,
-            dqueries: Linear,
-        },
-        Embedding {
-            dweights: Vec<Linear>,
-        },
-        LayerNormalization {
-            dbeta: Linear,
-            dgamma: Linear,
-        },
-    }
-}
-
 pub mod dense {
     use anyhow::{anyhow, Result};
     use serde::{Deserialize, Serialize};
 
-    use crate::{
-        lazy_opt,
-        ml::{layer::LayerInitStrategy, LayerValues, NetworkActivationMode, RngStrategy},
-    };
+    use crate::ml::{layer::LayerInitStrategy, LayerValues, NetworkActivationMode, RngStrategy};
 
     use super::{
-        gradients,
-        linear::{Linear, LinearIter},
-        solver::{source::OptimizerSource, Optimizer},
+        linear::Linear,
+        params::{
+            keys::{DenseBias, DenseWeight},
+            TrainableParameter, TrainableLinear,
+        },
+        solver::source::OptimizerSource,
     };
 
     #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
     pub struct Dense {
-        weights: Linear,
-        bias: Option<Linear>,
+        weights: TrainableLinear,
+        bias: Option<TrainableLinear>,
         activation: Option<NetworkActivationMode>,
         inputs_count: usize,
         outputs_count: usize,
-        #[serde(skip)]
-        gradients: Option<gradients::LossGradients>,
     }
 
     impl Dense {
@@ -3206,11 +3137,12 @@ pub mod dense {
         ) -> Self {
             let mut weights = Linear::new(inputs_count, outputs_count);
             weights.initialize_as_layer(strategy, rng);
+            let weights = weights.into();
 
             let bias = if strategy.requires_bias() {
                 let mut b = Linear::new(1, outputs_count);
                 b.initialize_as_layer_bias(strategy, rng);
-                Some(b)
+                Some(b.into())
             } else {
                 None
             };
@@ -3221,7 +3153,6 @@ pub mod dense {
                 activation: None,
                 inputs_count,
                 outputs_count,
-                gradients: None,
             }
         }
 
@@ -3259,7 +3190,7 @@ pub mod dense {
 
         fn compute_weighted_inputs(&self, inputs: &Linear) -> Result<Linear> {
             // -> output = inputs * weights
-            let output = inputs.matrix_product(&self.weights);
+            let output = inputs.matrix_product(self.weights.value());
 
             if let Some(bias) = &self.bias {
                 let bias = bias.iter().stack(inputs.count());
@@ -3269,7 +3200,7 @@ pub mod dense {
             }
         }
 
-        pub fn backward(&mut self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
+        pub fn backward(&self, inputs: &Linear, output_gradients: &Linear) -> Result<Linear> {
             let weighted_inputs_gradients = match &self.activation {
                 Some(activation) => {
                     let mut weighted_inputs = self.compute_weighted_inputs(&inputs)?;
@@ -3298,19 +3229,23 @@ pub mod dense {
             // -> weights_gradients = inputs.T * weighted_inputs_gradients
             let weights_gradients =
                 inputs.matrix_product_lhs_transposed(&weighted_inputs_gradients);
-            self.add_gradients(weights_gradients.iter(), bias_gradients.iter_transpose());
+
+            self.queue_gradients(DenseWeight, weights_gradients.iter());
+            if self.bias.is_some() {
+                self.queue_gradients(DenseBias, bias_gradients.iter_transpose());
+            }
 
             // -> output = inputs * weights
             // -> weighted_inputs_gradients = input_gradients_m * self.weights
             // -> input_gradients_m = weighted_inputs_gradients * self.weights.T
             let input_gradients =
-                weighted_inputs_gradients.matrix_product_rhs_transposed(&self.weights);
+                weighted_inputs_gradients.matrix_product_rhs_transposed(self.weights.value());
 
             Ok(input_gradients)
         }
 
         pub fn backward_row(
-            &mut self,
+            &self,
             inputs: LayerValues,
             output_gradients: LayerValues,
         ) -> Result<LayerValues> {
@@ -3325,53 +3260,73 @@ pub mod dense {
             self.activation = Some(activation);
         }
 
-        fn add_gradients(&mut self, weight_gradients: LinearIter, bias_gradients: LinearIter) {
-            let gradients = self
-                .gradients
-                .get_or_insert_with(|| gradients::LossGradients::Dense {
-                    weights: Linear::with_dimensions(&self.weights),
-                    bias: self
-                        .bias
-                        .as_ref()
-                        .map(|bias| Linear::with_dimensions(&bias)),
-                });
-
-            if let gradients::LossGradients::Dense { weights, bias } = gradients {
-                *weights = weights.iter().add(weight_gradients).collect();
-
-                if let Some(bias) = bias {
-                    *bias = bias.iter().add(bias_gradients).collect();
-                }
-            }
-        }
-
         pub fn apply_gradients<T: OptimizerSource>(&mut self, optimizer: &T) -> Result<()> {
-            // could mutate in-place these values back to zero rather than take
-            let gradients = self.gradients.take();
-            let mut opt_weights = lazy_opt!(optimizer, self.weights);
-            if let Some(gradients::LossGradients::Dense { weights, bias }) = gradients {
-                match (bias, &mut self.bias) {
-                    (Some(bias_gradient), Some(bias)) => {
-                        let mut opt_bias = lazy_opt!(optimizer, bias);
-                        opt_bias.update(bias, &bias_gradient)?;
-                        opt_weights.update(&mut self.weights, &weights)?;
-                    }
-                    _ => {
-                        opt_weights.update(&mut self.weights, &weights)?;
-                    }
-                }
+            self.apply_param_gradients(DenseWeight, optimizer)?;
+            if self.bias.is_some() {
+                self.apply_param_gradients(DenseBias, optimizer)?;
             }
             Ok(())
         }
     }
 
+    impl TrainableParameter<DenseWeight> for Dense {
+        fn store(&self) -> Option<super::params::ParameterStore> {
+            Some(self.weights.parameters())
+        }
+
+        fn param_mut(&mut self) -> Option<&mut TrainableLinear> {
+            Some(&mut self.weights)
+        }
+    }
+
+    impl TrainableParameter<DenseBias> for Dense {
+        fn store(&self) -> Option<super::params::ParameterStore> {
+            self.bias.as_ref().map(|x| x.parameters())
+        }
+
+        fn param_mut(&mut self) -> Option<&mut TrainableLinear> {
+            self.bias.as_mut()
+        }
+    }
+
     #[cfg(test)]
     mod tests {
-        use crate::ml::transformer::tests::helpers::{
-            assert_input_gradients, new_linear,
+        use crate::ml::transformer::{
+            solver,
+            tests::helpers::{assert_input_gradients, assert_optimisation_converges, new_linear},
         };
 
         use super::*;
+
+        #[test]
+        fn dense_can_minimise() {
+            let seq_len = 4;
+            let embed_dim = 8;
+            let output_dim = 12;
+            let strategy = LayerInitStrategy::Kaiming;
+
+            let learn_rate = 0.01;
+            let total_iterations = 25;
+            let optimizer = solver::SGDOptimizer::new_cache(learn_rate);
+
+            assert_optimisation_converges(
+                &move |rng| {
+                    let dense = Dense::new(embed_dim, output_dim, &strategy, &rng);
+                    let inputs = new_linear(seq_len, embed_dim, &rng);
+                    let target = new_linear(seq_len, output_dim, &rng);
+                    (dense, inputs, target)
+                },
+                &move |dense, inputs| dense.forward(&inputs).unwrap(),
+                &move |dense, inputs, dloss| {
+                    let grads = dense.backward(&inputs, &dloss).unwrap();
+
+                    *inputs = inputs.iter().apply_gradients(grads.iter(), learn_rate);
+                    dense.apply_gradients(&optimizer).unwrap();
+                    grads
+                },
+                total_iterations,
+            );
+        }
 
         #[test]
         fn dense_can_compute_valid_gradients_for_simple_feed_forward() {
@@ -3502,6 +3457,10 @@ pub mod linear {
             let stride = values.first().context("no values provided")?.len();
             let flattened_inputs = values.into_iter().flat_map(|x| x.iter());
             Linear::from_iter(stride, flattened_inputs.copied())
+        }
+
+        pub fn zero(&mut self) {
+            self.inner.iter_mut().for_each(|x| *x = 0.0);
         }
 
         pub fn initialize_as_layer(&mut self, strategy: &LayerInitStrategy, rng: &RngStrategy) {
@@ -3650,6 +3609,8 @@ pub mod linear {
                     .color_scale(ColorScalePalette::Blackbody.into())
                     .auto_color_scale(false),
             );
+
+            #[cfg(not(feature = "wasi"))]
             plot.show();
         }
 
@@ -3720,6 +3681,16 @@ pub mod linear {
         }
     }
 
+    impl Default for Linear {
+        fn default() -> Self {
+            Self {
+                inner: LayerValues::new(vec![0.0]),
+                stride: 1,
+                count: 1,
+            }
+        }
+    }
+
     #[must_use = "linear iterators are lazy and do nothing unless consumed"]
     pub struct LinearIter<'a> {
         inner: Box<dyn Iterator<Item = NodeValue> + 'a>,
@@ -3728,6 +3699,12 @@ pub mod linear {
     }
 
     impl<'a> LinearIter<'a> {
+        pub fn stride(&self) -> usize {
+            self.stride
+        }
+        pub fn count(&self) -> usize {
+            self.count
+        }
         pub fn matrix_transpose_product(self, rhs_transpose: Self) -> Linear {
             assert_eq!(
                 self.stride, rhs_transpose.stride,
@@ -4253,6 +4230,220 @@ pub mod linear {
     }
 }
 
+pub mod params {
+    use std::{
+        fmt::Debug,
+        sync::{Arc, Mutex, RwLock},
+    };
+
+    use anyhow::Result;
+    use serde::{Deserialize, Serialize};
+
+    use crate::lazy_opt;
+
+    use super::{
+        linear::{Linear, LinearIter},
+        solver::{source::OptimizerSource, Optimizer},
+    };
+
+    pub trait TrainableParameter<P: keys::TrainableParameterKey> {
+        fn store(&self) -> Option<ParameterStore>;
+        fn param_mut(&mut self) -> Option<&mut TrainableLinear>;
+        fn queue_gradients(&self, _: P, gradients: LinearIter) {
+            if let Some(store) = self.store() {
+                store.add_gradients(gradients);
+            }
+        }
+        fn apply_param_gradients<T: OptimizerSource>(&mut self, _: P, optimizer: &T) -> Result<()> {
+            if let Some(store) = self.store() {
+                store.apply_param_gradients(optimizer, self.param_mut())?;
+            }
+            Ok(())
+        }
+    }
+
+    pub trait TrainableCollection<P: keys::TrainableParameterKey> {
+        fn store(&self, index: usize) -> Option<ParameterStore>;
+        fn param_mut(&mut self) -> Option<&mut [TrainableLinear]>;
+        fn queue_gradients(&self, _: P, index: usize, gradients: LinearIter) {
+            if let Some(store) = self.store(index) {
+                store.add_gradients(gradients);
+            }
+        }
+        fn apply_param_gradients<T: OptimizerSource>(&mut self, _: P, optimizer: &T) -> Result<()> {
+            let count = self.param_mut().map(|x| x.len()).unwrap_or_default();
+            for index in 0..count {
+                if let Some(store) = self.store(index) {
+                    store.apply_param_gradients(
+                        optimizer,
+                        self.param_mut().and_then(|x| x.get_mut(index)),
+                    )?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct TrainableLinear {
+        value: Linear,
+        #[serde(skip)]
+        parameters: ParameterStore,
+    }
+
+    impl TrainableLinear {
+        pub fn parameters(&self) -> ParameterStore {
+            self.parameters.clone()
+        }
+
+        pub fn value(&self) -> &Linear {
+            &self.value
+        }
+
+        pub fn value_mut(&mut self) -> &mut Linear {
+            &mut self.value
+        }
+
+        pub fn iter(&self) -> LinearIter {
+            self.value.iter()
+        }
+
+        pub fn iter_transpose(&self) -> LinearIter {
+            self.value.iter_transpose()
+        }
+
+        pub fn stride(&self) -> usize {
+            self.value.stride()
+        }
+
+        pub fn count(&self) -> usize {
+            self.value.count()
+        }
+    }
+
+    impl From<Linear> for TrainableLinear {
+        fn from(value: Linear) -> Self {
+            Self {
+                value,
+                parameters: Default::default(),
+            }
+        }
+    }
+
+    // TODO: evaluate and possibly remove queue.. left over from RefCell store
+    #[derive(Debug, Default, Clone)]
+    pub struct ParameterStore(Arc<RwLock<Linear>>, Arc<Mutex<Vec<Linear>>>);
+
+    impl PartialEq for ParameterStore {
+        fn eq(&self, _: &Self) -> bool {
+            true
+        }
+    }
+
+    impl ParameterStore {
+        fn add_gradients(&self, gradients: LinearIter) {
+            let mut store = match self.0.try_write() {
+                Ok(store) => store,
+                Err(_) => {
+                    self.enqueue_gradient(gradients);
+                    return;
+                }
+            };
+            let (stride, count) = (store.stride(), store.count());
+            if stride == 1 && count == 1 {
+                if stride != gradients.stride() || count != gradients.count() {
+                    *store = Linear::new(gradients.count(), gradients.stride());
+                }
+            }
+
+            *store = store.iter().add(gradients).collect();
+        }
+        fn apply_param_gradients<T: OptimizerSource>(
+            &self,
+            optimizer: &T,
+            mut param: Option<&mut TrainableLinear>,
+        ) -> Result<()> {
+            for pending in self.dequeue_all() {
+                self.add_gradients(pending.iter());
+            }
+            self.with_gradients(move |gradients| {
+                if let Some(param) = param.as_mut() {
+                    let param = param.value_mut();
+                    let mut opt_param = lazy_opt!(optimizer, param);
+                    opt_param.update(param, gradients)?;
+                }
+                Ok(())
+            })?;
+            Ok(())
+        }
+        fn with_gradients(&self, mut action: impl FnMut(&Linear) -> Result<()>) -> Result<()> {
+            let mut gradients = self.0.write().unwrap();
+            if let Ok(true) = gradients.as_scalar().map(|x| x == 0.0) {
+                return Ok(());
+            }
+            action(&*gradients)?;
+            gradients.zero();
+            Ok(())
+        }
+        fn enqueue_gradient(&self, gradients: LinearIter) {
+            self.1.lock().unwrap().push(gradients.collect());
+        }
+        fn dequeue_all(&self) -> Vec<Linear> {
+            self.1.lock().unwrap().drain(..).collect()
+        }
+    }
+
+    pub mod keys {
+        use std::{fmt::Debug, hash::Hash};
+
+        pub use attention::*;
+        pub use dense::*;
+        pub use embedding::*;
+        pub use norm::*;
+
+        pub trait TrainableParameterKey: Hash + Debug {}
+
+        pub mod attention {
+            #[derive(Debug, Clone, Copy, Hash, PartialEq)]
+            pub struct AttentionKeyWeights;
+            impl super::TrainableParameterKey for AttentionKeyWeights {}
+
+            #[derive(Debug, Clone, Copy, Hash, PartialEq)]
+            pub struct AttentionQueryWeights;
+            impl super::TrainableParameterKey for AttentionQueryWeights {}
+
+            #[derive(Debug, Clone, Copy, Hash, PartialEq)]
+            pub struct AttentionValueWeights;
+            impl super::TrainableParameterKey for AttentionValueWeights {}
+        }
+        pub mod dense {
+
+            #[derive(Debug, Clone, Copy, Hash, PartialEq)]
+            pub struct DenseWeight;
+            impl super::TrainableParameterKey for DenseWeight {}
+
+            #[derive(Debug, Clone, Copy, Hash, PartialEq)]
+            pub struct DenseBias;
+            impl super::TrainableParameterKey for DenseBias {}
+        }
+        pub mod norm {
+            #[derive(Debug, Clone, Copy, Hash, PartialEq)]
+            pub struct LayerNormalizationBeta;
+            impl super::TrainableParameterKey for LayerNormalizationBeta {}
+
+            #[derive(Debug, Clone, Copy, Hash, PartialEq)]
+            pub struct LayerNormalizationGamma;
+            impl super::TrainableParameterKey for LayerNormalizationGamma {}
+        }
+        pub mod embedding {
+            #[derive(Debug, Clone, Copy, Hash, PartialEq)]
+            pub struct EmbeddingVector;
+            impl super::TrainableParameterKey for EmbeddingVector {}
+        }
+    }
+}
+
 pub mod solver {
     use anyhow::{anyhow, Result};
 
@@ -4577,11 +4768,11 @@ pub mod solver {
             }
 
             fn with_index(&self, index: usize) -> Box<Self> {
-                assert!(index < 10);
+                assert!(index < 100);
                 Box::new(Self {
                     factory: self.factory.clone(),
                     instances: self.instances.clone(),
-                    depth: (self.depth * 10) + index,
+                    depth: (self.depth * 100) + index,
                 })
             }
         }

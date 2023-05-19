@@ -81,22 +81,21 @@ pub mod transformer {
             let batch_size: TrainBatchConfig = batch_size.into();
             let batches = self.into_batches(corpus, batch_size);
             let (encoder_output, encoder_mask) = (None, None);
-            let mut costs = vec![];
 
-            // #[cfg(feature = "threadpool")]
-            // use rayon::prelude::*;
+            #[cfg(feature = "threadpool")]
+            use rayon::prelude::*;
 
             let batches_iter = {
-                // #[cfg(feature = "threadpool")]
-                // {
-                //     batches.par_iter()
-                // }
-                // #[cfg(not(feature = "threadpool"))]
+                #[cfg(feature = "threadpool")]
+                {
+                    batches.par_iter()
+                }
+                #[cfg(not(feature = "threadpool"))]
                 {
                     batches.iter()
                 }
             };
-            let batches_forward_pass: Result<Vec<_>> = batches_iter
+            let batches_forward_pass_costs = batches_iter
                 .map(|(input_sequence, targets)| {
                     let decoder_outputs = self.network.forward_training(
                         &input_sequence,
@@ -129,24 +128,20 @@ pub mod transformer {
                         .into_iter()
                         .unzip();
                     let decoder_gradients = Linear::from_values(&output_gradients)?;
+                    self.network.backward(
+                        &input_sequence,
+                        encoder_output,
+                        encoder_mask,
+                        decoder_gradients,
+                    )?;
 
-                    Ok((input_sequence, decoder_gradients, train_error))
+                    Ok(train_error)
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
-            for (input_sequence, decoder_gradients, train_error) in batches_forward_pass? {
-                self.network.backward(
-                    &input_sequence,
-                    encoder_output,
-                    encoder_mask,
-                    decoder_gradients,
-                )?;
+            self.network.apply_gradients(&*optimizer)?;
 
-                self.network.apply_gradients(&*optimizer)?;
-                costs.push(train_error.to_vec());
-            }
-
-            let costs: LayerValues = costs.into_iter().flatten().collect();
+            let costs: LayerValues = batches_forward_pass_costs.into_iter().flatten().collect();
             let ave_cost = costs.ave();
             Ok(ave_cost)
         }
