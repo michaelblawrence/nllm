@@ -38,6 +38,7 @@ pub struct TrainerState<M> {
     pub snapshot: (Option<String>, Instant),
     pub last_report: Option<(Instant, TrainerReport)>,
     paused: bool,
+    batches_trained: usize,
     pub round: usize,
     training_loss_logger: BoundedValueLogger<(usize, f64)>,
     rounds_until_pause_enabled: usize,
@@ -75,6 +76,7 @@ impl<M: MLModel> TrainerState<M> {
             rounds_until_pause_enabled: 0,
             halt: false,
             total_train_time: Duration::ZERO,
+            batches_trained: 0,
             round: 0,
         }
     }
@@ -89,6 +91,7 @@ impl<M: MLModel> TrainerState<M> {
 
         let train_duration = started.elapsed();
         self.total_train_time += train_duration;
+        self.batches_trained += self.inital_config.batch_size;
 
         self.try_record_train_iteration(train_error)
     }
@@ -308,6 +311,10 @@ impl<M: MLModel> TrainerState<M> {
         }
 
         self.halt = true;
+    }
+
+    pub fn batches_trained_since_process_started(&self) -> usize {
+        self.batches_trained
     }
 }
 
@@ -976,7 +983,7 @@ pub mod writer {
             .context("unable to extract trainer metatdata from saved model")?;
 
         let snapshot = serde_json::to_string(&snapshot)?;
-        
+
         info!("Extracted model configuration and training state from file");
         Ok((snapshot, config, state))
     }

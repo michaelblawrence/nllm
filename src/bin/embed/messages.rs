@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use std::{
+    ops::ControlFlow,
     sync::{mpsc, Arc},
-    time::{Duration, Instant}, ops::ControlFlow,
+    time::{Duration, Instant},
 };
 
 use plane::ml::{
@@ -249,7 +250,9 @@ impl TrainerHandleActions {
                 state.print_round_number = !state.print_round_number
             }
             TrainerHandleActions::Halt => {
-                state.trigger_round_report_test_set();
+                if state.batches_trained_since_process_started() > 0 {
+                    state.trigger_round_report_test_set();
+                }
                 state.halt();
             }
             TrainerHandleActions::DispatchWithMetadata(request) => {
