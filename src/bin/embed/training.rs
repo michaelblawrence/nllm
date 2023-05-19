@@ -922,6 +922,7 @@ pub mod writer {
     use serde_json::Value;
 
     use plane::ml::embeddings::Embedding;
+    use tracing::info;
 
     use crate::{config::TrainEmbeddingConfig, messages::TrainerStateMetadata, model::MLModel};
 
@@ -961,6 +962,7 @@ pub mod writer {
     pub fn read_model_from_disk(
         file_path: &str,
     ) -> Result<(String, TrainEmbeddingConfig, TrainerStateMetadata)> {
+        info!("Loading model from path: {file_path}");
         let file = File::open(file_path)?;
         let reader = BufReader::new(file);
 
@@ -974,7 +976,8 @@ pub mod writer {
             .context("unable to extract trainer metatdata from saved model")?;
 
         let snapshot = serde_json::to_string(&snapshot)?;
-
+        
+        info!("Extracted model configuration and training state from file");
         Ok((snapshot, config, state))
     }
 

@@ -38,6 +38,7 @@ pub enum TrainerMessage {
     NoOp,
     UnpauseForSingleIteration,
     PlotHeatMapGraphs,
+    PrintConfig,
 }
 
 impl TrainerMessage {
@@ -121,6 +122,11 @@ impl TrainerMessage {
             }
             TrainerMessage::PlotHeatMapGraphs => {
                 // plane::ml::transformer::linear::Linear::show_all_heatmap_plots();
+                TrainerHandleActions::Nothing
+            }
+            TrainerMessage::PrintConfig => {
+                let config_json = serde_json::to_string_pretty(&config).unwrap();
+                info!("Model initialization config: {}", config_json);
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::NoOp => TrainerHandleActions::Nothing,

@@ -1,10 +1,11 @@
-use std::{io::Write, thread, ops::ControlFlow};
+use std::{io::Write, ops::ControlFlow, thread};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use tracing::metadata::LevelFilter;
 
 use config::TrainEmbeddingConfig;
-use messages::{TrainerMessage, TrainerHandleSender};
+use messages::{TrainerHandleSender, TrainerMessage};
+use model::EmbedModel;
 
 mod bounded;
 mod config;
@@ -20,10 +21,11 @@ fn main() -> Result<()> {
     let (config, resumed_state) = parse_cli_args()?;
 
     let config_clone = config.clone();
-    let (tx, handle) = messages::TrainerHandle::new(move |embedding: &EmbedModel, msg: TrainerMessage| {
-        let handle_action = msg.apply(embedding, &config_clone);
-        handle_action
-    });
+    let (tx, handle) =
+        messages::TrainerHandle::new(move |embedding: &EmbedModel, msg: TrainerMessage| {
+            let handle_action = msg.apply(embedding, &config_clone);
+            handle_action
+        });
 
     if let Some((snapshot, state)) = resumed_state {
         tx.send(TrainerMessage::ReplaceEmbeddingState(snapshot, state))?;
@@ -31,8 +33,7 @@ fn main() -> Result<()> {
 
     if let Some(repl) = &config.repl {
         for c in repl.chars() {
-            parse_repl_char(c, &tx, &config)
-                .expect("config repl character caused startup to halt");
+            parse_repl_char(c, &tx, &config).expect("config repl character caused startup to halt");
         }
     }
 
@@ -42,16 +43,15 @@ fn main() -> Result<()> {
 
 #[cfg(feature = "thread")]
 fn main() -> Result<()> {
-    use model::EmbedModel;
-
     configure_logging();
     let (config, resumed_state) = parse_cli_args()?;
 
     let config_clone = config.clone();
-    let (tx, handle) = messages::TrainerHandle::new(move |model: &EmbedModel, msg: TrainerMessage| {
-        let handle_action = msg.apply(model, &config_clone);
-        handle_action
-    });
+    let (tx, handle) =
+        messages::TrainerHandle::new(move |model: &EmbedModel, msg: TrainerMessage| {
+            let handle_action = msg.apply(model, &config_clone);
+            handle_action
+        });
 
     let config_clone = config.clone();
     let thread = thread::spawn(move || {
@@ -109,6 +109,7 @@ fn parse_repl_char(
         'e' => tx.send(TrainerMessage::IncreaseMaxRounds(config.training_rounds))?,
         '/' => tx.send(TrainerMessage::UnpauseForSingleIteration)?,
         'p' => tx.send(TrainerMessage::TogglePause)?,
+        'c' => tx.send(TrainerMessage::PrintConfig)?,
         'l' => tx.send(prompt("output_label", |x| {
             TrainerMessage::RenameOutputLabel(x)
         }))?,
@@ -136,6 +137,7 @@ fn parse_repl_char(
                         '.' => multiply learn rate by 2
                         'e' => extend training rounds
                         'l' => rename output label (applies to subsequent save model operations)
+                        'c' => display config
                         'h' => display help
                         '/' => pause after a single iteration
                         'p' => toggle pause
