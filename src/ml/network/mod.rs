@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -448,7 +446,6 @@ impl Network {
                 Some(prev_layer_dl_dx) => LayerValues::new(prev_layer_dl_dx),
                 None => {
                     let layer_activations = state.layer_activations;
-                    let layer = &state.layer;
 
                     match state.activation_mode {
                         NetworkActivationMode::SoftMaxCrossEntropy => {

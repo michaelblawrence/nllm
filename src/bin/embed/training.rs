@@ -297,7 +297,7 @@ impl<M: MLModel> TrainerState<M> {
 
     pub fn halt(&mut self) {
         let quit_on_complete = self.inital_config.quit_on_complete;
-        let run_completed = self.round >= self.training_rounds;
+        let run_completed = (self.round + 1) >= self.training_rounds;
 
         if quit_on_complete && run_completed && !self.halt {
             let metadata = self.metadata();

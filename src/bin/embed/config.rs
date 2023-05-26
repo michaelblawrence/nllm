@@ -95,6 +95,12 @@ pub struct TrainEmbeddingConfig {
 }
 
 #[derive(Args, Debug, Clone)]
+pub struct SerializedTrainEmbeddingConfig {
+    #[arg(long, value_parser = parse_train_config_json)]
+    pub trainer_config: TrainEmbeddingConfig
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct LoadEmbeddingConfig {
     pub file_path: String,
 
@@ -148,6 +154,9 @@ pub enum Command {
 
     #[command(name = "load", arg_required_else_help = true)]
     LoadEmbedding(LoadEmbeddingConfig),
+
+    #[command(name = "json", arg_required_else_help = true)]
+    JsonTrainEmbedding(SerializedTrainEmbeddingConfig),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
@@ -195,4 +204,12 @@ where
     };
 
     Ok((range_start, range_end))
+}
+
+fn parse_train_config_json(
+    s: &str,
+) -> Result<TrainEmbeddingConfig, Box<dyn std::error::Error + Send + Sync + 'static>>
+{
+    let config: TrainEmbeddingConfig = serde_json::from_str(s)?;
+    Ok(config)
 }

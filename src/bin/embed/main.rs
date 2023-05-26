@@ -268,6 +268,7 @@ fn parse_cli_args() -> Result<(
 
     let (mut config, resumed_state) = match cli.command() {
         config::Command::TrainEmbedding(config) => (config, None),
+        config::Command::JsonTrainEmbedding(config) => (config.trainer_config, None),
         config::Command::LoadEmbedding(config) => load_embedding(config)?,
     };
 
