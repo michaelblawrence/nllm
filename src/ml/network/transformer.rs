@@ -3610,7 +3610,7 @@ pub mod linear {
                     .auto_color_scale(false),
             );
 
-            #[cfg(not(feature = "wasi"))]
+            #[cfg(not(any(feature = "wasi", not(feature = "cli"))))]
             plot.show();
         }
 
