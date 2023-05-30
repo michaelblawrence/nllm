@@ -1,11 +1,11 @@
-use std::{collections::HashMap, hash::Hash, ops::Deref, rc::Rc};
+use std::{collections::HashMap, hash::Hash, ops::Deref, rc::Rc, sync::Arc};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::ml::NodeValue;
 
-use self::{store::GlobalRngStore, cell::RngCell};
+use self::{cell::RngCell, rc::ArcRNG, store::GlobalRngStore};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum RngStrategy {
@@ -17,12 +17,12 @@ pub enum RngStrategy {
 
     #[serde(serialize_with = "serialize_cached")]
     #[serde(skip_deserializing)]
-    Cached(Rc<dyn RNG>, Box<RngStrategy>),
+    Cached(ArcRNG, Arc<RngStrategy>),
 
     #[serde(alias = "Cached")]
     #[serde(serialize_with = "serialize_unknown")]
     #[serde(deserialize_with = "deserialize_unknown")]
-    Unknown(Option<Box<RngStrategy>>),
+    Unknown(Option<Arc<RngStrategy>>),
 }
 
 impl Default for RngStrategy {
@@ -50,10 +50,10 @@ impl RngStrategy {
         RngStrategy::Debug { seed }.upgrade()
     }
 
-    pub fn to_rc(&self) -> Rc<dyn RNG> {
+    pub fn to_arc(&self) -> Arc<dyn RNG> {
         match self {
-            RngStrategy::Cached(instance, _) => instance.clone(),
-            RngStrategy::Unknown(Some(restored)) => GlobalRngStore::get(restored).to_rc(),
+            RngStrategy::Cached(instance, _) => instance.rng.clone(),
+            RngStrategy::Unknown(Some(restored)) => GlobalRngStore::get(restored).to_arc(),
             rng => rng.factory().unwrap().into(),
         }
     }
@@ -73,7 +73,7 @@ impl RngStrategy {
             RngStrategy::Unknown(Some(restored)) => {
                 (*GlobalRngStore::get(&restored)).clone().upgrade()
             }
-            rng => RngStrategy::Cached(rng.to_rc(), Box::new(rng)),
+            rng => RngStrategy::Cached(rng.to_arc().into(), Arc::new(rng)),
         }
     }
 
@@ -110,8 +110,8 @@ impl RngStrategy {
 unsafe impl Send for RngStrategy {}
 
 fn serialize_cached<S>(
-    _: &Rc<dyn RNG>,
-    inner: &Box<RngStrategy>,
+    _: &Arc<dyn RNG>,
+    inner: &Arc<RngStrategy>,
     serializer: S,
 ) -> std::result::Result<S::Ok, S::Error>
 where
@@ -125,27 +125,26 @@ where
 }
 
 fn serialize_unknown<S>(
-    inner: &Option<Box<RngStrategy>>,
+    inner: &Option<Arc<RngStrategy>>,
     serializer: S,
 ) -> std::result::Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    if let Some(child) = &inner {
-        child.serialize(serializer)
-    } else {
-        inner.serialize(serializer)
+    match &inner {
+        Some(child) => child.serialize(serializer),
+        _ => Option::<RngStrategy>::None.serialize(serializer),
     }
 }
 
 fn deserialize_unknown<'de, D>(
     deserializer: D,
-) -> std::result::Result<Option<Box<RngStrategy>>, D::Error>
+) -> std::result::Result<Option<Arc<RngStrategy>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let rng = RngStrategy::deserialize(deserializer)?;
-    Ok(Some(Box::new(rng)))
+    Ok(Some(Arc::new(rng)))
 }
 
 impl std::fmt::Debug for RngStrategy {
@@ -180,10 +179,10 @@ impl RNG for JsRng {
 }
 
 mod cell {
-    #[cfg(feature = "threadpool")]
-    use std::sync::Mutex;
     #[cfg(not(feature = "threadpool"))]
     use std::cell::UnsafeCell;
+    #[cfg(feature = "threadpool")]
+    use std::sync::Mutex;
 
     // TODO: evaluate perf for 'threadpool' feature
     #[cfg(feature = "threadpool")]
@@ -213,6 +212,41 @@ mod cell {
         pub fn with_inner<F: Fn(&mut T) -> O, O>(&'a self, func: F) -> O {
             let inner = unsafe { &mut *self.0.get() };
             func(inner)
+        }
+    }
+}
+
+mod rc {
+    use std::{sync::Arc, ops::Deref};
+
+    use super::{RngStrategy, RNG};
+
+    #[derive(Clone)]
+    pub struct ArcRNG {
+        pub rng: Arc<dyn RNG>,
+    }
+
+    unsafe impl Sync for ArcRNG {}
+
+    impl Default for ArcRNG {
+        fn default() -> Self {
+            Self {
+                rng: Arc::new(RngStrategy::default()),
+            }
+        }
+    }
+
+    impl Deref for ArcRNG {
+        type Target = Arc<dyn RNG>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.rng
+        }
+    }
+
+    impl From<Arc<dyn RNG>> for ArcRNG {
+        fn from(value: Arc<dyn RNG>) -> Self {
+            Self { rng: value }
         }
     }
 }
