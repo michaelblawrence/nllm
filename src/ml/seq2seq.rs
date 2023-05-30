@@ -709,35 +709,52 @@ pub mod transformer {
                 transformer: &CharacterTransformer,
                 testing_phrases: &String,
             ) -> (Vec<(f64, f64)>, f64) {
-                let mut validation_errors = vec![];
-                let mut correct_first_word_predictions = 0;
-                let mut total_first_word_predictions = 0;
-
-                for testing_phrase_window in testing_phrases
+                let testing_phrase_windows = &testing_phrases
                     .chars()
                     .chunks(transformer.input_stride_width() + 1)
                     .into_iter()
-                {
-                    let testing_phrase_window = testing_phrase_window.collect_vec();
-                    let (&last_token, context_tokens) = testing_phrase_window.split_last().unwrap();
+                    .map(|chunk| chunk.collect_vec())
+                    .collect_vec();
 
-                    let predicted = transformer.predict_next(&context_tokens).unwrap();
-                    let actual = last_token;
+                #[cfg(feature = "threadpool")]
+                use rayon::prelude::*;
 
-                    if predicted == actual {
-                        correct_first_word_predictions += 1;
+                let testing_phrase_windows_iter = {
+                    #[cfg(feature = "threadpool")]
+                    {
+                        testing_phrase_windows.par_iter()
                     }
+                    #[cfg(not(feature = "threadpool"))]
+                    {
+                        testing_phrase_windows.iter()
+                    }
+                };
 
-                    let error = transformer
-                        .compute_error(&[context_tokens, &[actual]].concat())
-                        .unwrap();
-                    let nll = transformer.nll(&context_tokens, actual).unwrap();
-                    validation_errors.push((error, nll));
-                    total_first_word_predictions += 1;
-                }
+                let (validation_errors, correct_first_word_predictions): (
+                    Vec<(f64, f64)>,
+                    Vec<usize>,
+                ) = testing_phrase_windows_iter
+                    .map(|testing_phrase_window| {
+                        let (&last_token, context_tokens) =
+                            testing_phrase_window.split_last().unwrap();
 
-                let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
-                    / total_first_word_predictions as NodeValue;
+                        let predicted = transformer.predict_next(&context_tokens).unwrap();
+                        let actual = last_token;
+                        let correct_first_word_count = if predicted == actual { 1 } else { 0 };
+
+                        let error = transformer
+                            .compute_error(&[context_tokens, &[actual]].concat())
+                            .unwrap();
+
+                        let nll = transformer.nll(&context_tokens, actual).unwrap();
+                        ((error, nll), correct_first_word_count)
+                    })
+                    .unzip();
+
+                let correct_count = correct_first_word_predictions.iter().sum::<usize>();
+                let predictions_pct =
+                    correct_count as NodeValue * 100.0 / validation_errors.len() as NodeValue;
+
                 (validation_errors, predictions_pct)
             }
         }
