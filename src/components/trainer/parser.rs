@@ -71,19 +71,13 @@ pub(crate) fn split_training_and_testing(
 pub(crate) fn parse_vocab_and_phrases(
     max_vocab: Option<usize>,
 ) -> (HashSet<String>, Vec<Vec<String>>) {
-    // let phrase_json = include_str!("../../../res/phrase_list.json");
-    let phrase_json = todo!();
-    let phrase_json: serde_json::Value = serde_json::from_str(phrase_json).unwrap();
-    let mut phrases: Vec<Vec<String>> = phrase_json
-        .as_array()
-        .unwrap()
-        .into_iter()
-        .map(|value| {
-            value
-                .as_array()
-                .unwrap()
+    let corpus = include_str!("../../../res/tinytester.txt");
+    let mut phrases: Vec<Vec<String>> = corpus
+        .lines()
+        .map(|line| {
+            line.split_ascii_whitespace()
                 .into_iter()
-                .map(|value| value.as_str().unwrap().to_owned())
+                .map(|value| value.to_owned())
                 .collect()
         })
         .collect();

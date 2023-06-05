@@ -15,7 +15,7 @@ pub type VocabAndPhrases = (HashSet<String>, Vec<Vec<String>>, Vec<Vec<String>>)
 #[hook]
 pub fn use_embeddings<F, C>(
     config: Rc<TrainEmbeddingConfig>,
-    with_emedding_fn: F,
+    with_embedding_fn: F,
     cleanup_fn: C,
 ) -> (
     UseStateHandle<EmbeddingHandle>,
@@ -55,7 +55,7 @@ where
                         config.process_all_batches,
                     );
 
-                    with_emedding_fn(embedding_instance, error, (*vocab_and_phrases).clone())
+                    with_embedding_fn(embedding_instance, error, (*vocab_and_phrases).clone())
                 }));
 
                 train_remaining_iters.set(*train_remaining_iters - 1);
