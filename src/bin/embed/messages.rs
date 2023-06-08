@@ -36,6 +36,7 @@ pub enum TrainerMessage {
     PrintEachRoundNumber,
     PlotTrainingLossGraph,
     PlotTrainingLossGraphDispatch(TrainerStateMetadata),
+    Yield,
     NoOp,
     UnpauseForSingleIteration,
     PlotHeatMapGraphs,
@@ -130,6 +131,7 @@ impl TrainerMessage {
                 info!("Model initialization config: {}", config_json);
                 TrainerHandleActions::Nothing
             }
+            TrainerMessage::Yield => TrainerHandleActions::Nothing,
             TrainerMessage::NoOp => TrainerHandleActions::Nothing,
         }
     }

@@ -1,5 +1,6 @@
 FROM rust:1.68.2-alpine3.17 as builder
 
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 RUN set -eux; \
         apk add --no-cache musl-dev; \
 		rustup --version; \
@@ -16,19 +17,18 @@ RUN set -eux; \
 		cp src/main.rs src/bin/embed/main.rs;
 
 COPY Cargo.toml Cargo.lock ./
-ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
         
 RUN set -eux; \
-        cargo install --features="cli thread threadpool" --bin embed --path .;
+        cargo install --features="multi_threaded" --bin embed --path .;
 
 COPY src src
 RUN touch src/bin/embed/main.rs src/bin/derivate.rs src/main.rs;
 
 RUN set -eux; \
-        cargo install --features="cli thread threadpool" --bin embed --path .;
+        cargo install --features="multi_threaded" --bin embed --path .;
 
 COPY justfile ./
-COPY res/tinyimdb.txt res/tinyshakespeare.txt ./res/
+COPY res/tiny*.txt ./res/
 
 RUN set -eux; \
         mkdir out

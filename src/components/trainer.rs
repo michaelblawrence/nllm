@@ -13,6 +13,7 @@ use crate::components::PlotComponent;
 use hook::use_embeddings;
 use nearest::EmbeddingNearest;
 pub use parser::TrainEmbeddingConfig;
+pub use handle::RefCellHandle;
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct EmbeddingTrainerProps {

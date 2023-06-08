@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -157,9 +158,14 @@ impl<M: MLModel> TrainerState<M> {
 
             self.trigger_round_report_test_set();
             self.pause();
-        } else if !self.training_paused() {
+            return;
+        }
+        
+        if !self.training_paused() {
             self.round += 1;
         }
+        _ = self.handle_tx
+            .send(TrainerMessage::Yield);
     }
 
     pub fn pause(&mut self) -> bool {
@@ -433,7 +439,7 @@ where
     } else {
         RngStrategy::default()
     };
-    let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, rng.to_rc());
+    let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, rng.to_arc());
     let mut testing_phrases = match config.phrase_test_set_split_pct.filter(|x| *x > 0.0) {
         Some(pct) => {
             split_training_and_testing(&mut phrases, pct, config.phrase_test_set_max_tokens)
@@ -474,7 +480,7 @@ where
 
     let model: M = if let (true, Some(vocab)) = (
         config.use_character_tokens && config.use_transformer,
-        char_vocab,
+        &char_vocab,
     ) {
         info!("Using CharacterTransformer (S2S)...");
         let builder = DecoderBuilder::new(
@@ -514,7 +520,9 @@ where
         let s2s = CharacterTransformer::from_builder_ordered(builder, &vocab, rng).unwrap();
 
         s2s.into()
-    } else if let Some(vocab) = str_vocab {
+    } else if let Some(vocab) =
+        str_vocab.or(char_vocab.map(|x| x.into_iter().map(|c| c.to_string()).collect()))
+    {
         info!("Using Embedding...");
         let hidden_layer_shape = TrainerState::<()>::build_hidden_layer_shape(&config);
 
@@ -584,7 +592,7 @@ type DeterministicHashSet<T> =
 
 pub fn init_phrases_and_vocab(
     config: &TrainEmbeddingConfig,
-    rng: Rc<dyn RNG>,
+    rng: Arc<dyn RNG>,
 ) -> (Vec<Vec<String>>, DeterministicHashSet<String>) {
     let phrases = parse_phrases(&config);
 

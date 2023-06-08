@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use tracing::{metadata::LevelFilter, Level};
+use tracing::{metadata::LevelFilter, Level, info};
 use tracing_subscriber::prelude::*;
 use yew::prelude::*;
 use yew_hooks::use_local_storage;
@@ -53,9 +53,9 @@ fn App() -> Html {
 
     html! {
         <div>
-        <EmbeddingChat />
-        <EmbeddingTrainer config={&*embedding_training_config}/>
-        <JsonEditor json_input={json} on_json_change={on_json_change} input_invalid={!*json_is_valid}/>
+            <EmbeddingChat />
+            <EmbeddingTrainer config={&*embedding_training_config}/>
+            <JsonEditor json_input={json} on_json_change={on_json_change} input_invalid={!*json_is_valid}/>
         </div>
     }
 }
@@ -77,6 +77,8 @@ fn main() {
         .with(fmt_layer)
         .with(perf_layer)
         .init();
+
+    info!("WASM Started!");
 
     yew::Renderer::<App>::new().render();
 }
