@@ -2,6 +2,8 @@ mongodb_user := env_var_or_default('MONGO_INITDB_ROOT_USERNAME', 'root')
 mongodb_pass := env_var_or_default('MONGO_INITDB_ROOT_PASSWORD', 'example')
 mongodb_host := env_var_or_default('MONGO_INITDB_HOST', 'localhost')
 model_output_label := "dev-model"
+ssh_user := env_var_or_default('SSH_USER', 'root')
+home_dir := env_var_or_default('USER_HOME_DIR', '/home/docker')
 
 build:
   cargo build --features="multi_threaded" --release --bin embed
@@ -10,7 +12,7 @@ build-wasi:
   cargo +nightly wasi build --features="wasi" --release --bin embed 
 
 install:
-  cargo install --features="multi_threaded" --bin embed --path .
+  cargo install --features="multi_threaded" --bin embed --offline --path .
 
 install-upload:
   cargo install --features="db" --bin upload --path .
@@ -81,6 +83,9 @@ testrun-tinyshakespeare:
     --hidden-layer-nodes 650  --embedding-size 16 --input-stride-width 64 --repl "PR" \
     -o out -O {{model_output_label}} -i ./res/tinyshakespeare.txt
 
+run-microgpt-MK7 phrase_test_set_max_tokens="500":
+  embed json --trainer-config '{"activation_mode":"Tanh","batch_size":8,"embedding_size":128,"hidden_deep_layer_nodes":"1,4","hidden_layer_nodes":512,"input_stride_width":128,"input_txt_path":"./res/tinyimdbtrainneg.txt","output_dir":"out/labelled/train","output_label":"microgpt","output_label_append_details":true,"pause_on_start":false,"phrase_split_seed":null,"phrase_test_set_max_tokens":{{phrase_test_set_max_tokens}},"phrase_test_set_split_pct":20.0,"phrase_train_set_size":null,"phrase_word_length_bounds":[null,null],"quit_on_complete":false,"repl":"crP","sample_from_newline":false,"single_batch_iterations":true,"snapshot_interval_secs":120,"train_rate":0.004,"training_rounds":1000,"use_character_tokens":true,"use_transformer":true}'
+
 upload-tinyshakespeare mongodb_conn_str=("mongodb://" + mongodb_user + ":" + mongodb_pass + "@" + mongodb_host + ":27017"):
   MONGODB_HOST={{mongodb_conn_str}} \
     upload out/{{model_output_label}}
@@ -126,25 +131,57 @@ docker-test-upload-tty: docker-build
 
 docker-run run_script="run" script_args="": docker-build
   mkdir -p out/script-{{run_script}}
-  docker run --name embedtestrun --rm -v `pwd`/out/script-{{run_script}}:/app/out \
+  docker run --name embedtestrun --rm -itd -v `pwd`/out/script-{{run_script}}:/app/out \
     embed just {{run_script}} {{script_args}}
+  docker attach --no-stdin --sig-proxy=false embedtestrun
 
 configure-node node_ip public_key_path:
-  ssh-copy-id -i {{public_key_path}} root@{{node_ip}}
-  ssh root@{{node_ip}} snap install --edge --classic just
+  ssh-copy-id -i {{public_key_path}} {{ssh_user}}@{{node_ip}}
+  ssh {{ssh_user}}@{{node_ip}} snap install --edge --classic just
+  ssh {{ssh_user}}@{{node_ip}} apt install -y socat
+
+configure-aws-arm-ami-node node_ip public_key_path:
+  ssh ec2-user@{{node_ip}} "sudo yum update -y; sudo yum search docker; sudo yum install docker -y; sudo usermod -a -G docker ec2-user; id ec2-user; newgrp docker; sudo systemctl enable docker.service; sudo systemctl start docker.service; sudo yum install socat -y; sudo yum install gcc -y; curl https://sh.rustup.rs -sSf > RUSTUP.sh; sh RUSTUP.sh -y; source ~/.bashrc; cargo install just"
+
+resume-node node_ip input_file version="v1" run_script="testrun-tinyshakespeare":
+  ssh {{ssh_user}}@{{node_ip}} mkdir -p {{home_dir}}/code/{{version}}
+  git archive --add-file=justfile --add-file=Dockerfile --format=zip HEAD > ./res/archive.zip
+  scp -p ./res/archive.zip {{ssh_user}}@{{node_ip}}:{{home_dir}}/code
+  ssh {{ssh_user}}@{{node_ip}} "cd {{home_dir}}/code/{{version}}; unzip -o ../archive.zip"
+  scp -p ./res/tiny*.txt {{ssh_user}}@{{node_ip}}:{{home_dir}}/code/{{version}}/res/
+  scp -p ./{{input_file}} {{ssh_user}}@{{node_ip}}:{{home_dir}}/code/{{version}}/{{input_file}}
+  ssh {{ssh_user}}@{{node_ip}} "cd {{home_dir}}/code/{{version}}; just docker-run resume {{input_file}}"
 
 push-node node_ip version="v1" run_script="testrun-tinyshakespeare" script_args="":
-  ssh root@{{node_ip}} mkdir -p /home/docker/code/{{version}}
+  ssh {{ssh_user}}@{{node_ip}} mkdir -p {{home_dir}}/code/{{version}}
   git archive --add-file=justfile --add-file=Dockerfile --format=zip HEAD > ./res/archive.zip
-  scp -p ./res/archive.zip root@{{node_ip}}:/home/docker/code
-  ssh root@{{node_ip}} "cd /home/docker/code/{{version}}; unzip -o ../archive.zip"
-  scp -p ./res/tiny*.txt root@{{node_ip}}:/home/docker/code/{{version}}/res/
-  ssh root@{{node_ip}} "cd /home/docker/code/{{version}}; just docker-run {{run_script}} {{script_args}}"
-
-pull-node node_ip version="v1" run_script="testrun-tinyshakespeare" script_args="":
+  scp -p ./res/archive.zip {{ssh_user}}@{{node_ip}}:{{home_dir}}/code
+  ssh {{ssh_user}}@{{node_ip}} "cd {{home_dir}}/code/{{version}}; unzip -o ../archive.zip"
+  scp -p ./res/tiny*.txt {{ssh_user}}@{{node_ip}}:{{home_dir}}/code/{{version}}/res/
+  ssh {{ssh_user}}@{{node_ip}} "cd {{home_dir}}/code/{{version}}; just docker-run {{run_script}} {{script_args}}"
   mkdir -p out/remote/{{run_script}}/{{version}}
-  scp -p root@{{node_ip}}:/home/docker/code/{{version}}/out/script-{{run_script}} ./out/remote/{{run_script}}/{{version}}
+  scp -p -r {{ssh_user}}@{{node_ip}}:{{home_dir}}/code/{{version}}/out/script-{{run_script}} ./out/remote/{{run_script}}/{{version}}
 
-pull-aws-node node_ip version="v1" label="testrun-tinyshakespeare" script_args="":
+snapshot-model-node node_ip version="v1":
+  ssh {{ssh_user}}@{{node_ip}} "cd {{home_dir}}/code/{{version}}; echo 's' | socat EXEC:'docker attach embedtestrun',pty STDIN"
+
+repl-model-node node_ip repl:
+  ssh {{ssh_user}}@{{node_ip}} "echo '{{repl}}' | socat EXEC:'docker attach embedtestrun',pty STDIN"
+
+docker-stop-node node_ip:
+  ssh {{ssh_user}}@{{node_ip}} docker kill embedtestrun
+
+push-node-res node_ip version res_fname:
+  ssh {{ssh_user}}@{{node_ip}} mkdir -p {{home_dir}}/code/{{version}}
+  scp -p ./res/{{res_fname}} {{ssh_user}}@{{node_ip}}:{{home_dir}}/code/{{version}}/res/
+
+clean-node node_ip version="v1" run_script="testrun-tinyshakespeare":
+  ssh {{ssh_user}}@{{node_ip}} rm -rf {{home_dir}}/code/{{version}}/out/script-{{run_script}}
+
+pull-node node_ip version="v1" run_script="testrun-tinyshakespeare":
+  mkdir -p out/remote/{{run_script}}/{{version}}
+  scp -p -r {{ssh_user}}@{{node_ip}}:{{home_dir}}/code/{{version}}/out/script-{{run_script}} ./out/remote/{{run_script}}/{{version}}
+
+pull-aws-node node_ip version="v1" label="testrun-tinyshakespeare":
   mkdir -p out/remote/{{label}}/aws-{{version}}
-  scp -p -r ubuntu@{{node_ip}}:/home/ubuntu/code/out/{{label}} ./out/remote/{{label}}/aws-{{version}}
+  scp -p -r {{ssh_user}}@{{node_ip}}:/home/ubuntu/code/out/{{label}} ./out/remote/{{label}}/aws-{{version}}
