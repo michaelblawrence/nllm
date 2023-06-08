@@ -182,26 +182,30 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             _ => (),
         };
 
-        let response: Vec<_> = if let (Some(vocab), true) = (
+        let response: Box<dyn Iterator<Item = String>> = if let (Some(vocab), true) = (
             vocab.as_ref(),
             char_mode && vocab_supervised_predictions_enabled,
         ) {
-            predict_supervised(&model, &context_tokens, vocab, default_min_word_len, &rng)
+            Box::new(predict_supervised(&model, &context_tokens, vocab, default_min_word_len, &rng).into_iter())
         } else {
-            model.predict_from_iter(&context_tokens).collect()
+            model.predict_from_iter(&context_tokens)
         };
 
-        let response = if char_mode {
+        let response: Box<dyn Iterator<Item = (String, &'static str)>> = if char_mode {
             if append_space {
-                response.join("")
+                Box::new(response.into_iter().map(|x| (x, "")))
             } else {
-                format!("{input_txt}{}", &response.join("")[1..])
+                Box::new(
+                    [(input_txt, "")]
+                        .into_iter()
+                        .chain(response.into_iter().skip(1).map(|x| (x, ""))),
+                )
             }
         } else {
-            response.join(" ")
+            Box::new(response.into_iter().map(|x| (x, " ")))
         };
 
-        print_prompt_response(&response);
+        print_prompt_response(response);
     }
 }
 
@@ -426,15 +430,28 @@ fn configure_vocab(
     }
 }
 
-fn print_prompt_response(response: &str) {
+fn print_prompt_response(mut response_iter: impl Iterator<Item = (String, &'static str)>) {
     print!("Model Response:        ");
     io::stdout().flush().unwrap();
 
-    for word in response.split_whitespace() {
-        print!(" {word}");
+    let mut response = String::new();
+    while let Some((token, separator)) = response_iter.next() {
+        response += &format!("{token}{separator}");
+        let split_whitespace = response.split_whitespace();
+        let whole_word_count = split_whitespace.clone().count().saturating_sub(1);
+        let mut final_token = None;
+        for word in split_whitespace.take(whole_word_count) {
+            print!(" {word}");
 
-        io::stdout().flush().unwrap();
-        thread::sleep(Duration::from_millis(25))
+            io::stdout().flush().unwrap();
+            // thread::sleep(Duration::from_millis(25))
+            final_token = Some(word);
+        }
+        if let Some(token) = final_token {
+            let token_start_idx = response.find(token).expect("token should be in sequence");
+            let token_end_idx = token_start_idx + token.len();
+            response = response[token_end_idx + 1..].trim_start().to_string();
+        }
     }
 
     println!("");
