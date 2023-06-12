@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use itertools::Itertools;
 use plane::ml::{
     embeddings::{builder::EmbeddingBuilder, Embedding},
+    gdt::GenerativeDecoderTransformer,
     seq2seq::transformer::CharacterTransformer,
     LayerValues, RngStrategy, SamplingRng,
 };
@@ -27,11 +28,14 @@ fn main() {
 enum RespondModel {
     Embedding(Embedding),
     S2S(CharacterTransformer),
+    GDT(GenerativeDecoderTransformer),
 }
 
 impl RespondModel {
-    fn from_snapshot(use_transformer: bool, json: &str) -> Result<Self> {
-        if use_transformer {
+    fn from_snapshot(use_transformer: bool, use_gdt: bool, json: &str) -> Result<Self> {
+        if use_gdt {
+            Ok(Self::GDT(serde_json::from_str(json)?))
+        } else if use_transformer {
             Ok(Self::S2S(serde_json::from_str(json)?))
         } else {
             let rng = RngStrategy::default();
@@ -47,6 +51,7 @@ impl RespondModel {
         match self {
             RespondModel::Embedding(_) => "Embedding",
             RespondModel::S2S(_) => "CharacterTransformer",
+            RespondModel::GDT(_) => "GenerativeDecoderTransformer",
         }
     }
     fn vocab(&self) -> HashMap<String, usize> {
@@ -56,6 +61,12 @@ impl RespondModel {
                 .vocab()
                 .iter()
                 .map(|(k, v)| (k.to_string(), *v))
+                .collect(),
+            RespondModel::GDT(gdt) => gdt
+                .vocab()
+                .dictionary()
+                .into_iter()
+                .map(|(x, y)| (x.to_string(), y))
                 .collect(),
         }
     }
@@ -71,6 +82,10 @@ impl RespondModel {
                 s2s.predict_from_iter(&to_chars(seed_tokens))
                     .map(|c| c.to_string()),
             ),
+            RespondModel::GDT(gdt) => Box::new(
+                gdt.predict_from_iter(&gdt.vocab().encode(&seed_tokens.join("")).unwrap())
+                    .map(|c| c.appendable()),
+            ),
         }
     }
 
@@ -78,6 +93,9 @@ impl RespondModel {
         match self {
             RespondModel::Embedding(embedding) => embedding.predict_next(last_words),
             RespondModel::S2S(s2s) => Ok(s2s.predict_next(&to_chars(last_words))?.to_string()),
+            RespondModel::GDT(gdt) => Ok(gdt
+                .predict_next(&gdt.vocab().encode(&last_words.join("")).unwrap())?
+                .to_string()),
         }
     }
 
@@ -85,6 +103,7 @@ impl RespondModel {
         match self {
             RespondModel::Embedding(embedding) => embedding.control_vocab().to_string(),
             RespondModel::S2S(s2s) => s2s.control_vocab().to_string(),
+            RespondModel::GDT(gdt) => gdt.control_vocab().to_string(),
         }
     }
 
@@ -92,6 +111,9 @@ impl RespondModel {
         match self {
             RespondModel::Embedding(embedding) => embedding.sample_probabilities(context_tokens),
             RespondModel::S2S(s2s) => s2s.sample_probabilities(&to_chars(context_tokens)),
+            RespondModel::GDT(gdt) => {
+                gdt.sample_probabilities(&gdt.vocab().encode(&context_tokens.join("")).unwrap())
+            }
         }
     }
 }
@@ -106,10 +128,10 @@ fn run(model_fpath: &mut Option<String>) -> bool {
         None => return false,
     };
 
-    let (json, state) = extract_config(json).expect("failed to parse config");
+    let (_json, state) = extract_config(&json).expect("failed to parse config");
     let rng = RngStrategy::default();
 
-    let model = RespondModel::from_snapshot(state.use_transformer, &json)
+    let model = RespondModel::from_snapshot(state.use_transformer, state.use_gdt, &json)
         .expect("failed to rebuild instance from snapshot state");
 
     // let embedding = EmbeddingBuilder::from_snapshot(&json)
@@ -186,12 +208,17 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             vocab.as_ref(),
             char_mode && vocab_supervised_predictions_enabled,
         ) {
-            Box::new(predict_supervised(&model, &context_tokens, vocab, default_min_word_len, &rng).into_iter())
+            Box::new(
+                predict_supervised(&model, &context_tokens, vocab, default_min_word_len, &rng)
+                    .into_iter(),
+            )
         } else {
             model.predict_from_iter(&context_tokens)
         };
 
-        let response: Box<dyn Iterator<Item = (String, &'static str)>> = if char_mode {
+        let response: Box<dyn Iterator<Item = (String, &'static str)>> = if state.use_gdt {
+            Box::new(response.into_iter().map(|x| (x, "")))
+        } else if char_mode {
             if append_space {
                 Box::new(response.into_iter().map(|x| (x, "")))
             } else {
@@ -205,7 +232,7 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             Box::new(response.into_iter().map(|x| (x, " ")))
         };
 
-        print_prompt_response(response);
+        print_prompt_response(response, &state);
     }
 }
 
@@ -430,7 +457,10 @@ fn configure_vocab(
     }
 }
 
-fn print_prompt_response(mut response_iter: impl Iterator<Item = (String, &'static str)>) {
+fn print_prompt_response(
+    mut response_iter: impl Iterator<Item = (String, &'static str)>,
+    state: &ExtractedModelConfig,
+) {
     print!("Model Response:        ");
     io::stdout().flush().unwrap();
 
@@ -460,9 +490,10 @@ fn print_prompt_response(mut response_iter: impl Iterator<Item = (String, &'stat
 struct ExtractedModelConfig {
     input_txt_path: Option<String>,
     use_transformer: bool,
+    use_gdt: bool,
 }
 
-fn extract_config(json: String) -> Result<(String, ExtractedModelConfig)> {
+fn extract_config(json: &str) -> Result<(String, ExtractedModelConfig)> {
     use serde_json::Value;
 
     let mut snapshot: Value = serde_json::from_str(&json)?;
@@ -477,12 +508,14 @@ fn extract_config(json: String) -> Result<(String, ExtractedModelConfig)> {
 
     let input_txt_path = config["input_txt_path"].as_str().map(|x| x.to_string());
     let use_transformer = config["use_transformer"].as_bool().unwrap_or_default();
+    let use_gdt = config["use_gdt"].as_bool().unwrap_or_default();
 
     Ok((
         snapshot,
         ExtractedModelConfig {
             input_txt_path,
             use_transformer,
+            use_gdt,
         },
     ))
 }

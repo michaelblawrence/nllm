@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::ml::NodeValue;
 
-use self::{cell::RngCell, rc::ArcRNG, store::GlobalRngStore};
+use self::{rc::ArcRNG, store::GlobalRngStore};
+
+use super::cell::MutexCell;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum RngStrategy {
@@ -178,44 +180,6 @@ impl RNG for JsRng {
     }
 }
 
-mod cell {
-    #[cfg(not(feature = "threadpool"))]
-    use std::cell::UnsafeCell;
-    #[cfg(feature = "threadpool")]
-    use std::sync::Mutex;
-
-    // TODO: evaluate perf for 'threadpool' feature
-    #[cfg(feature = "threadpool")]
-    pub(crate) struct RngCell<T>(Mutex<T>);
-
-    #[cfg(feature = "threadpool")]
-    impl<'a, T> RngCell<T> {
-        pub fn new(value: T) -> Self {
-            Self(Mutex::new(value))
-        }
-
-        pub fn with_inner<F: Fn(&mut T) -> O, O>(&'a self, func: F) -> O {
-            let mut cell = self.0.lock().unwrap();
-            func(&mut *cell)
-        }
-    }
-
-    #[cfg(not(feature = "threadpool"))]
-    pub(crate) struct RngCell<T>(UnsafeCell<T>);
-
-    #[cfg(not(feature = "threadpool"))]
-    impl<'a, T> RngCell<T> {
-        pub fn new(value: T) -> Self {
-            Self(UnsafeCell::new(value))
-        }
-
-        pub fn with_inner<F: Fn(&mut T) -> O, O>(&'a self, func: F) -> O {
-            let inner = unsafe { &mut *self.0.get() };
-            func(inner)
-        }
-    }
-}
-
 mod rc {
     use std::{sync::Arc, ops::Deref};
 
@@ -310,11 +274,11 @@ mod store {
     }
 }
 
-pub struct SeedableTestRng(RngCell<algo::mersenne_twister::MersenneTwister>);
+pub struct SeedableTestRng(MutexCell<algo::mersenne_twister::MersenneTwister>);
 
 impl SeedableTestRng {
     pub fn new(seed: u32) -> Self {
-        Self(RngCell::new(algo::mersenne_twister::MersenneTwister::new(
+        Self(MutexCell::new(algo::mersenne_twister::MersenneTwister::new(
             seed,
         )))
     }
@@ -330,11 +294,11 @@ impl RNG for SeedableTestRng {
     }
 }
 
-pub struct FastSeedableTestRng(RngCell<algo::park_miller::ParkMiller>);
+pub struct FastSeedableTestRng(MutexCell<algo::park_miller::ParkMiller>);
 
 impl FastSeedableTestRng {
     pub fn new(seed: u64) -> Self {
-        Self(RngCell::new(algo::park_miller::ParkMiller::new(seed)))
+        Self(MutexCell::new(algo::park_miller::ParkMiller::new(seed)))
     }
 }
 

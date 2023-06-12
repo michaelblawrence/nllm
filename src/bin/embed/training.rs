@@ -8,6 +8,7 @@ use std::{
 
 use plane::ml::{
     embeddings::{Embedding, TrainBatchConfig},
+    gdt::{self, GenerativeDecoderTransformer},
     seq2seq::transformer::CharacterTransformer,
     transformer::decoder::builder::DecoderBuilder,
     NodeValue, RngStrategy, RNG,
@@ -160,12 +161,11 @@ impl<M: MLModel> TrainerState<M> {
             self.pause();
             return;
         }
-        
+
         if !self.training_paused() {
             self.round += 1;
         }
-        _ = self.handle_tx
-            .send(TrainerMessage::Yield);
+        _ = self.handle_tx.send(TrainerMessage::Yield);
     }
 
     pub fn pause(&mut self) -> bool {
@@ -447,7 +447,7 @@ where
         None => phrases.clone(),
     };
 
-    let (char_vocab, str_vocab) = if config.use_character_tokens {
+    let (char_vocab, str_vocab, gdt_vocab) = if config.use_character_tokens && !config.use_gdt {
         info!("Tranforming vocab and train/test sets to character-level tokens");
         phrases = characterize_phrases(phrases);
         testing_phrases = characterize_phrases(testing_phrases);
@@ -458,11 +458,29 @@ where
             .chain(['\n'])
             .collect::<Vec<_>>();
 
-        (Some(char_vocab), None)
+        (Some(char_vocab), None, None)
+    } else if config.use_gdt {
+        let vocab_builder = gdt::token::Vocab::new_builder(if config.gdt_word_mode {
+            gdt::token::VocabTokenType::Word
+        } else {
+            gdt::token::VocabTokenType::Char
+        })
+        .with_max_vocab_size(config.gdt_bpe_vocab_size);
+
+        let vocab_builder = phrases
+            .iter()
+            .chain(testing_phrases.iter())
+            .fold(vocab_builder, |builder, x| {
+                builder.from_corpus(&x.join(" "))
+            });
+
+        let gdt_vocab = vocab_builder.with_char_fallback().build().unwrap();
+
+        (None, None, Some(gdt_vocab))
     } else {
         let str_vocab = vocab.into_iter().collect::<Vec<_>>();
 
-        (None, Some(str_vocab))
+        (None, Some(str_vocab), None)
     };
 
     let token_count = |x: &Vec<Vec<String>>| x.iter().map(|phrase| phrase.len()).sum::<usize>();
@@ -479,7 +497,7 @@ where
     );
 
     let model: M = if let (true, Some(vocab)) = (
-        config.use_character_tokens && config.use_transformer,
+        config.use_character_tokens && config.use_transformer && !config.use_gdt,
         &char_vocab,
     ) {
         info!("Using CharacterTransformer (S2S)...");
@@ -520,6 +538,45 @@ where
         let s2s = CharacterTransformer::from_builder_ordered(builder, &vocab, rng).unwrap();
 
         s2s.into()
+    } else if let (true, Some(vocab)) = (config.use_character_tokens && config.use_gdt, gdt_vocab) {
+        info!("Using GenerativeDecoderTransformer (GDT)...");
+        let builder = DecoderBuilder::new(
+            config.input_stride_width,
+            config.embedding_size,
+            vocab.len(),
+        );
+        let builder = builder
+            .with_dropout_rate(0.0)
+            .with_feed_forward_hidden_dimension(config.hidden_layer_nodes);
+
+        let hidden_deep_layer_nodes = config
+            .hidden_deep_layer_nodes
+            .as_ref()
+            .map(|x| x.split(',').collect_vec());
+
+        let builder = if let Some(block_count) = hidden_deep_layer_nodes
+            .as_ref()
+            .and_then(|x| x.get(0))
+            .and_then(|x| x.parse::<usize>().ok())
+        {
+            builder.with_block_count(block_count)
+        } else {
+            builder
+        };
+
+        let builder = if let Some(head_count) = hidden_deep_layer_nodes
+            .as_ref()
+            .and_then(|x| x.get(1))
+            .and_then(|x| x.parse::<usize>().ok())
+        {
+            builder.with_head_count(head_count)
+        } else {
+            builder
+        };
+
+        let gdt = GenerativeDecoderTransformer::from_builder(builder, vocab, rng).unwrap();
+
+        gdt.into()
     } else if let Some(vocab) =
         str_vocab.or(char_vocab.map(|x| x.into_iter().map(|c| c.to_string()).collect()))
     {
@@ -555,17 +612,20 @@ fn report_round<M: MLModel>(
     } else if let Some(s2s) = state.model.as_s2s() {
         let testing_phrases = TrainerState::<M>::join_phrases(&testing_phrases, Some(true));
         Ok(validate::validate_s2s(s2s, &testing_phrases))
+    } else if let Some(gdt) = state.model.as_gdt() {
+        let char_mode = gdt.vocab().token_type().is_char();
+        let testing_phrases = TrainerState::<M>::join_phrases(&testing_phrases, Some(char_mode));
+        validate::validate_gdt(gdt, &testing_phrases)
     } else {
         panic!("unknown model type: unable to run validation")
     };
 
     match validation_results {
-        Ok((validation_errors, predictions_pct)) => {
+        Ok(validation_results) => {
             let report = validate::generate_training_report(
                 state.round,
                 training_error.unwrap_or(0.0),
-                validation_errors,
-                predictions_pct,
+                validation_results,
                 state
                     .last_report
                     .as_ref()
@@ -769,31 +829,38 @@ mod validate {
     use std::time::Duration;
 
     use anyhow::{Context, Result};
-    use tracing::info;
+    use tracing::{error, info};
 
-    use plane::ml::{embeddings::Embedding, seq2seq::transformer::CharacterTransformer, NodeValue};
+    use plane::ml::{
+        embeddings::Embedding, gdt::GenerativeDecoderTransformer,
+        seq2seq::transformer::CharacterTransformer, NodeValue,
+    };
 
     use crate::messages::TrainerReport;
+
+    pub struct TestSetValidation {
+        validation_errors: Vec<(f64, f64)>,
+        predictions_pct: f64,
+    }
 
     pub fn generate_training_report(
         round: usize,
         training_error: f64,
-        validation_errors: Vec<(f64, f64)>,
-        predictions_pct: f64,
+        validation_results: TestSetValidation,
         last_report_time: Option<(Duration, usize)>,
         label: Option<&str>,
     ) -> TrainerReport {
         let label = label.map(|x| x.to_string());
-        let val_count = validation_errors.len() as NodeValue;
-        let (validation_error, nll) =
-            validation_errors
-                .iter()
-                .fold((0.0, 0.0), |sum, (validation_error, nll)| {
-                    (
-                        sum.0 + (validation_error / val_count),
-                        sum.1 + (nll / val_count),
-                    )
-                });
+        let val_count = validation_results.validation_errors.len() as NodeValue;
+        let (validation_error, nll) = validation_results.validation_errors.iter().fold(
+            (0.0, 0.0),
+            |sum, (validation_error, nll)| {
+                (
+                    sum.0 + (validation_error / val_count),
+                    sum.1 + (nll / val_count),
+                )
+            },
+        );
 
         let ms_per_round = last_report_time.map(|(duration, last_round)| {
             duration.as_millis() / (round - last_round).max(1) as u128
@@ -802,6 +869,7 @@ mod validate {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
+        let predictions_pct = validation_results.predictions_pct;
 
         TrainerReport {
             round,
@@ -836,7 +904,7 @@ mod validate {
     pub fn validate_embeddings(
         embedding: &Embedding,
         testing_phrases: &Vec<Vec<String>>,
-    ) -> Result<(Vec<(f64, f64)>, f64)> {
+    ) -> Result<TestSetValidation> {
         let mut validation_errors = vec![];
         let mut correct_first_word_predictions = 0;
         let mut total_first_word_predictions = 0;
@@ -871,13 +939,16 @@ mod validate {
         let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
             / total_first_word_predictions.max(1) as NodeValue;
 
-        Ok((validation_errors, predictions_pct))
+        Ok(TestSetValidation {
+            validation_errors,
+            predictions_pct,
+        })
     }
 
     pub fn validate_s2s(
         transformer: &CharacterTransformer,
         testing_phrases: &str,
-    ) -> (Vec<(f64, f64)>, f64) {
+    ) -> TestSetValidation {
         use itertools::Itertools;
 
         let mut validation_errors = vec![];
@@ -909,7 +980,52 @@ mod validate {
 
         let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
             / total_first_word_predictions as NodeValue;
-        (validation_errors, predictions_pct)
+
+        TestSetValidation {
+            validation_errors,
+            predictions_pct,
+        }
+    }
+
+    pub fn validate_gdt(
+        transformer: &GenerativeDecoderTransformer,
+        testing_phrases: &str,
+    ) -> Result<TestSetValidation> {
+        let mut validation_errors = vec![];
+        let mut correct_first_word_predictions = 0;
+        let mut total_first_word_predictions = 0;
+        let testing_tokens = transformer.vocab().encode(testing_phrases)?;
+
+        let input_stride_width = transformer.input_stride_width();
+        for testing_phrase_window in testing_tokens.chunks(input_stride_width + 1).into_iter() {
+            let (last_token, context_tokens) = testing_phrase_window.split_last().unwrap();
+
+            let predicted = match transformer.predict_arg_max(&context_tokens) {
+                Ok((predicted, _prob)) => predicted,
+                Err(e) => {
+                    error!("failed prediction: {e}");
+                    continue;
+                }
+            };
+            let actual = last_token;
+
+            if &predicted == actual {
+                correct_first_word_predictions += 1;
+            }
+
+            let error = transformer.compute_error(&[context_tokens, &[actual.clone()]].concat())?;
+            let nll = transformer.nll(&context_tokens, actual.clone())?;
+            validation_errors.push((error, nll));
+            total_first_word_predictions += 1;
+        }
+
+        let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
+            / total_first_word_predictions as NodeValue;
+
+        Ok(TestSetValidation {
+            validation_errors,
+            predictions_pct,
+        })
     }
 
     pub fn should_report_round(round: usize, training_rounds: usize) -> bool {

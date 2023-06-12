@@ -83,8 +83,65 @@ testrun-tinyshakespeare:
     --hidden-layer-nodes 650  --embedding-size 16 --input-stride-width 64 --repl "PR" \
     -o out -O {{model_output_label}} -i ./res/tinyshakespeare.txt
 
+run-microgpt:
+  embed --quit-on-complete \
+    --single-batch-iterations --char --train-rate 0.004 --batch-size 24 \
+    --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
+    --hidden-layer-nodes 512 -H 6,4  --embedding-size 128 --input-stride-width 256 --repl "PR" \
+    --training-rounds 50000 -i ./res/tinyimdbtrainneg.txt \
+    --output-label-append-details -o out/labelled/train -O microgpt \
+    --use-transformer
+
+run-microgpt-MK2:
+  embed --quit-on-complete \
+    --single-batch-iterations --char --train-rate 0.004 --batch-size 8 \
+    --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
+    --hidden-layer-nodes 512 -H 2,4  --embedding-size 128 --input-stride-width 256 --repl "P" \
+    --training-rounds 1000 -i ./res/tinyimdbtrainneg.txt \
+    --output-label-append-details -o out/labelled/train -O microgpt \
+    --use-transformer
+
+run-microgpt-MK3:
+  embed --quit-on-complete \
+    --single-batch-iterations --char --train-rate 0.004 --batch-size 64 \
+    --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
+    --hidden-layer-nodes 512 -H 3,4  --embedding-size 128 --input-stride-width 256 --repl "P" \
+    --training-rounds 1000 -i ./res/tinyimdbtrainneg.txt \
+    --output-label-append-details -o out/labelled/train -O microgpt \
+    --use-transformer
+
+run-microgpt-MK4:
+  embed --quit-on-complete \
+    --single-batch-iterations --char --train-rate 0.004 --batch-size 96 \
+    --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
+    --hidden-layer-nodes 512 -H 3,4  --embedding-size 128 --input-stride-width 256 --repl "P" \
+    --training-rounds 10 -i ./res/tinyimdbtrainneg.txt \
+    --output-label-append-details -o out/labelled/train -O microgpt \
+    --use-transformer
+
+run-microgpt-MK5:
+  embed --quit-on-complete \
+    --single-batch-iterations --char --train-rate 0.004 --batch-size 384 \
+    --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
+    --hidden-layer-nodes 512 -H 3,4  --embedding-size 128 --input-stride-width 256 --repl "P" \
+    --training-rounds 10 -i ./res/tinyimdbtrainneg.txt \
+    --output-label-append-details -o out/labelled/train -O microgpt \
+    --use-transformer
+
+run-microgpt-MK6:
+  embed json --trainer-config '{"activation_mode":"Tanh","batch_size":64,"embedding_size":128,"hidden_deep_layer_nodes":"3,4","hidden_layer_nodes":512,"input_stride_width":256,"input_txt_path":"./res/tinyimdbtrainneg.txt","output_dir":"out/labelled/train","output_label":"microgpt-e128-L512x3x4","output_label_append_details":false,"pause_on_start":false,"phrase_split_seed":null,"phrase_test_set_max_tokens":500,"phrase_test_set_split_pct":20.0,"phrase_train_set_size":null,"phrase_word_length_bounds":[null,null],"quit_on_complete":false,"repl":"crP","sample_from_newline":false,"single_batch_iterations":true,"snapshot_interval_secs":120,"train_rate":0.004,"training_rounds":1000,"use_character_tokens":true,"use_transformer":true}'
+
 run-microgpt-MK7 phrase_test_set_max_tokens="500":
   embed json --trainer-config '{"activation_mode":"Tanh","batch_size":8,"embedding_size":128,"hidden_deep_layer_nodes":"1,4","hidden_layer_nodes":512,"input_stride_width":128,"input_txt_path":"./res/tinyimdbtrainneg.txt","output_dir":"out/labelled/train","output_label":"microgpt","output_label_append_details":true,"pause_on_start":false,"phrase_split_seed":null,"phrase_test_set_max_tokens":{{phrase_test_set_max_tokens}},"phrase_test_set_split_pct":20.0,"phrase_train_set_size":null,"phrase_word_length_bounds":[null,null],"quit_on_complete":false,"repl":"crP","sample_from_newline":false,"single_batch_iterations":true,"snapshot_interval_secs":120,"train_rate":0.004,"training_rounds":1000,"use_character_tokens":true,"use_transformer":true}'
+
+run-microgpt-MK8:
+  cargo run --features="multi_threaded" --release --bin embed -- \
+    --single-batch-iterations --char --train-rate 0.004 --batch-size 1 \
+    --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
+    --hidden-layer-nodes 512 -H 2,4  --embedding-size 128 --input-stride-width 256 --repl "P" \
+    --training-rounds 100 -i ./res/tinyimdbtrainneg.txt \
+    --output-label-append-details -o out/labelled/train -O microgdt-dev-init \
+    --use-transformer --use-gdt --gdt-word-mode --gdt-bpe-vocab-size 2500
 
 upload-tinyshakespeare mongodb_conn_str=("mongodb://" + mongodb_user + ":" + mongodb_pass + "@" + mongodb_host + ":27017"):
   MONGODB_HOST={{mongodb_conn_str}} \

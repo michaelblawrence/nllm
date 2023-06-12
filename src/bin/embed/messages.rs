@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, error};
 
 use std::{
     ops::ControlFlow,
@@ -9,7 +9,7 @@ use std::{
 };
 
 use plane::ml::{
-    embeddings::builder::EmbeddingBuilder, seq2seq::transformer::CharacterTransformer, NodeValue,
+    embeddings::builder::EmbeddingBuilder, seq2seq::transformer::CharacterTransformer, NodeValue, gdt::GenerativeDecoderTransformer,
 };
 
 use crate::{model::MLModel, training};
@@ -119,7 +119,10 @@ impl TrainerMessage {
             TrainerMessage::PredictRandomPhrase => {
                 let sep = if config.use_character_tokens { "" } else { " " };
                 let generated_phrase = model.generate_sequence_string(sep);
-                info!("Generated a new phrase:  {}", generated_phrase);
+                match generated_phrase {
+                    Ok(output) => info!("Generated a new phrase:  {}", output),
+                    Err(e) => error!("Error generating a new phrase:  {}", e),
+                }
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::PlotHeatMapGraphs => {
@@ -285,6 +288,9 @@ impl TrainerHandleActions {
                 } else if let Some(_) = state.model.as_s2s() {
                     let new_s2s = serde_json::from_str::<CharacterTransformer>(&snapshot).unwrap();
                     M::from_s2s(new_s2s, new_state.learn_rate)
+                } else if let Some(_) = state.model.as_gdt() {
+                    let new_gdt = serde_json::from_str::<GenerativeDecoderTransformer>(&snapshot).unwrap();
+                    M::from_gdt(new_gdt, new_state.learn_rate)
                 } else {
                     panic!("can not restore unknown model");
                 };

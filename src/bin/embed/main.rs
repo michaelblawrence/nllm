@@ -1,4 +1,4 @@
-use std::{io::Write, ops::ControlFlow, thread};
+use std::{io::Write, ops::ControlFlow, rc::Rc, thread};
 
 use anyhow::Result;
 use tracing::metadata::LevelFilter;
@@ -15,14 +15,29 @@ mod training;
 
 #[cfg(not(feature = "thread"))]
 fn main() -> Result<()> {
+    use std::cell::RefCell;
+
     use tracing::warn;
 
     configure_logging();
     let (config, resumed_state) = parse_cli_args()?;
 
+    let on_yield: Rc<RefCell<Option<Rc<dyn Fn() -> ()>>>> = Rc::new(RefCell::new(None));
+
     let config_clone = config.clone();
+    let on_yield_clone = on_yield.clone();
     let (tx, handle) =
         messages::TrainerHandle::new(move |embedding: &EmbedModel, msg: TrainerMessage| {
+            match &msg {
+                TrainerMessage::Yield => {
+                    dbg!("yield start");
+                    if let Some(on_yield) = on_yield_clone.borrow().as_ref() {
+                        (**on_yield)()
+                    }
+                    dbg!("yield stop");
+                }
+                _ => {}
+            }
             let handle_action = msg.apply(embedding, &config_clone);
             handle_action
         });
@@ -36,6 +51,14 @@ fn main() -> Result<()> {
             parse_repl_char(c, &tx, &config).expect("config repl character caused startup to halt");
         }
     }
+
+    let config_clone = config.clone();
+    let tx1 = tx.clone();
+    on_yield.replace(Some(Rc::new(move || {
+        let tx = tx1.clone();
+        let config_clone = config_clone.clone();
+        // block_on_key_press(move |c| parse_repl_char(c, &tx, &config_clone), &tx1)
+    })));
 
     training::setup_and_train_model_v2(config, handle);
     Ok(())
@@ -177,11 +200,11 @@ fn block_on_key_press<F: Fn(char) -> Result<ControlFlow<()>>>(
 }
 
 #[cfg(not(feature = "cli"))]
-fn block_on_key_press<F: Fn(char) -> Result<()>>(
+fn block_on_key_press<F: Fn(char) -> Result<ControlFlow<()>>>(
     key_press_callback: F,
     tx: &TrainerHandleSender<TrainerMessage>,
 ) {
-    use std::io::{BufRead, Read};
+    use std::io::BufRead;
 
     let stdin = std::io::stdin();
     loop {
@@ -204,7 +227,7 @@ fn block_on_key_press<F: Fn(char) -> Result<()>>(
         drop(stdin);
 
         for c in buffer.trim().chars() {
-            if let Err(_) = key_press_callback(c) {
+            if let Err(_) | Ok(ControlFlow::Break(())) = key_press_callback(c) {
                 return;
             }
         }

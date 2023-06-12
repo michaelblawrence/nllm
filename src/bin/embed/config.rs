@@ -39,6 +39,21 @@ pub struct TrainEmbeddingConfig {
     #[serde(default)]
     pub use_transformer: bool,
 
+    #[arg(long, default_value_t = false)]
+    #[serde(default)]
+    pub use_gdt: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[serde(default)]
+    pub gdt_word_mode: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[serde(default)]
+    pub gdt_bpe_enable: bool,
+
+    #[arg(long, default_value_t = 1000)]
+    pub gdt_bpe_vocab_size: usize,
+
     #[arg(short = 'r', long, default_value_t = 1e-3)]
     pub train_rate: NodeValue,
 
@@ -86,7 +101,7 @@ pub struct TrainEmbeddingConfig {
     #[serde(default)]
     pub phrase_test_set_max_tokens: Option<usize>,
 
-    #[arg(short = 'w', long, default_value = None)]
+    #[arg(long, default_value = None)]
     #[serde(default)]
     pub phrase_split_seed: Option<isize>,
 
