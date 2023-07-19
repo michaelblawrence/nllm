@@ -1399,6 +1399,22 @@ version = "0.1.0"
 [[package]]
 name = "nllm_web"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "js-sys",
+ "plotly",
+ "serde",
+ "serde_json",
+ "time",
+ "tracing",
+ "tracing-web",
+ "wasm-bindgen",
+ "web-sys",
+ "yew",
+ "yew-agent",
+ "yew-hooks",
+]
 
 [[package]]
 name = "nom"
