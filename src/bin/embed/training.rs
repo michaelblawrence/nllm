@@ -460,7 +460,9 @@ where
 
         (Some(char_vocab), None, None)
     } else if config.use_gdt {
-        let vocab_builder = gdt::token::Vocab::new_builder(if config.gdt_word_mode {
+        let vocab_builder = gdt::token::Vocab::new_builder(if config.gdt_bpe_enable {
+            gdt::token::VocabTokenType::BPE
+        } else if config.gdt_word_mode {
             gdt::token::VocabTokenType::Word
         } else {
             gdt::token::VocabTokenType::Char

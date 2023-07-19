@@ -32,6 +32,7 @@ pub mod token {
         pub struct Token {
             inner: GDTToken,
             id: Option<usize>,
+            user_control_token: bool,
         }
 
         impl std::hash::Hash for Token {
@@ -67,6 +68,7 @@ pub mod token {
                 Self {
                     inner: value,
                     id: None,
+                    user_control_token: false,
                 }
             }
         }
@@ -98,8 +100,21 @@ pub mod token {
                     ..self
                 }
             }
+            pub fn as_control_token(self) -> Self {
+                Self {
+                    user_control_token: true,
+                    ..self
+                }
+            }
             pub fn id(&self) -> Option<usize> {
                 self.id
+            }
+            pub fn len(&self) -> usize {
+                match &self.inner {
+                    GDTToken::Word(x) => x.chars().count(),
+                    GDTToken::Subword(x) => x.chars().count(),
+                    GDTToken::Char(x) => 1,
+                }
             }
             pub fn appendable(&self) -> String {
                 match &self.inner {
@@ -111,6 +126,9 @@ pub mod token {
 
             pub fn is_whitespace_or_control(&self) -> bool {
                 if let Some(0) = self.id {
+                    return true;
+                }
+                if self.user_control_token {
                     return true;
                 }
                 match &self.inner {
@@ -132,11 +150,21 @@ pub mod token {
             Char(char),
         }
 
+        impl Display for GDTToken {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    GDTToken::Word(x) => write!(f, "{}", x),
+                    GDTToken::Subword(x) => write!(f, "{}", x),
+                    GDTToken::Char(x) => write!(f, "{}", x),
+                }
+            }
+        }
+
         #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
         pub enum VocabTokenType {
             Word,
             Char,
-            // BPE,
+            BPE,
         }
 
         impl VocabTokenType {
@@ -171,8 +199,8 @@ pub mod token {
 
             #[serde(skip)]
             encoder: Option<Arc<HashMap<Token, usize>>>,
-            // #[serde(skip)]
-            // char_encoder: MutexCell<HashMap<usize, HashMap<Token, usize>>>,
+            #[serde(skip)]
+            bpe_encoder: Option<Arc<[(usize, HashMap<Token, usize>)]>>,
         }
 
         impl From<Vocabulary> for Vocab {
@@ -182,10 +210,12 @@ pub mod token {
                     value.fallback.as_deref(),
                     value.index_offset,
                 );
+                let bpe_encoder = Self::build_bpe_encoder_dictionary(&encoder);
 
                 Self {
                     value,
                     encoder: Some(Arc::new(encoder)),
+                    bpe_encoder: Some(bpe_encoder.into()),
                 }
             }
         }
@@ -243,6 +273,14 @@ pub mod token {
             }
 
             pub fn encode(&self, input: &str) -> Result<Vec<Token>> {
+                self.encode_truncated(input, None)
+            }
+
+            pub fn encode_truncated(
+                &self,
+                input: &str,
+                max_tokens: Option<usize>,
+            ) -> Result<Vec<Token>> {
                 let encoder = self.encoder();
                 let start_token: Option<&Token> = self
                     .seq_start_token
@@ -263,7 +301,71 @@ pub mod token {
                                     None => Err(token),
                                 })
                         })
+                        .take(max_tokens.unwrap_or(usize::MAX))
                         .collect(),
+
+                    VocabTokenType::BPE => {
+                        let by_char_count = self.bpe_encoder(&encoder);
+                        let mut encode_str = input.to_string();
+                        let mut encoded_tokens = vec![];
+
+                        while encode_str.len() > 0
+                            && max_tokens
+                                .clone()
+                                .map_or(true, |max| encoded_tokens.len() < max)
+                        {
+                            match try_consume_token(&mut encode_str, &by_char_count) {
+                                Some(token) => {
+                                    encoded_tokens.push(Some(token));
+                                }
+                                None => {
+                                    let discarded = encode_str.remove(0);
+                                    match self.fallback.as_ref().and_then(|fallback| {
+                                        fallback.encode(&discarded.to_string()).ok()
+                                    }) {
+                                        Some(tokens) => tokens.into_iter().for_each(|token| {
+                                            encoded_tokens.push(Some(token.inner().clone()))
+                                        }),
+                                        None => {
+                                            println!("unknown token: {:?}", discarded);
+                                            encoded_tokens.push(None);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        fn try_consume_token(
+                            encode_input: &mut String,
+                            by_char_count: &[(usize, HashMap<Token, usize>)],
+                        ) -> Option<GDTToken> {
+                            for (token_len, tokens) in by_char_count.iter().rev() {
+                                let truncated: String =
+                                    encode_input.chars().take(*token_len).collect();
+                                if truncated.chars().count() != *token_len {
+                                    continue;
+                                }
+                                let gdt_token = GDTToken::Subword(truncated);
+                                if let Some((token, _)) = tokens.get_key_value(&gdt_token.into()) {
+                                    *encode_input = encode_input.chars().skip(*token_len).collect();
+                                    return Some(token.inner().clone());
+                                }
+                            }
+                            None
+                        }
+
+                        encoded_tokens
+                            .into_iter()
+                            .map(|x| {
+                                x.as_ref()
+                                    .and_then(|token| encoder.get_key_value(&token.clone().into()))
+                                    .ok_or_else(|| {
+                                        x.map_or_else(|| "<unknown>".to_string(), |x| x.to_string())
+                                    })
+                                    .map(|(x, _)| vec![x.clone()])
+                            })
+                            .collect()
+                    }
 
                     VocabTokenType::Char => input
                         .chars()
@@ -333,28 +435,46 @@ pub mod token {
                     VocabTokenType::Word => {
                         let corpus_len = corpus.chars().count();
                         for _ in 0..sequence_count {
-                            let start_idx = {
-                                let mut rand_index = None;
-                                while rand_index.map_or(true, |x| !corpus.is_char_boundary(x)) {
-                                    rand_index = Some(rng.rand_range(0, corpus_len));
-                                }
-                                let rand_index = rand_index.unwrap();
-                                let byte_offset: usize = corpus[0..rand_index]
-                                    .chars()
-                                    .rev()
-                                    .take_while(|x| !x.is_whitespace())
-                                    .map(|x| x.len_utf8())
-                                    .sum();
-                                rand_index - byte_offset
-                            };
-
+                            let start_idx = sample_next_word_boundary_idx(corpus, corpus_len, rng);
                             let indexed_corpus = &corpus[start_idx..];
                             let chars: String = indexed_corpus
                                 .lines()
                                 .map(|x| x.split_whitespace().take(token_len + 1).join(" "))
                                 .join("\n");
 
-                            let sequence = self.encode(&chars)?;
+                            let sequence = self.encode_truncated(&chars, Some(token_len + 1))?;
+                            let sequence = if sequence.len() > token_len + 1 {
+                                let max_start_idx = sequence.len().saturating_sub(token_len + 1);
+                                let start_idx = rng.rand_range(0, max_start_idx);
+                                let end_idx = start_idx + token_len + 1;
+
+                                sequence[start_idx..end_idx].to_vec()
+                            } else if sequence.len() < token_len + 1 {
+                                let control_token = self.control_token();
+                                let pad_count = (token_len + 1).saturating_sub(sequence.len());
+                                let mut padded_sequence = sequence;
+                                for _ in 0..pad_count {
+                                    padded_sequence.push(control_token.clone());
+                                }
+
+                                padded_sequence
+                            } else {
+                                sequence
+                            };
+                            batch_samples.push(sequence);
+                        }
+                    }
+                    VocabTokenType::BPE => {
+                        let corpus_len = corpus.chars().count();
+                        for _ in 0..sequence_count {
+                            let start_idx = sample_next_word_boundary_idx(corpus, corpus_len, rng);
+                            let indexed_corpus = &corpus[start_idx..];
+                            let chars: String = indexed_corpus
+                                .lines()
+                                .map(|x| x.split_whitespace().take(token_len + 1).join(" "))
+                                .join("\n");
+
+                            let sequence = self.encode_truncated(&chars, Some(token_len + 1))?; // needed?
                             let sequence = if sequence.len() > token_len + 1 {
                                 let max_start_idx = sequence.len().saturating_sub(token_len + 1);
                                 let start_idx = rng.rand_range(0, max_start_idx);
@@ -432,6 +552,15 @@ pub mod token {
                 })
             }
 
+            fn bpe_encoder(
+                &self,
+                encoder: &HashMap<Token, usize>,
+            ) -> Arc<[(usize, HashMap<Token, usize>)]> {
+                self.bpe_encoder
+                    .clone()
+                    .unwrap_or_else(|| Self::build_bpe_encoder_dictionary(encoder).into())
+            }
+
             fn build_encoder_dictionary(
                 vocab: &[Token],
                 fallback: Option<&Vocab>,
@@ -445,15 +574,62 @@ pub mod token {
                     .collect();
                 dict
             }
+
+            fn build_bpe_encoder_dictionary(
+                encoder: &HashMap<Token, usize>,
+            ) -> Vec<(usize, HashMap<Token, usize>)> {
+                let mut counts: Vec<(usize, HashMap<Token, usize>)> = encoder
+                    .iter()
+                    .group_by(|(x, _)| x.len())
+                    .into_iter()
+                    .map(|(k, v)| (k, v.map(|(c, x)| (c.clone(), *x)).collect()))
+                    .collect_vec();
+                counts.sort_by_key(|x| x.0);
+                counts
+            }
+        }
+
+        fn sample_next_word_boundary_idx(
+            corpus: &str,
+            corpus_len: usize,
+            rng: &RngStrategy,
+        ) -> usize {
+            let mut rand_index = None;
+            while rand_index.map_or(true, |x| !corpus.is_char_boundary(x)) {
+                rand_index = Some(rng.rand_range(0, corpus_len));
+            }
+            let rand_index = rand_index.unwrap();
+            let byte_offset: usize = corpus[0..rand_index]
+                .chars()
+                .rev()
+                .take_while(|x| !x.is_whitespace())
+                .map(|x| x.len_utf8())
+                .sum();
+            rand_index - byte_offset
         }
 
         mod builder {
-            use anyhow::Result;
+            use anyhow::{anyhow, Result};
             use itertools::Itertools;
 
-            use crate::ml::gdt::token::hash;
+            use crate::ml::{bpe::BytePairEncoder, gdt::token::hash};
 
             use super::{GDTToken, Token, Vocab, VocabTokenType};
+
+            #[derive(Debug, Clone)]
+            pub struct VocabBpeConfig {
+                num_merges: usize,
+                iters: usize,
+            }
+
+            impl Default for VocabBpeConfig {
+                fn default() -> Self {
+                    Self {
+                        num_merges: 1000,
+                        iters: 5,
+                    }
+                }
+            }
 
             #[derive(Debug, Clone)]
             pub struct VocabBuilder {
@@ -461,6 +637,7 @@ pub mod token {
                 control_token: GDTToken,
                 tokens: hash::DeterministicHashMap<GDTToken, usize>,
                 max_vocab_size: Option<usize>,
+                bpe_config: Option<VocabBpeConfig>,
                 fallback: Option<Box<Vocab>>,
             }
 
@@ -470,9 +647,11 @@ pub mod token {
                         token_type: which,
                         control_token: match which {
                             VocabTokenType::Word => GDTToken::Word("<CTRL>".to_string()),
+                            VocabTokenType::BPE => GDTToken::Subword("<CTRL>".to_string()),
                             VocabTokenType::Char => GDTToken::Char('\x00'),
                         },
                         tokens: Default::default(),
+                        bpe_config: Default::default(),
                         max_vocab_size: None,
                         fallback: None,
                     }
@@ -488,6 +667,28 @@ pub mod token {
                                     .and_modify(|x| *x += 1)
                                     .or_insert(0);
                             }),
+                        VocabTokenType::BPE => {
+                            let VocabBpeConfig { num_merges, iters } =
+                                self.bpe_config.clone().unwrap_or_default();
+
+                            let vocab = BytePairEncoder::build(
+                                corpus,
+                                num_merges,
+                                iters,
+                                self.max_vocab_size.unwrap_or(1000),
+                                false,
+                            );
+
+                            vocab
+                                .into_iter()
+                                .map(|x| GDTToken::Subword(x))
+                                .for_each(|token| {
+                                    self.tokens
+                                        .entry(token)
+                                        .and_modify(|x| *x += 1)
+                                        .or_insert(0);
+                                });
+                        }
                         VocabTokenType::Char => {
                             corpus.chars().map(|x| GDTToken::Char(x)).for_each(|token| {
                                 self.tokens
@@ -510,7 +711,7 @@ pub mod token {
                 }
                 pub fn with_char_fallback(mut self) -> Self {
                     match self.token_type {
-                        VocabTokenType::Word => {
+                        VocabTokenType::Word | VocabTokenType::BPE => {
                             let space_token = GDTToken::Char(' ');
                             let newline_token = GDTToken::Char('\n');
 
@@ -577,13 +778,15 @@ pub mod token {
                                 let value: Token = token.into();
                                 vocab.push(value.with_id(i + offset))
                             }
-                            (&GDTToken::Subword(_), _) => todo!(),
-                            // (&GDTToken::Subword(_), VocabTokenType::Char) => todo!(),
+                            (&GDTToken::Subword(_), VocabTokenType::BPE) => {
+                                let value: Token = token.into();
+                                vocab.push(value.with_id(i + offset))
+                            }
                             (&GDTToken::Char(_), VocabTokenType::Char) => {
                                 let value: Token = token.into();
                                 vocab.push(value.with_id(i + offset))
                             }
-                            _ => (),
+                            _ => Err(anyhow!("Invalid token/token type pair"))?,
                         }
                     }
                     let fallback = match self.fallback {
@@ -958,6 +1161,60 @@ mod tests {
     use crate::ml::{gdt::token::Token, layer::LayerInitStrategy, transformer::solver};
 
     use super::{token::Vocab, *};
+
+    #[ignore = "fix test"]
+    #[test]
+    fn transformer_work_build_bpe_vocab() {
+        let corpus_part1 = "this is an example corpus that includes a number of words that comprise only of lowercase alphabetic";
+        let corpus_part2 = " characters";
+        let corpus = format!("{}{}", corpus_part1, corpus_part2);
+        let vocab = Vocab::new_builder(token::VocabTokenType::BPE)
+            .from_corpus(&corpus)
+            // .with_char_fallback()
+            // .with_max_vocab_size(100)
+            .build()
+            .unwrap();
+
+        let all_tokens = vocab.encode(&corpus).unwrap();
+        let ctrl_vocab = vocab.control_token();
+        let part1_tokens = vocab.encode(&corpus_part1).unwrap();
+        let part1_tokens_iter = part1_tokens.iter().chain(std::iter::repeat(&ctrl_vocab));
+
+        let next_token_start = all_tokens
+            .iter()
+            .zip(part1_tokens_iter)
+            .position(|(all, ctx)| all != ctx);
+
+        let (ctx_tokens, next_tokens) = all_tokens.split_at(next_token_start.unwrap());
+
+        let optimizer = solver::SGDOptimizer::new_cache(0.1);
+        let sequence_len = all_tokens.len() - 1;
+        // let sequence_len = 8;
+        let builder = DecoderBuilder::new(sequence_len, 12, vocab.len())
+            // .with_head_count(2)
+            .with_block_count(1)
+            // .with_feed_forward_hidden_dimension(8)
+            .with_dropout_rate(0.0);
+
+        let transformer = training::setup_and_train_transformer(training::TestGptConfig {
+            builder,
+            training_rounds: 100,
+            batch_size: 1,
+            optimizer,
+            vocab,
+            training_corpus: corpus.clone(),
+            testing_corpus: corpus,
+        });
+
+        let (pred_next, prob) = transformer.predict_arg_max(ctx_tokens).unwrap();
+
+        let actual_next = next_tokens.first().unwrap();
+
+        dbg!((actual_next, &pred_next));
+        let prob = dbg!(prob);
+        assert!(prob > 0.95);
+        assert_eq!(actual_next, &pred_next);
+    }
 
     #[test]
     fn transformer_work_single_simple_pattern() {
