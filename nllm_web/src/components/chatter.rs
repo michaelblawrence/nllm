@@ -2,7 +2,7 @@ use tracing::debug;
 use web_sys::HtmlTextAreaElement;
 use yew::prelude::*;
 
-use crate::ml::embeddings::builder::EmbeddingBuilder;
+use plane::ml::embeddings::builder::EmbeddingBuilder;
 
 #[cfg(feature = "include_res")]
 const MODEL_JSON: &str = include_str!(

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use crate::ml::{embeddings::Embedding, JsRng, NodeValue, ShuffleRng, RNG};
+use plane::ml::{embeddings::Embedding, JsRng, NodeValue, ShuffleRng, RNG};
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrainEmbeddingConfig {

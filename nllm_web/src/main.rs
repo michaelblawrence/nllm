@@ -5,9 +5,11 @@ use tracing_subscriber::prelude::*;
 use yew::prelude::*;
 use yew_hooks::use_local_storage;
 
+mod components;
+
 #[function_component]
 fn App() -> Html {
-    use plane::components::{trainer::TrainEmbeddingConfig, EmbeddingChat, EmbeddingTrainer, JsonEditor};
+    use components::{trainer::TrainEmbeddingConfig, EmbeddingChat, EmbeddingTrainer, JsonEditor};
 
     let storage = use_local_storage::<TrainEmbeddingConfig>("embeddings_config".to_string());
     let json_is_valid = use_state(|| true);

@@ -1403,11 +1403,13 @@ dependencies = [
  "anyhow",
  "itertools",
  "js-sys",
+ "plane",
  "plotly",
  "serde",
  "serde_json",
  "time",
  "tracing",
+ "tracing-subscriber",
  "tracing-web",
  "wasm-bindgen",
  "web-sys",
@@ -1578,12 +1580,7 @@ dependencies = [
  "time",
  "tracing",
  "tracing-subscriber",
- "tracing-web",
  "wasm-bindgen",
- "web-sys",
- "yew",
- "yew-agent",
- "yew-hooks",
 ]
 
 [[package]]

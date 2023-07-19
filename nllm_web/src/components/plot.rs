@@ -1,6 +1,6 @@
 use yew::prelude::*;
 
-use crate::ml;
+use plane::ml;
 
 #[derive(Properties, PartialEq, Clone)]
 pub struct PlotComponentProps {

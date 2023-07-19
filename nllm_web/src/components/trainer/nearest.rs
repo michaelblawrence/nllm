@@ -3,7 +3,7 @@ use std::{collections::HashSet, rc::Rc};
 use tracing::info;
 use yew::prelude::*;
 
-use crate::ml::{JsRng, RNG};
+use plane::ml::{JsRng, RNG};
 use super::handle;
 
 #[derive(Properties, Clone, PartialEq)]

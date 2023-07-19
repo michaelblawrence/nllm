@@ -2,7 +2,7 @@ use std::{self, ops::Deref, rc::Rc};
 
 use wasm_bindgen::__rt::WasmRefCell;
 
-use crate::ml::embeddings::Embedding;
+use plane::ml::embeddings::Embedding;
 
 pub type EmbeddingHandle = RefCellHandle<Embedding>;
 

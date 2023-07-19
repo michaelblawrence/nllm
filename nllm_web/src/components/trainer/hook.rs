@@ -3,7 +3,7 @@ use std::{collections::HashSet, rc::Rc};
 use yew::prelude::*;
 use yew_hooks::use_timeout;
 
-use crate::ml::embeddings::Embedding;
+use plane::ml::embeddings::Embedding;
 
 use super::{
     handle::{self, EmbeddingHandle},
