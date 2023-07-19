@@ -1391,6 +1391,18 @@ dependencies = [
 [[package]]
 name = "nllm_embed"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "itertools",
+ "plane",
+ "plotly",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "nllm_respond"
