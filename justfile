@@ -143,6 +143,42 @@ run-microgpt-MK8:
     --output-label-append-details -o out/labelled/train -O microgdt-dev-init \
     --use-transformer --use-gdt --gdt-word-mode --gdt-bpe-vocab-size 2500
 
+run-microgpt-MK9:
+  embed \
+    --single-batch-iterations --char --train-rate 0.004 --batch-size 24 \
+    --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
+    --hidden-layer-nodes 512 -H 2,4  --embedding-size 128 --input-stride-width 256 --repl "P" \
+    --training-rounds 100 -i ./res/tinyimdbtrainneg.txt \
+    --output-label-append-details -o out/labelled/train -O microgdt-dev-init \
+    --use-transformer --use-gdt --gdt-word-mode --gdt-bpe-vocab-size 2500
+
+run-microgpt-MK10:
+  embed \
+    --single-batch-iterations --char --train-rate 0.004 --batch-size 72 \
+    --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
+    --hidden-layer-nodes 512 -H 6,4  --embedding-size 128 --input-stride-width 512 --repl "P" \
+    --training-rounds 100 -i ./res/tinyimdbtrainneg.txt \
+    --output-label-append-details -o out/labelled/train -O microgdt-dev-init \
+    --use-transformer --use-gdt --gdt-word-mode --gdt-bpe-vocab-size 2500
+
+run-microgpt-MK11:
+  cargo run --features="multi_threaded" --release --bin embed -- \
+    --single-batch-iterations --char --train-rate 0.004 --batch-size 4 \
+    --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
+    --hidden-layer-nodes 768 -H 1,6  --embedding-size 192 --input-stride-width 256 --repl "P" \
+    --training-rounds 100 -i ./res/tinyimdbtrainneg.txt \
+    --output-label-append-details -o out/labelled/train -O microgdt-dev-init \
+    --use-transformer --use-gdt --gdt-word-mode --gdt-bpe-vocab-size 2500
+
+run-microgpt-MK12:
+  cargo run --features="multi_threaded" --release --bin embed -- \
+    --single-batch-iterations --char --train-rate 0.004 --batch-size 4 \
+    --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
+    --hidden-layer-nodes 72 -H 1,4  --embedding-size 16 --input-stride-width 256 --repl "P/" \
+    --training-rounds 100 -i ./res/tinyimdbtrainneg.txt \
+    --output-label-append-details -o out/labelled/train -O microgdt-dev-init \
+    --use-transformer --use-gdt --gdt-bpe-enable --gdt-bpe-vocab-size 2500
+
 upload-tinyshakespeare mongodb_conn_str=("mongodb://" + mongodb_user + ":" + mongodb_pass + "@" + mongodb_host + ":27017"):
   MONGODB_HOST={{mongodb_conn_str}} \
     upload out/{{model_output_label}}
@@ -153,6 +189,14 @@ upload mongodb_conn_str=("mongodb://" + mongodb_user + ":" + mongodb_pass + "@" 
 
 docker-build:
   docker build -t embed .
+
+docker-build-aws:
+  aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 545568271585.dkr.ecr.us-east-1.amazonaws.com
+  docker pull 545568271585.dkr.ecr.us-east-1.amazonaws.com/embed-ecr:latest
+  docker tag 545568271585.dkr.ecr.us-east-1.amazonaws.com/embed-ecr:latest embed:0.1
+  docker build -t embed:0.2 .
+  docker tag embed:0.2 545568271585.dkr.ecr.us-east-1.amazonaws.com/embed-ecr:latest
+  docker push 545568271585.dkr.ecr.us-east-1.amazonaws.com/embed-ecr:latest
 
 docker-down-mongo:
   docker rm -f mongo mongo-express || true
@@ -192,6 +236,12 @@ docker-run run_script="run" script_args="": docker-build
     embed just {{run_script}} {{script_args}}
   docker attach --no-stdin --sig-proxy=false embedtestrun
 
+docker-run-aws run_script="run" script_args="": docker-build-aws
+  mkdir -p out/script-{{run_script}}
+  docker run --name embedtestrun --rm -itd -v `pwd`/out/script-{{run_script}}:/app/out \
+    545568271585.dkr.ecr.us-east-1.amazonaws.com/embed-ecr:latest just {{run_script}} {{script_args}}
+  docker attach --no-stdin --sig-proxy=true embedtestrun
+
 configure-node node_ip public_key_path:
   ssh-copy-id -i {{public_key_path}} {{ssh_user}}@{{node_ip}}
   ssh {{ssh_user}}@{{node_ip}} snap install --edge --classic just
@@ -199,6 +249,21 @@ configure-node node_ip public_key_path:
 
 configure-aws-arm-ami-node node_ip public_key_path:
   ssh ec2-user@{{node_ip}} "sudo yum update -y; sudo yum search docker; sudo yum install docker -y; sudo usermod -a -G docker ec2-user; id ec2-user; newgrp docker; sudo systemctl enable docker.service; sudo systemctl start docker.service; sudo yum install socat -y; sudo yum install gcc -y; curl https://sh.rustup.rs -sSf > RUSTUP.sh; sh RUSTUP.sh -y; source ~/.bashrc; cargo install just"
+
+# m5zn.3xlarge
+configure-aws-docker-node node_ip:
+  ssh {{ssh_user}}@{{node_ip}} sudo snap install --edge --classic just
+  ssh {{ssh_user}}@{{node_ip}} sudo snap install --edge --classic aws-cli
+  ssh {{ssh_user}}@{{node_ip}} sudo apt install -y socat
+  ssh {{ssh_user}}@{{node_ip}} aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 545568271585.dkr.ecr.us-east-1.amazonaws.com
+
+configure-aws-arm-docker-node node_ip:
+  ssh {{ssh_user}}@{{node_ip}} mkdir -p ~/bin
+  ssh {{ssh_user}}@{{node_ip}} curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to ~/bin
+  ssh {{ssh_user}}@{{node_ip}} export PATH="$PATH:$HOME/bin"
+  ssh {{ssh_user}}@{{node_ip}} sudo snap install --edge --classic aws-cli
+  ssh {{ssh_user}}@{{node_ip}} sudo apt install -y socat
+  ssh {{ssh_user}}@{{node_ip}} aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 545568271585.dkr.ecr.us-east-1.amazonaws.com
 
 resume-node node_ip input_file version="v1" run_script="testrun-tinyshakespeare":
   ssh {{ssh_user}}@{{node_ip}} mkdir -p {{home_dir}}/code/{{version}}
@@ -209,13 +274,13 @@ resume-node node_ip input_file version="v1" run_script="testrun-tinyshakespeare"
   scp -p ./{{input_file}} {{ssh_user}}@{{node_ip}}:{{home_dir}}/code/{{version}}/{{input_file}}
   ssh {{ssh_user}}@{{node_ip}} "cd {{home_dir}}/code/{{version}}; just docker-run resume {{input_file}}"
 
-push-node node_ip version="v1" run_script="testrun-tinyshakespeare" script_args="":
+push-node node_ip version="v1" run_script="testrun-tinyshakespeare" script_args="" recipe="docker-run":
   ssh {{ssh_user}}@{{node_ip}} mkdir -p {{home_dir}}/code/{{version}}
   git archive --add-file=justfile --add-file=Dockerfile --format=zip HEAD > ./res/archive.zip
   scp -p ./res/archive.zip {{ssh_user}}@{{node_ip}}:{{home_dir}}/code
   ssh {{ssh_user}}@{{node_ip}} "cd {{home_dir}}/code/{{version}}; unzip -o ../archive.zip"
   scp -p ./res/tiny*.txt {{ssh_user}}@{{node_ip}}:{{home_dir}}/code/{{version}}/res/
-  ssh {{ssh_user}}@{{node_ip}} "cd {{home_dir}}/code/{{version}}; just docker-run {{run_script}} {{script_args}}"
+  ssh {{ssh_user}}@{{node_ip}} "cd {{home_dir}}/code/{{version}}; just {{recipe}} {{run_script}} {{script_args}}"
   mkdir -p out/remote/{{run_script}}/{{version}}
   scp -p -r {{ssh_user}}@{{node_ip}}:{{home_dir}}/code/{{version}}/out/script-{{run_script}} ./out/remote/{{run_script}}/{{version}}
 

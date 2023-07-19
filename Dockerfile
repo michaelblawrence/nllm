@@ -22,13 +22,13 @@ RUN set -eux; \
         cargo install --features="multi_threaded" --bin embed --path .;
 
 COPY src src
+COPY res/tiny*.txt ./res/
 RUN touch src/bin/embed/main.rs src/bin/derivate.rs src/main.rs;
 
 RUN set -eux; \
         cargo install --features="multi_threaded" --bin embed --path .;
 
 COPY justfile ./
-COPY res/tiny*.txt ./res/
 
 RUN set -eux; \
         mkdir out
