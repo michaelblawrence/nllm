@@ -71,7 +71,7 @@ pub(crate) fn split_training_and_testing(
 pub(crate) fn parse_vocab_and_phrases(
     max_vocab: Option<usize>,
 ) -> (HashSet<String>, Vec<Vec<String>>) {
-    let corpus = include_str!("../../../res/tinytester.txt");
+    let corpus = include_str!("../../../../res/tinytester.txt");
     let mut phrases: Vec<Vec<String>> = corpus
         .lines()
         .map(|line| {

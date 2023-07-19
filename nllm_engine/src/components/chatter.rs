@@ -6,7 +6,7 @@ use crate::ml::embeddings::builder::EmbeddingBuilder;
 
 #[cfg(feature = "include_res")]
 const MODEL_JSON: &str = include_str!(
-    "../../out/labelled/train/imdb-reviews-neg-v2-e32-L150x150x75x50/model-r1273568-42pct.json"
+    "../../../out/labelled/train/imdb-reviews-neg-v2-e32-L150x150x75x50/model-r1273568-42pct.json"
 );
 #[cfg(not(feature = "include_res"))]
 const MODEL_JSON: &str = "";

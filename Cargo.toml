@@ -1,0 +1,8 @@
+[workspace]
+
+members = [
+    "nllm_engine",
+    "nllm_web",
+    "nllm_embed",
+    "nllm_respond",
+]
