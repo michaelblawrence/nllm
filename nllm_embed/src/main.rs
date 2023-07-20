@@ -17,8 +17,6 @@ mod training;
 fn main() -> Result<()> {
     use std::cell::RefCell;
 
-    use tracing::warn;
-
     configure_logging();
     let (config, resumed_state) = parse_cli_args()?;
 
@@ -30,11 +28,9 @@ fn main() -> Result<()> {
         messages::TrainerHandle::new(move |embedding: &EmbedModel, msg: TrainerMessage| {
             match &msg {
                 TrainerMessage::Yield => {
-                    dbg!("yield start");
                     if let Some(on_yield) = on_yield_clone.borrow().as_ref() {
                         (**on_yield)()
                     }
-                    dbg!("yield stop");
                 }
                 _ => {}
             }
@@ -52,11 +48,11 @@ fn main() -> Result<()> {
         }
     }
 
-    let config_clone = config.clone();
-    let tx1 = tx.clone();
+    // let config_clone = config.clone();
+    // let tx1 = tx.clone();
     on_yield.replace(Some(Rc::new(move || {
-        let tx = tx1.clone();
-        let config_clone = config_clone.clone();
+        // let tx = tx1.clone();
+        // let config_clone = config_clone.clone();
         // block_on_key_press(move |c| parse_repl_char(c, &tx, &config_clone), &tx1)
     })));
 

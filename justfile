@@ -6,16 +6,16 @@ ssh_user := env_var_or_default('SSH_USER', 'root')
 home_dir := env_var_or_default('USER_HOME_DIR', '/home/docker')
 
 build:
-  cargo build --features="multi_threaded" --release --bin embed
+  cargo build --features="multi_threaded" --release --package embed
 
 build-wasi:
-  cargo +nightly wasi build --features="wasi" --release --bin embed 
+  cargo +nightly wasi build --no-default-features --features="wasi" --release --package embed 
 
 install:
-  cargo install --features="multi_threaded" --bin embed --offline --path .
+  cargo install --features="multi_threaded" --offline --path ./nllm_embed
 
 install-upload:
-  cargo install --features="db" --bin upload --path .
+  cargo install --features="db" --bin upload --path ./nllm_embed
 
 wasi-run:
   wasmer run --dir ./out --dir ./res --enable-all ./embed.wasm -- \
@@ -30,13 +30,13 @@ wasi-testrun:
     -i ./res/tinyshakespeare.txt -o out -O dev-model-wasi 
 
 run-like-wasi-testrun:
-  cargo run --features="single_threaded" --release --bin embed -- \
+  cargo run --features="single_threaded" --release --package embed -- \
     --quit-on-complete --single-batch-iterations --char --training-rounds 100000 \
     --batch-size 64 --phrase-test-set-max-tokens 5 \
     -i ./res/tinyshakespeare.txt -o out -O dev-model-wasi 
 
 cargo-run input_file="./res/tinyshakespeare.txt" rounds="100000" output_label=(model_output_label):
-  cargo run --features="multi_threaded" --release --bin embed -- \
+  cargo run --features="multi_threaded" --release --package embed -- \
     --single-batch-iterations --char --train-rate 0.0016 --batch-size 32 \
     --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
     --hidden-layer-nodes 650  --embedding-size 16 --input-stride-width 64 --repl "PR" \
@@ -44,16 +44,16 @@ cargo-run input_file="./res/tinyshakespeare.txt" rounds="100000" output_label=(m
     --output-label-append-details -o out/labelled/train -O {{model_output_label}}
 
 cargo-resume input_file repl="p" batch_size="32":
-  cargo run --features="multi_threaded" --release --bin embed -- \
+  cargo run --features="multi_threaded" --release --package embed -- \
     load {{input_file}} \
     --repl "{{repl}}" --batch-size {{batch_size}} --force-continue
 
 cargo-respond input_file:
-  cargo run --features="threadrng" --release --bin respond -- \
+  cargo run --features="threadrng" --release --package respond -- \
     {{input_file}}
 
 cargo-flamegraph input_file:
-  sudo cargo flamegraph --features="single_threaded thread" --bin=embed -- \
+  sudo cargo flamegraph --features="single_threaded thread" --package embed -- \
     load out/labelled/train/dev-model-qa-e24-L64x1/model-r24957-41pct.json \
     --repl="pr"
 
@@ -135,7 +135,7 @@ run-microgpt-MK7 phrase_test_set_max_tokens="500":
   embed json --trainer-config '{"activation_mode":"Tanh","batch_size":8,"embedding_size":128,"hidden_deep_layer_nodes":"1,4","hidden_layer_nodes":512,"input_stride_width":128,"input_txt_path":"./res/tinyimdbtrainneg.txt","output_dir":"out/labelled/train","output_label":"microgpt","output_label_append_details":true,"pause_on_start":false,"phrase_split_seed":null,"phrase_test_set_max_tokens":{{phrase_test_set_max_tokens}},"phrase_test_set_split_pct":20.0,"phrase_train_set_size":null,"phrase_word_length_bounds":[null,null],"quit_on_complete":false,"repl":"crP","sample_from_newline":false,"single_batch_iterations":true,"snapshot_interval_secs":120,"train_rate":0.004,"training_rounds":1000,"use_character_tokens":true,"use_transformer":true}'
 
 run-microgpt-MK8:
-  cargo run --features="multi_threaded" --release --bin embed -- \
+  cargo run --features="multi_threaded" --release --package embed -- \
     --single-batch-iterations --char --train-rate 0.004 --batch-size 1 \
     --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
     --hidden-layer-nodes 512 -H 2,4  --embedding-size 128 --input-stride-width 256 --repl "P" \
@@ -162,7 +162,7 @@ run-microgpt-MK10:
     --use-transformer --use-gdt --gdt-word-mode --gdt-bpe-vocab-size 2500
 
 run-microgpt-MK11:
-  cargo run --features="multi_threaded" --release --bin embed -- \
+  cargo run --features="multi_threaded" --release --package embed -- \
     --single-batch-iterations --char --train-rate 0.004 --batch-size 4 \
     --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
     --hidden-layer-nodes 768 -H 1,6  --embedding-size 192 --input-stride-width 256 --repl "P" \
@@ -171,7 +171,7 @@ run-microgpt-MK11:
     --use-transformer --use-gdt --gdt-word-mode --gdt-bpe-vocab-size 2500
 
 run-microgpt-MK12:
-  cargo run --features="multi_threaded" --release --bin embed -- \
+  cargo run --features="multi_threaded" --release --package embed -- \
     --single-batch-iterations --char --train-rate 0.004 --batch-size 4 \
     --phrase-word-length-bounds .. --phrase-test-set-max-tokens 500 \
     --hidden-layer-nodes 72 -H 1,4  --embedding-size 16 --input-stride-width 256 --repl "P/" \

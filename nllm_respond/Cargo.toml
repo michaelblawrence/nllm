@@ -1,8 +1,13 @@
 [package]
-name = "nllm_respond"
+name = "respond"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
+plane = { path = "../nllm_engine", default-features = false, features = ["threadrng"]}
+anyhow = { version = "1.0.69", features = ["backtrace"] }
+itertools = "0.10.5"
+serde_json = "1.0.93"
+
+[features]
+threadrng = ["plane/threadrng"]

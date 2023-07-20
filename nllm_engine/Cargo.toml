@@ -3,46 +3,33 @@ name = "plane"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[[bin]]
-name = "upload"
-required-features = ["db"]
-
 [dependencies]
 anyhow = { version = "1.0.69", features = ["backtrace"] }
-clap = { version = "4.1.13", features = ["derive"], optional = true }
-crossterm = { version = "0.26.1", optional = true }
 itertools = "0.10.5"
 js-sys = { version = "0.3.61", optional = true }
-mongodb = { version = "2.5.0", default-features = false, features = ["tokio-sync"], optional = true }
-plotly = { version = "0.8.3", features = ["wasm"] }
+plotly = "0.8.3"
 rand = { version = "0.8.5", optional = true }
 rand_distr = { version = "0.4.3", optional = true }
 rayon = { version = "1.7.0", optional = true }
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = "1.0.93"
-time = { version = "0.3.20", features = ["wasm-bindgen"] }
 tracing = "0.1.37"
-tracing-subscriber = { version = "0.3.16", features = ["env-filter", "time"] }
-wasm-bindgen = "0.2.84"
 
 [dev-dependencies]
 rand = { version = "0.8.5" }
 test-log = { version = "0.2.11", default-features = false, features = [
     "trace",
 ] }
+tracing-subscriber = { version = "0.3.16", features = ["env-filter", "time"] }
 
 [features]
-default = ["cli", "thread", "threadrng", "threadpool", "db"]
-db = ["mongodb"]
+default = ["cli", "thread", "threadrng", "threadpool"]
 js = ["js-sys"]
-cli = ["crossterm", "args"]
-args = ["clap"]
+cli = []
 thread = []
 threadpool = ["thread", "rayon"]
 threadrng = ["rand", "rand_distr"]
-wasi = ["args", "threadrng"]
+wasi = ["threadrng"]
 single_threaded = ["cli", "threadrng"]
 multi_threaded = ["cli", "threadrng", "threadpool"]
 short_floats = []

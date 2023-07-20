@@ -627,6 +627,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fcaabb2fef8c910e7f4c7ce9f67a1283a1715879a7c230ca9d6d1ae31f16d91"
 
 [[package]]
+name = "embed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "itertools",
+ "mongodb",
+ "plane",
+ "plotly",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "enum-as-inner"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1389,26 +1406,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nllm_embed"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossterm",
- "itertools",
- "plane",
- "plotly",
- "serde",
- "serde_json",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "nllm_respond"
-version = "0.1.0"
-
-[[package]]
 name = "nllm_web"
 version = "0.1.0"
 dependencies = [
@@ -1577,11 +1574,8 @@ name = "plane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
- "crossterm",
  "itertools",
  "js-sys",
- "mongodb",
  "plotly",
  "rand",
  "rand_distr",
@@ -1589,10 +1583,8 @@ dependencies = [
  "serde",
  "serde_json",
  "test-log",
- "time",
  "tracing",
  "tracing-subscriber",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -1839,6 +1831,16 @@ checksum = "52e44394d2086d010551b14b53b1f24e31647570cd1deb0379e2c21b329aba00"
 dependencies = [
  "hostname",
  "quick-error",
+]
+
+[[package]]
+name = "respond"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "plane",
+ "serde_json",
 ]
 
 [[package]]
