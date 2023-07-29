@@ -5,4 +5,5 @@ members = [
     "nllm_trainer_web",
     "nllm_embed",
     "nllm_respond",
+    "nllm_chat_web",
 ]
