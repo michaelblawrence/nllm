@@ -11,7 +11,7 @@ name = "upload"
 required-features = ["db"]
 
 [dependencies]
-plane = { path = "../nllm_engine", default-features = false }
+plane = { path = "../nllm_plane", default-features = false }
 anyhow = { version = "1.0.69", features = ["backtrace"] }
 clap = { version = "4.1.13", features = ["derive"] }
 crossterm = { version = "0.26.1", optional = true }
