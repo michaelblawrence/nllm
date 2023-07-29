@@ -4,9 +4,9 @@ use axum::{
         State,
     },
     http::StatusCode,
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Response},
     routing::get,
-    Router,
+    Router, body::Bytes,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use plane::ml::RngStrategy;
@@ -17,6 +17,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::broadcast;
+use tower_http::services::ServeDir;
 use tracing::{info, metadata::LevelFilter};
 
 mod model;
@@ -82,8 +83,11 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/diagnostics/ws.js", get(diagnostics_ws_js))
         .route("/websocket", get(websocket_handler))
         .route("/keepalive", get(keepalive_websocket_handler))
+        // .route("/scripts", ServeDir::new("public/scripts"))
+        .nest_service("/scripts", ServeDir::new("public/scripts"))
         .with_state(app_state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
@@ -266,4 +270,17 @@ async fn index() -> (StatusCode, Html<String>) {
         Ok(html) => (StatusCode::OK, Html(html)),
         Err(err) => (StatusCode::NOT_FOUND, Html(err.to_string())),
     }
+}
+
+// Include utf-8 file at **compile** time.
+async fn diagnostics_ws_js() -> Response {
+    let body: &'static str = include_str!("../public/res/ws.js");
+    let response: (_, axum::body::Full<Bytes>) = (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/javascript"),
+        )],
+        body.into(),
+    );
+    response.into_response()
 }
