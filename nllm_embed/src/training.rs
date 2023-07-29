@@ -540,7 +540,7 @@ where
         let s2s = CharacterTransformer::from_builder_ordered(builder, &vocab, rng).unwrap();
 
         s2s.into()
-    } else if let (true, Some(vocab)) = (config.use_character_tokens && config.use_gdt, gdt_vocab) {
+    } else if let (true, Some(vocab)) = (config.use_gdt, gdt_vocab) {
         info!("Using GenerativeDecoderTransformer (GDT)...");
         let builder = DecoderBuilder::new(
             config.input_stride_width,
