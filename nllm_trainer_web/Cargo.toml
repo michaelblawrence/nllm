@@ -1,5 +1,5 @@
 [package]
-name = "nllm_web"
+name = "nllm_trainer_web"
 version = "0.1.0"
 edition = "2021"
 
