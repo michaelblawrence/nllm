@@ -43,7 +43,7 @@ function Conversation() {
         }
 
         setConnectDisabled(true);
-        const websocket = new WebSocket("ws://localhost:3000/websocket");
+        const websocket = new WebSocket("/websocket");
 
         websocket.onopen = function () {
             console.log("connection opened");
