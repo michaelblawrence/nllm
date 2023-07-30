@@ -117,6 +117,19 @@ pub fn load(model_fpath: Option<&str>) -> Result<(RespondModel, ExtractedModelCo
         None => bail!("failed to read model file"),
     };
 
+    let (model, state) = from_json(&json)?;
+
+    println!("..");
+    println!(
+        "Loaded {} model from '{}'",
+        model.description(),
+        model_fpath.clone().unwrap_or_default()
+    );
+
+    Ok((model, state))
+}
+
+pub fn from_json(json: &str) -> Result<(RespondModel, ExtractedModelConfig)> {
     let (_json, mut state) = extract_config(&json).expect("failed to parse config");
 
     let model = RespondModel::from_snapshot(state.use_transformer, state.use_gdt, &json)
@@ -134,13 +147,6 @@ pub fn load(model_fpath: Option<&str>) -> Result<(RespondModel, ExtractedModelCo
     //     .with_rng(rng.clone())
     //     .build()
     //     .expect("failed to rebuild instance from snapshot state");
-
-    println!("..");
-    println!(
-        "Loaded {} model from '{}'",
-        model.description(),
-        model_fpath.clone().unwrap_or_default()
-    );
 
     Ok((model, state))
 }

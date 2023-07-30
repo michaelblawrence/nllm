@@ -6,4 +6,5 @@ members = [
     "nllm_embed",
     "nllm_respond",
     "nllm_chat_web",
+    "nllm_chat_functions",
 ]
