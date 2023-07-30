@@ -1,4 +1,5 @@
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
@@ -6,23 +7,21 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::get,
-    Router, body::Bytes,
+    Router,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
-use plane::ml::RngStrategy;
+
 use std::{
     collections::HashSet,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
-use tracing::{info, metadata::LevelFilter};
+use tracing::metadata::LevelFilter;
 
+mod inference;
 mod model;
-
-// Our shared state
 struct AppState {
     // We require unique usernames. This tracks which usernames have been taken.
     user_set: Mutex<HashSet<String>>,
@@ -36,7 +35,6 @@ fn configure_logging() {
         .compact()
         .with_target(false)
         .with_max_level(LevelFilter::INFO)
-        // .with_span_events(FmtSpan::CLOSE)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).unwrap();
@@ -51,29 +49,7 @@ async fn main() {
     user_set.insert("Chat".to_string());
     let user_set = Mutex::new(user_set);
     let (tx, _rx) = broadcast::channel(100);
-    let (model_tx, _model_rx) = broadcast::channel::<String>(100);
-    let model_fpath = std::env::var("NLLM_MODEL_PATH").ok();
-    let (model, state) = respond::load(model_fpath.as_deref()).unwrap();
-
-    tokio::spawn({
-        let tx = tx.clone();
-        let model_tx = model_tx.clone();
-        let rng = RngStrategy::default();
-        let ctx = Arc::new((model, state, rng, tx.clone()));
-        async move {
-            let mut model_rx = model_tx.subscribe();
-            while let Ok(prompt) = model_rx.recv().await {
-                let ctx = ctx.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    let (model, state, rng, tx) = &*ctx;
-                    run_inference(&prompt, &model, &state, &rng, &tx)
-                })
-                .await
-                .unwrap();
-            }
-        }
-    });
+    let model_tx = inference::spawn_local_inference(tx.clone());
 
     let app_state = Arc::new(AppState {
         user_set,
@@ -86,53 +62,15 @@ async fn main() {
         .route("/diagnostics/ws.js", get(diagnostics_ws_js))
         .route("/websocket", get(websocket_handler))
         .route("/keepalive", get(keepalive_websocket_handler))
-        // .route("/scripts", ServeDir::new("public/scripts"))
         .nest_service("/scripts", ServeDir::new("public/scripts"))
         .with_state(app_state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     tracing::debug!("listening on {}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await
         .unwrap();
-}
-
-fn run_inference(
-    prompt: &str,
-    model: &respond::RespondModel,
-    state: &respond::ExtractedModelConfig,
-    rng: &RngStrategy,
-    tx: &tokio::sync::broadcast::Sender<String>,
-) {
-    let char_mode = state.char_mode.expect("missing char_mode");
-    let inference_started = std::time::Instant::now();
-    let config = respond::PromptConfig {
-        use_gdt: state.use_gdt,
-        char_mode,
-        vocab_supervised_predictions_enabled: false,
-        vocab: None,
-    };
-    let response = match respond::process_prompt(&model, &rng, &prompt, &config) {
-        Ok(x) => x,
-        Err(_) => return,
-    };
-
-    _ = tx.send(format!("Chat: 　"));
-    let mut response_msg = String::new();
-    for (token, separator) in response {
-        response_msg += &format!("{token}{separator}");
-        _ = tx.send(format!("[CHAT_PARTIAL]: {response_msg}"));
-
-        if inference_started.elapsed() > Duration::from_secs(15) {
-            info!("Timed out on prompt `{prompt}`");
-            _ = tx.send(format!("Chat: {response_msg}..."));
-            return;
-        }
-    }
-
-    info!("Completed user prompt response");
-    _ = tx.send(format!("Chat: {response_msg}"));
 }
 
 async fn websocket_handler(
