@@ -1,36 +1,124 @@
+use aws_sdk_lambda::types::InvokeMode;
 use plane::ml::RngStrategy;
+use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{error, info};
 
-pub fn spawn_local_inference(tx: broadcast::Sender<String>) -> broadcast::Sender<String> {
-    let model_fpath = std::env::var("NLLM_MODEL_PATH").ok();
-    let (model, state) = respond::load(model_fpath.as_deref()).unwrap();
-
+pub async fn spawn_lambda_inference_client(
+    lambda_arn: &str,
+    tx: broadcast::Sender<String>,
+) -> broadcast::Sender<String> {
     let (model_tx, mut model_rx) = broadcast::channel::<String>(100);
 
-    tokio::spawn({
-        let tx = tx.clone();
-        let rng = RngStrategy::default();
-        let ctx = Arc::new((model, state, rng, tx.clone()));
-        async move {
-            while let Ok(prompt) = model_rx.recv().await {
-                let ctx = ctx.clone();
+    use aws_sdk_lambda::{primitives::Blob, types::InvocationType, Client as LambdaClient};
 
-                tokio::task::spawn_blocking(move || {
-                    let (model, state, rng, tx) = &*ctx;
-                    match infer(&prompt, &model, &state, &rng) {
-                        Ok(messages) => {
-                            for msg in messages {
-                                tx.send(msg).unwrap();
-                            }
-                        }
-                        Err(_) => return,
-                    };
-                })
+    let shared_config = aws_config::load_from_env().await;
+    let client = LambdaClient::new(&shared_config);
+    let lambda_arn = lambda_arn.to_owned();
+    let function_url_config = client
+        .get_function_url_config()
+        .function_name(&lambda_arn)
+        .send()
+        .await
+        .expect("error extracting lambda url config");
+    
+    match function_url_config.invoke_mode() {
+        Some(InvokeMode::ResponseStream) => {}
+        Some(_) => panic!("lambda response streaming is not enabled on server"),
+        None => panic!("lambda config missing function invoke mode"),
+    }
+    let function_url = function_url_config
+        .function_url()
+        .expect("lambda config missing function url")
+        .to_owned();
+
+    let function_name = client.invoke().function_name(&lambda_arn);
+    let factory = move |prompt: Option<&str>| {
+        function_name
+            .clone()
+            .set_payload(prompt.map(|prompt| Blob::new(json!({ "prompt": prompt }).to_string())))
+    };
+
+    let function = factory(None);
+    function
+        .invocation_type(InvocationType::DryRun)
+        .send()
+        .await
+        .expect("failed to validate lambda connection");
+
+    info!("Connected to lambda endpoint...");
+
+    tokio::spawn(async move {
+        let http_client = reqwest::Client::new();
+        while let Ok(prompt) = model_rx.recv().await {
+            info!("Requesting inference from remote");
+            match http_client
+                .post(&function_url)
+                .json(&json!({ "prompt": prompt }))
+                .send()
                 .await
-                .unwrap();
+            {
+                Ok(response) => {
+                    use futures::StreamExt;
+                    use tokio::io::AsyncBufReadExt;
+
+                    info!("Started streaming inference response from remote");
+                    match response.error_for_status_ref() {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!("Error streaming inference response from remote: {e}");
+                            continue;
+                        }
+                    }
+                    let stream = response.bytes_stream();
+                    let stream = stream.map(|result| {
+                        result.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+                    });
+
+                    let read = tokio_util::io::StreamReader::new(stream);
+                    let reader = tokio::io::BufReader::new(read);
+                    let mut lines = reader.lines();
+
+                    while let Ok(Some(msg)) = lines.next_line().await {
+                        tx.send(dbg!(msg)).unwrap();
+                    }
+                    info!("Completed streaming inference response from remote");
+                }
+                Err(e) => error!("Error starting inference streaming from remote: {e}"),
             }
+        }
+    });
+
+    model_tx
+}
+pub fn spawn_local_inference(
+    model_fpath: Option<&str>,
+    tx: broadcast::Sender<String>,
+) -> broadcast::Sender<String> {
+    let (model, state) = respond::load(model_fpath).unwrap();
+    let (model_tx, mut model_rx) = broadcast::channel::<String>(100);
+
+    let rng = RngStrategy::default();
+    let ctx = Arc::new((model, state, rng, tx.clone()));
+
+    tokio::spawn(async move {
+        while let Ok(prompt) = model_rx.recv().await {
+            let ctx = ctx.clone();
+
+            tokio::task::spawn_blocking(move || {
+                let (model, state, rng, tx) = &*ctx;
+                match infer(&prompt, &model, &state, &rng) {
+                    Ok(messages) => {
+                        for msg in messages {
+                            tx.send(msg).unwrap();
+                        }
+                    }
+                    Err(_) => return,
+                };
+            })
+            .await
+            .unwrap();
         }
     });
 

@@ -49,7 +49,18 @@ async fn main() {
     user_set.insert("Chat".to_string());
     let user_set = Mutex::new(user_set);
     let (tx, _rx) = broadcast::channel(100);
-    let model_tx = inference::spawn_local_inference(tx.clone());
+    let model_tx = match (
+        std::env::var("NLLM_MODEL_PATH").ok(),
+        std::env::var("NLLM_INFER_LAMBDA_ARN").ok(),
+    ) {
+        (None, Some(lambda_arn)) => {
+            inference::spawn_lambda_inference_client(&lambda_arn, tx.clone()).await
+        }
+        (model_fpath, None) => inference::spawn_local_inference(model_fpath.as_deref(), tx.clone()),
+        (_, _) => panic!(
+            "Either the NLLM_MODEL_PATH or NLLM_INFER_LAMBDA_ARN environment variable must be set"
+        ),
+    };
 
     let app_state = Arc::new(AppState {
         user_set,
