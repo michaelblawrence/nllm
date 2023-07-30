@@ -76,7 +76,12 @@ async fn main() {
         .nest_service("/scripts", ServeDir::new("public/scripts"))
         .with_state(app_state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    let port = std::env::var("NLLM_API_PORT")
+        .ok()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(3000_u16);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::debug!("listening on {}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
@@ -214,16 +219,17 @@ enum CheckUsernameAction {
 }
 
 // Include utf-8 file at **compile** time.
-async fn index() -> (StatusCode, Html<String>) {
-    match std::fs::read_to_string("index.html") {
-        Ok(html) => (StatusCode::OK, Html(html)),
-        Err(err) => (StatusCode::NOT_FOUND, Html(err.to_string())),
-    }
+async fn index() -> (StatusCode, Html<&'static str>) {
+    (StatusCode::OK, Html(include_str!("../index.html")))
 }
 
 // Include utf-8 file at **compile** time.
 async fn diagnostics_ws_js() -> Response {
-    let body: &'static str = include_str!("../public/res/ws.js");
+    let body: &'static str = if let Some(_) = option_env!("NLLM_HOTRELOAD") {
+        include_str!("../public/res/ws.js")
+    } else {
+        "initKeepAliveSocket = () => {};"
+    };
     let response: (_, axum::body::Full<Bytes>) = (
         [(
             axum::http::header::CONTENT_TYPE,
