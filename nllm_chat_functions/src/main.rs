@@ -16,9 +16,19 @@ async fn func(
         RngStrategy,
     )>,
 ) -> Result<Response<Body>, Error> {
+    let json = serde_json::to_string(&event.payload).unwrap();
+    info!("event json: {}", json);
     let prompt_txt = event
         .payload
         .get("prompt")
+        .cloned()
+        .or_else(|| {
+            // fallback to html api request body
+            serde_json::from_str::<Value>(event.payload.get("body")?.as_str()?)
+                .ok()?
+                .get("prompt")
+                .cloned()
+        })
         .context("request missing prompt field")?
         .as_str()
         .context("request prompt field invalid type")?
