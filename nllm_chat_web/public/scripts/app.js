@@ -28,10 +28,6 @@ function Conversation() {
         </textarea>
     `;
 
-    if (initKeepAliveSocket) {
-        initKeepAliveSocket();
-    }
-
     window.onerror = function myErrorHandler(errorMsg, url, lineNumber) {
         setTextAreaValue(value => value + "Error occured: " + errorMsg + "\n\n");
         return false;
