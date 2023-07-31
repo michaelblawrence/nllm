@@ -5,9 +5,64 @@
     <meta charset="UTF-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebSocket Chat</title>
+    <title>ChatNLLN - chat with AI</title>
+
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="/icons/favicon-16x16.png">
+    <link rel="manifest" href="/icons/site.webmanifest">
+    <link rel="mask-icon" href="/icons/safari-pinned-tab.svg" color="#5bbad5">
+    <link rel="shortcut icon" href="/icons/favicon.ico">
+    <meta name="apple-mobile-web-app-title" content="NLLM Chat">
+    <meta name="application-name" content="NLLM Chat">
+    <meta name="msapplication-TileColor" content="#da532c">
+    <meta name="msapplication-config" content="/icons/browserconfig.xml">
+    <meta name="theme-color" content="#1a9f5f">
+
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/flowbite/1.8.0/flowbite.min.css" rel="stylesheet" />
+    <script>
+        tailwind.config = {
+            theme: {
+                fontFamily: {
+                    sans: ['Graphik', 'sans-serif'],
+                    serif: ['Merriweather', 'serif'],
+                },
+                extend: {
+                    colors: {
+                        "gray": {
+                            DEFAULT: '#6C7F7E',
+                            50: '#E3E6E8',
+                            100: '#D8DCDE',
+                            200: '#C2C9CB',
+                            300: '#ACB6B9',
+                            400: '#96A4A6',
+                            500: '#809293',
+                            600: '#6C7F7E',
+                            700: '#52605E',
+                            800: '#384240',
+                            900: '#1E2422',
+                            950: '#121514'
+                        },
+                        "green": {
+                            DEFAULT: '#1A9F5F',
+                            50: '#CCF7E2',
+                            100: '#BAF4D8',
+                            200: '#97EEC4',
+                            300: '#74E8B0',
+                            400: '#51E39C',
+                            500: '#2EDD89',
+                            600: '#20C274',
+                            700: '#1A9F5F',
+                            800: '#126F42',
+                            900: '#0A3F25',
+                            950: '#062617'
+                        }
+                    }
+                }
+            }
+        }
+    </script>
 </head>
 
 <body class="p-5 bg-white dark:bg-gray-900 antialiased">
