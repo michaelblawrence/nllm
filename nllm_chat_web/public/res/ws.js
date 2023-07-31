@@ -21,15 +21,14 @@ initKeepAliveSocket = () => {
                     console.log("server restarted, reloading page...");
                     window.location.reload();
                 };
-                keepalive.onerror = function () {
-                    restartConnection.restart();
-                }
                 keepalive.onclose = function () {
                     restartConnection.restart();
-                }
+                };
             }, 3000);
         };
 
         restartConnection.restart();
     }
 };
+
+initKeepAliveSocket();

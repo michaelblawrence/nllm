@@ -219,8 +219,13 @@ enum CheckUsernameAction {
 }
 
 // Include utf-8 file at **compile** time.
-async fn index() -> (StatusCode, Html<&'static str>) {
-    (StatusCode::OK, Html(include_str!("../index.html")))
+// async fn index() -> (StatusCode, Html<&'static str>) {
+async fn index() -> (StatusCode, Html<String>) {
+    // (StatusCode::OK, Html(include_str!("../index.html")))
+    match std::fs::read_to_string("index.html") {
+        Ok(html) => (StatusCode::OK, Html(html)),
+        Err(err) => (StatusCode::NOT_FOUND, Html(err.to_string())),
+    }
 }
 
 // Include utf-8 file at **compile** time.
@@ -228,7 +233,7 @@ async fn diagnostics_ws_js() -> Response {
     let body: &'static str = if let Some(_) = option_env!("NLLM_HOTRELOAD") {
         include_str!("../public/res/ws.js")
     } else {
-        "initKeepAliveSocket = () => {};"
+        "// diagnostic js loaded"
     };
     let response: (_, axum::body::Full<Bytes>) = (
         [(
