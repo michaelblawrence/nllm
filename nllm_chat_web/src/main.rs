@@ -126,21 +126,27 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     while let Some(Ok(message)) = receiver.next().await {
         if let Message::Text(name) = message {
             // If username that is sent by client is not taken, fill username string.
-            match check_username(&state, &name) {
-                CheckUsernameAction::FoundNew => username.push_str(&name),
-                CheckUsernameAction::AlreadyExisted => (),
-            }
+            let username_check = match check_username(&state, &name) {
+                CheckUsernameAction::FoundNew => {
+                    username.push_str(&name);
+                    Ok(())
+                }
+                CheckUsernameAction::InvalidUsernameChars => {
+                    Err("Username contains invalid characters.")
+                }
+                CheckUsernameAction::InvalidUsernameLength => Err("Username is too long or short."),
+                CheckUsernameAction::AlreadyExisted => Err("Username already taken."),
+            };
 
             // If not empty we want to quit the loop else we want to quit function.
-            if !username.is_empty() {
-                break;
-            } else {
-                // Only send our client that username is taken.
-                let _ = sender
-                    .send(Message::Text(String::from("Username already taken.")))
-                    .await;
+            match username_check {
+                Ok(()) => break,
+                Err(msg) => {
+                    // Only send our client that username is taken.
+                    let _ = sender.send(Message::Text(String::from(msg))).await;
 
-                return;
+                    return;
+                }
             }
         }
     }
@@ -177,11 +183,15 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     // name, and sends them to all broadcast subscribers.
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            let chatbot_prefix = "hey ai";
-            if text.to_lowercase().starts_with(chatbot_prefix) {
-                let query =
-                    text[chatbot_prefix.len()..].trim_start_matches(|c: char| !c.is_alphabetic());
-                let _ = model_tx.send(query.to_string());
+            let chatbot_prefixes = ["hey ai", "hey chat", "hi ai", "hi chat"];
+            for prefix in chatbot_prefixes {
+                if text.to_lowercase().starts_with(prefix) {
+                    let query = text[prefix.len()..]
+                        .trim_start_matches(|c: char| !c.is_alphabetic());
+                    
+                    let _ = model_tx.send(query.to_string());
+                    break;
+                }
             }
             // Add username before message.
             let _ = tx.send(format!("{}: {}", name, text));
@@ -205,18 +215,29 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
 
 fn check_username(state: &AppState, name: &str) -> CheckUsernameAction {
     let mut user_set = state.user_set.lock().unwrap();
+    let name = name.trim();
+    let name_len = name.len();
+    let valid_chars = |x: char| x.is_alphanumeric() || x == '_' || x == '-';
 
-    if !user_set.contains(name) {
-        user_set.insert(name.to_owned());
-        CheckUsernameAction::FoundNew
-    } else {
-        CheckUsernameAction::AlreadyExisted
+    if user_set.contains(name) {
+        return CheckUsernameAction::AlreadyExisted;
     }
+    if name_len < 2 || name_len > 18 {
+        return CheckUsernameAction::InvalidUsernameLength;
+    }
+    if !name.chars().all(valid_chars) {
+        return CheckUsernameAction::InvalidUsernameChars;
+    }
+
+    user_set.insert(name.to_owned());
+    CheckUsernameAction::FoundNew
 }
 
 enum CheckUsernameAction {
     FoundNew,
+    InvalidUsernameChars,
     AlreadyExisted,
+    InvalidUsernameLength,
 }
 
 // Include utf-8 file at **compile** time.
