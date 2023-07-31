@@ -34,6 +34,7 @@ fn configure_logging() {
     let subscriber = tracing_subscriber::fmt()
         .compact()
         .with_target(false)
+        .with_timer(tracing_subscriber::fmt::time::time())
         .with_max_level(LevelFilter::INFO)
         .finish();
 
@@ -150,7 +151,7 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
 
     // Now send the "joined" message to all subscribers.
     let msg = format!("{} joined.", username);
-    tracing::debug!("{}", msg);
+    tracing::info!("{}", msg);
     let _ = state.tx.send(msg);
     let _ = sender.send(Message::Text(
         format!("Chat: Hi {username}, if you ever need my help, just call me by starting your message with 'hey ai'")
@@ -195,7 +196,7 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
 
     // Send "user left" message (similar to "joined" above).
     let msg = format!("{} left.", username);
-    tracing::debug!("{}", msg);
+    tracing::info!("{}", msg);
     let _ = state.tx.send(msg);
 
     // Remove username from map so new clients can take it again.
