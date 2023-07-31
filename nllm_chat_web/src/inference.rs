@@ -22,7 +22,7 @@ pub async fn spawn_lambda_inference_client(
         .send()
         .await
         .expect("error extracting lambda url config");
-    
+
     match function_url_config.invoke_mode() {
         Some(InvokeMode::ResponseStream) => {}
         Some(_) => panic!("lambda response streaming is not enabled on server"),
@@ -55,7 +55,7 @@ pub async fn spawn_lambda_inference_client(
             info!("Requesting inference from remote");
             match http_client
                 .post(&function_url)
-                .json(&json!({ "prompt": prompt }))
+                .json(&json!({ "prompt": &prompt }))
                 .send()
                 .await
             {
@@ -63,7 +63,7 @@ pub async fn spawn_lambda_inference_client(
                     use futures::StreamExt;
                     use tokio::io::AsyncBufReadExt;
 
-                    info!("Started streaming inference response from remote");
+                    info!("Started streaming inference response from remote: prompt = `{prompt}`");
                     match response.error_for_status_ref() {
                         Ok(_) => (),
                         Err(e) => {
@@ -79,11 +79,14 @@ pub async fn spawn_lambda_inference_client(
                     let read = tokio_util::io::StreamReader::new(stream);
                     let reader = tokio::io::BufReader::new(read);
                     let mut lines = reader.lines();
+                    let mut last_line = String::new();
 
                     while let Ok(Some(msg)) = lines.next_line().await {
-                        tx.send(dbg!(msg)).unwrap();
+                        last_line.clear();
+                        last_line.push_str(&msg);
+                        tx.send(msg).unwrap();
                     }
-                    info!("Completed streaming inference response from remote");
+                    info!("Completed streaming inference response from remote: {last_line}");
                 }
                 Err(e) => error!("Error starting inference streaming from remote: {e}"),
             }
