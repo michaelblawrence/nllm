@@ -4,12 +4,13 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::StatusCode,
-    response::{Html, IntoResponse, Response},
+    http::{HeaderName, StatusCode},
+    response::{AppendHeaders, Html, IntoResponse, Response},
     routing::get,
     Router,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
+use reqwest::header;
 
 use std::{
     collections::HashSet,
@@ -75,6 +76,8 @@ async fn main() {
         .route("/websocket", get(websocket_handler))
         .route("/keepalive", get(keepalive_websocket_handler))
         .nest_service("/scripts", ServeDir::new("public/scripts"))
+        .nest_service("/icons", ServeDir::new("public/icons"))
+        .nest_service("/images", ServeDir::new("public/images"))
         .with_state(app_state);
 
     let port = std::env::var("NLLM_API_PORT")
@@ -186,9 +189,9 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
             let chatbot_prefixes = ["hey ai", "hey chat", "hi ai", "hi chat"];
             for prefix in chatbot_prefixes {
                 if text.to_lowercase().starts_with(prefix) {
-                    let query = text[prefix.len()..]
-                        .trim_start_matches(|c: char| !c.is_alphabetic());
-                    
+                    let query =
+                        text[prefix.len()..].trim_start_matches(|c: char| !c.is_alphabetic());
+
                     let _ = model_tx.send(query.to_string());
                     break;
                 }
@@ -242,11 +245,27 @@ enum CheckUsernameAction {
 
 // Include utf-8 file at **compile** time.
 // async fn index() -> (StatusCode, Html<&'static str>) {
-async fn index() -> (StatusCode, Html<String>) {
+async fn index() -> (
+    StatusCode,
+    AppendHeaders<Vec<(HeaderName, &'static str)>>,
+    Html<String>,
+) {
     // (StatusCode::OK, Html(include_str!("../index.html")))
+
     match std::fs::read_to_string("index.html") {
-        Ok(html) => (StatusCode::OK, Html(html)),
-        Err(err) => (StatusCode::NOT_FOUND, Html(err.to_string())),
+        Ok(html) => (
+            StatusCode::OK,
+            AppendHeaders(vec![
+                (header::CACHE_CONTROL, "no-cache, no-store"),
+                (header::EXPIRES, "-1"),
+            ]),
+            Html(html),
+        ),
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            AppendHeaders(vec![]),
+            Html(err.to_string()),
+        ),
     }
 }
 
