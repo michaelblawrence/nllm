@@ -1,3 +1,4 @@
+// /@ts-check
 import {
     createEffect,
     createSignal,
@@ -5,8 +6,11 @@ import {
 } from "https://cdn.skypack.dev/solid-js";
 import { render } from "https://cdn.skypack.dev/solid-js/web";
 import html from "https://cdn.skypack.dev/solid-js/html";
+
 import { TopBar, Footer } from "./navigation.js";
 import { InsertEmojiIcon, SendMessageIcon, UploadImageIcon, UserIcon } from "./svg.js";
+import { storageGetUsername, generateDefaultUsername } from "./utils.js";
+import { createWebSocket } from "./realtime.js";
 
 function App() {
     return html`
@@ -17,13 +21,11 @@ function App() {
 }
 
 function Conversation() {
-    const initUserIndex = `1${Math.floor(Math.random() * 999)}`;
-    const initUserId = `${"00000".substring(initUserIndex.length)}${initUserIndex}`;
+    const initialUsername = storageGetUsername() || generateDefaultUsername();
     const [messageInputValue, setMessageInputValue] = createSignal("");
-    const [usernameValue, setUsernameValue] = createSignal("anon_1" + initUserId);
+    const [usernameValue, setUsernameValue] = createSignal(initialUsername);
     const [textAreaValue, setTextAreaValue] = createSignal("");
     const [connectDisabled, setConnectDisabled] = createSignal(false);
-    const [wsInvokeSend, setWsInvokeSend] = createSignal((_msg) => { });
 
     const chatTextArea = html`
         <textarea class="block p-2.5 w-full h-[250px] text-sm text-gray-900 bg-gray-50 rounded-lg leading-tight border border-gray-300 focus:ring-green-500 focus:border-green-500 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-green-500 dark:focus:border-green-500"
@@ -32,87 +34,20 @@ function Conversation() {
         </textarea>
     `;
 
-    window.onerror = function myErrorHandler(errorMsg, url, lineNumber) {
-        setTextAreaValue(value => value + "Error occured: " + errorMsg + "\n\n");
-        return false;
-    }
-
-    const wsStartConnection = async () => {
-        if (connectDisabled()) {
-            return Promise.resolve(false);
-        }
-
-        setConnectDisabled(true);
-        return new Promise((resolve, reject) => {
-            const websocket = new WebSocket(document.location.origin.replace(/^http/, "ws") + "/websocket");
-
-            websocket.onopen = function () {
-                console.log("connection opened");
-                websocket.send(usernameValue());
-                resolve(true);
-            }
-
-            websocket.onerror = function (e) {
-                setTextAreaValue(value => value + "Connection error occured\n\n");
-                reject(e);
-            }
-
-            websocket.onclose = function () {
-                console.log("connection closed");
-                setConnectDisabled(false);
-            }
-
-            websocket.onmessage = function (e) {
-                const chatBotPartialPrefix = "[CHAT_PARTIAL]: ";
-                const chatBotCompletedPrefix = "Chat: ";
-                const getMatchesOld = value => /(.*\n\n)(Chat: .*?　)(\n\n.*?)/.exec(value);
-                const getMatches = value => {
-                    const padIdx = value.lastIndexOf("　");
-                    if (padIdx < 0) return null;
-                    const preChatStartIdx = value.substring(0, padIdx).lastIndexOf("\n\nChat: ");
-                    if (preChatStartIdx < 0) return null;
-                    const chatStartIdx = preChatStartIdx + 2;
-                    const chatEndIdx = padIdx + 1;
-                    return [value, value.substring(0, chatStartIdx), value.substring(chatStartIdx, chatEndIdx), value.substring(chatEndIdx)]
-                };
-
-                if (e.data.startsWith(chatBotPartialPrefix)) {
-                    let partial = e.data.substring(chatBotPartialPrefix.length);
-                    setTextAreaValue(value => {
-                        const matches = getMatches(value);
-                        if (matches) {
-                            return `${matches[1]}Chat: ${partial}　${matches[3]}`;
-                        } else {
-                            return value;
-                        }
-                    });
-                    return;
-                }
-
-                if (e.data.startsWith(chatBotCompletedPrefix)) {
-                    const value = textAreaValue();
-                    const matches = getMatches(value);
-                    if (matches) {
-                        console.log("received message: " + e.data);
-                        setTextAreaValue(value => `${matches[1]}${e.data}${matches[3]}`);
-                        return;
-                    }
-                }
-
-                console.log("received message: " + e.data);
-                setTextAreaValue(value => value + e.data + "\n\n");
-                if (chatTextArea) {
-                    chatTextArea.scrollTop = chatTextArea.scrollHeight;
-                }
-            }
-
-            setWsInvokeSend(_ => ({ send: data => websocket.send(data) }));
-        });
-    };
-
-    const onConnectClick = () => {
-        wsStartConnection();
-    }
+    const [wsStart, wsSend] = createWebSocket({
+        onConnected: () => setConnectDisabled(true),
+        onDisconnected: () => setConnectDisabled(false),
+        onMessage: msg => {
+            setTextAreaValue(value => value + msg + "\n\n");
+            chatTextArea.scrollTop = chatTextArea.scrollHeight;
+        },
+        onPartialMessage: ({ completed: _, exec, payload }) =>
+            setTextAreaValue(value => {
+                const matches = exec(value);
+                return matches ? `${matches[1]}${payload}${matches[3]}` : value;
+            }),
+        username: () => usernameValue(),
+    });
 
     const onUsernameKeyDown = e => {
         if (e.key == "Enter") {
@@ -120,6 +55,10 @@ function Conversation() {
             onConnectClick();
         }
     };
+
+    const onConnectClick = () => {
+        wsStart();
+    }
 
     const onMessageKeyDown = e => {
         if (e.key == "Enter") {
@@ -131,19 +70,24 @@ function Conversation() {
     const onMessageSubmit = async () => {
         if (!connectDisabled()) {
             try {
-                await wsStartConnection();
+                await wsStart();
             }
             catch {
                 return;
             }
         }
-        const { send } = wsInvokeSend();
+        
         const msg = messageInputValue();
-        if (send && msg) {
-            send(msg);
+        if (msg) {
+            wsSend(msg);
             setMessageInputValue("");
         }
     };
+
+    window.onerror = (errorMsg, _url, _lineNumber) => {
+        setTextAreaValue(value => value + "Error occurred: " + errorMsg + "\n\n");
+        return false;
+    }
 
     return html`
         <div class="flex flex-col max-w-screen-xl mx-auto p-4 space-y-2">
@@ -204,3 +148,5 @@ function Conversation() {
 }
 
 render(App, document.body);
+
+
