@@ -122,6 +122,7 @@ async fn keepalive_websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse 
 async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     // By splitting, we can send and receive at the same time.
     let (mut sender, mut receiver) = stream.split();
+    let (client_tx, mut client_rx) = broadcast::channel(10);
 
     // Username gets set in the receive loop, if it's valid.
     let mut username = String::new();
@@ -169,15 +170,25 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     // Spawn the first task that will receive broadcast messages and send text
     // messages over the websocket to our client.
     let mut send_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
+        while let Ok(msg) = client_rx.recv().await {
             // In any websocket error, break loop.
             if sender.send(Message::Text(msg)).await.is_err() {
                 break;
             }
         }
     });
+    
+    let client_tx1 = client_tx.clone();
+    tokio::spawn(async move {
+        while let Ok(msg) = rx.recv().await {
+            if client_tx1.send(msg).is_err() {
+                break;
+            }
+        }
+    });
 
     // Clone things we want to pass (move) to the receiving task.
+    let state1 = state.clone();
     let tx = state.tx.clone();
     let model_tx = state.model_tx.clone();
     let name = username.clone();
@@ -185,7 +196,30 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     // Spawn a task that takes messages from the websocket, prepends the user
     // name, and sends them to all broadcast subscribers.
     let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(Message::Text(text))) = receiver.next().await {
+        while let Some(Ok(Message::Text(mut text))) = receiver.next().await {
+            if text.starts_with('!') {
+                text.make_ascii_uppercase();
+                let cmd_response = match text[1..].trim() {
+                    "USERS" => Ok(state1.user_set.lock().unwrap().iter().fold(
+                        String::with_capacity(128),
+                        |mut acc, x| {
+                            acc.push_str(x);
+                            acc.push_str(", ");
+                            acc
+                        },
+                    )),
+                    _ => Err("Invalid Command".to_string()),
+                };
+                match cmd_response {
+                    Ok(cmd_response) => {
+                        client_tx.send(format!("🤖 {cmd_response}")).unwrap();
+                    }
+                    Err(err_response) => {
+                        client_tx.send(format!("❓ {err_response}")).unwrap();
+                    },
+                }
+                continue;
+            }
             let chatbot_prefixes = ["hey ai", "hey chat", "hi ai", "hi chat"];
             for prefix in chatbot_prefixes {
                 if text.to_lowercase().starts_with(prefix) {
