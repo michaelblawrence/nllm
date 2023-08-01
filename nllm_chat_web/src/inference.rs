@@ -1,3 +1,4 @@
+use anyhow::Context;
 use aws_sdk_lambda::types::InvokeMode;
 use plane::ml::RngStrategy;
 use serde_json::json;
@@ -109,19 +110,25 @@ pub fn spawn_local_inference(
         while let Ok(prompt) = model_rx.recv().await {
             let ctx = ctx.clone();
 
-            tokio::task::spawn_blocking(move || {
-                let (model, state, rng, tx) = &*ctx;
-                match infer(&prompt, &model, &state, &rng) {
-                    Ok(messages) => {
-                        for msg in messages {
-                            tx.send(msg).unwrap();
-                        }
+            let prompt: Arc<str> = prompt.into();
+            let infer_task = tokio::task::spawn_blocking({
+                let prompt = prompt.clone();
+                move || {
+                    let (model, state, rng, tx) = &*ctx;
+                    let messages = infer(&prompt, &model, &state, &rng)?;
+                    for msg in messages {
+                        tx.send(msg)?;
                     }
-                    Err(_) => return,
-                };
-            })
-            .await
-            .unwrap();
+                    anyhow::Result::<()>::Ok(())
+                }
+            });
+
+            match infer_task.await.context("failed to join task") {
+                Ok(Err(e)) | Err(e) => {
+                    error!("Error performing model inference for prompt = '{prompt}': {e}");
+                }
+                _ => (),
+            }
         }
     });
 
