@@ -138,7 +138,7 @@ pub fn from_json(json: &str) -> Result<(RespondModel, ExtractedModelConfig)> {
     let char_mode = model
         .vocab()
         .iter()
-        .all(|(token, id)| *id == 0 || token.len() == 1);
+        .all(|(token, id)| *id == 0 || token.chars().count() == 1);
 
     state.char_mode = Some(char_mode);
 
