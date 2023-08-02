@@ -25,3 +25,10 @@ export function storageSetUsername(username) {
 export function toCallback(fnOrValue) {
     return typeof fnOrValue === "function" ? fnOrValue : (() => fnOrValue);
 }
+
+/**
+ * @param {Function} fn
+ */
+export function eventHandler(fn) {
+    return (() => fn);
+}
