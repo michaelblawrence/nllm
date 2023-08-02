@@ -16,23 +16,15 @@ async fn func(
         RngStrategy,
     )>,
 ) -> Result<Response<Body>, Error> {
-    let json = serde_json::to_string(&event.payload).unwrap();
-    info!("event json: {}", json);
-    let prompt_txt = event
-        .payload
-        .get("prompt")
-        .cloned()
-        .or_else(|| {
-            // fallback to html api request body
-            serde_json::from_str::<Value>(event.payload.get("body")?.as_str()?)
-                .ok()?
-                .get("prompt")
-                .cloned()
-        })
-        .context("request missing prompt field")?
-        .as_str()
-        .context("request prompt field invalid type")?
-        .to_owned();
+    let prompt_txt = extract_prompt(event)?;
+
+    // TODO: resolve this requirement another way
+    let make_lowercase = true;
+    let prompt_txt = if make_lowercase {
+        prompt_txt.to_lowercase().to_owned()
+    } else {
+        prompt_txt
+    };
 
     let (mut body_tx, body_rx) = Body::channel();
     let (tx, mut rx) = tokio::sync::broadcast::channel(100);
@@ -56,6 +48,25 @@ async fn func(
         .body(body_rx)?;
 
     Ok(resp)
+}
+
+fn extract_prompt(event: LambdaEvent<Value>) -> anyhow::Result<String> {
+    let prompt_txt = event
+        .payload
+        .get("prompt")
+        .cloned()
+        .or_else(|| {
+            // fallback to html api request body
+            serde_json::from_str::<Value>(event.payload.get("body")?.as_str()?)
+                .ok()?
+                .get("prompt")
+                .cloned()
+        })
+        .context("request missing prompt field")?
+        .as_str()
+        .context("request prompt field invalid type")?
+        .to_owned();
+    Ok(prompt_txt)
 }
 
 #[tokio::main]
