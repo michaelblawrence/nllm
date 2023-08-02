@@ -32,28 +32,31 @@ export function toCallback(fnOrValue) {
  * @param {Function} fn
  */
 export function runOnboarding(key, fn) {
+    const onboardingTask = getOnboardingTask(key);
+
+    if (!onboardingTask.completed) { 
+        fn();
+        onboardingTask.complete();
+    }
+}
+
+/**
+ * @param {string} key
+ */
+export function getOnboardingTask(key) {
     let storage_key = key.toUpperCase();
     const state = storageGetOnboardingProgress();
 
-    if (!state[storage_key]) { 
-        fn();
-        state[storage_key] = true;
-        storageSetOnboardingProgress(state);
-    }
-
-    function storageGetOnboardingProgress() {
-        try {
-            const json = localStorage.getItem(storageKeys.onboardingProgress) || "{}";
-            return JSON.parse(json);
+    return {
+        storage_key, 
+        completed: !!state[storage_key],
+        complete: () => {
+            if (!state[storage_key]) {
+                state[storage_key] = true;
+                storageSetOnboardingProgress(state);
+            }
         }
-        catch {
-            return {};
-        }
-    }
-    function storageSetOnboardingProgress(state) {
-        const json = JSON.stringify(state || {});
-        localStorage.setItem(storageKeys.onboardingProgress, json);
-    }
+    };
 }
 
 /**
@@ -61,4 +64,18 @@ export function runOnboarding(key, fn) {
  */
 export function eventHandler(fn) {
     return (() => fn);
+}
+
+function storageGetOnboardingProgress() {
+    try {
+        const json = localStorage.getItem(storageKeys.onboardingProgress) || "{}";
+        return JSON.parse(json);
+    }
+    catch {
+        return {};
+    }
+}
+function storageSetOnboardingProgress(state) {
+    const json = JSON.stringify(state || {});
+    localStorage.setItem(storageKeys.onboardingProgress, json);
 }

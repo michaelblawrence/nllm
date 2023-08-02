@@ -11,7 +11,7 @@ import html from "https://cdn.skypack.dev/solid-js/html";
 import { TopBar, Footer } from "./navigation.js";
 import { InsertEmojiIcon, SendMessageIcon, UploadImageIcon, UserIcon } from "./svg.js";
 import { eventHandler, storageGetUsername, generateDefaultUsername } from "./utils.js";
-import { createWebSocket } from "./realtime.js";
+import { createWebSocketChat } from "./realtime.js";
 
 function App() {
     return html`
@@ -30,14 +30,9 @@ function Conversation() {
     const [connectText, setConnectText] = createSignal(initialConnectText);
     const [connectDisabled, setConnectDisabled] = createSignal(false);
 
-    const chatTextArea = html`
-        <textarea class="block p-2.5 w-full h-[250px] text-sm text-gray-900 bg-gray-50 rounded-lg leading-tight border border-gray-300 focus:ring-green-500 focus:border-green-500 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-green-500 dark:focus:border-green-500"
-            rows="4" readonly>
-                ${textAreaValue}
-        </textarea>
-    `;
+    let chatTextAreaRef;
 
-    const [wsStart, wsSend] = createWebSocket({
+    const [wsStart, wsSend] = createWebSocketChat({
         onConnected: () => setConnectText("Joined"),
         onDisconnected: () => {
             setConnectText(initialConnectText);
@@ -45,7 +40,7 @@ function Conversation() {
         },
         onMessage: msg => {
             setTextAreaValue(value => value + msg + "\n\n");
-            chatTextArea.scrollTop = chatTextArea.scrollHeight;
+            chatTextAreaRef.scrollTop = chatTextAreaRef.scrollHeight;
         },
         onPartialMessage: ({ completed: _, exec, payload }) =>
             setTextAreaValue(value => {
@@ -126,7 +121,12 @@ function Conversation() {
                 </div>
             </div>
 
-            ${chatTextArea}
+
+            <textarea class="block p-2.5 w-full h-[250px] text-sm text-gray-900 bg-gray-50 rounded-lg leading-tight border border-gray-300 focus:ring-green-500 focus:border-green-500 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-green-500 dark:focus:border-green-500"
+                rows="4" readonly ref=${e => (chatTextAreaRef = e)}>
+                    ${textAreaValue}
+            </textarea>
+            
 
             <div>
                 <label for="chat" class="sr-only">Your message</label>
