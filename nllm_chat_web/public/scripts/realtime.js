@@ -43,6 +43,7 @@ export function createWebSocket({ onConnected, onDisconnected, onMessage, onPart
 
             websocket.onclose = function () {
                 console.log("connection closed");
+                onMessage("🚪 You have left the room for now. Tap 'Join Chat' to rejoin...");
                 onDisconnected();
             };
 
