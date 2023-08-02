@@ -1,6 +1,6 @@
 ///@ts-check
 
-import { storageSetUsername, toCallback, runOnboarding } from "./utils.js";
+import { storageSetUsername, toCallback, runOnboarding, getOnboardingTask } from "./utils.js";
 
 /**
  * @param {{
@@ -12,13 +12,23 @@ import { storageSetUsername, toCallback, runOnboarding } from "./utils.js";
  * }} options
  * @returns {[() => Promise<boolean>, (payload: string) => void]}
  */
-export function createWebSocket({ onConnected, onDisconnected, onMessage, onPartialMessage, username }) {
+export function createWebSocketChat({ onConnected, onDisconnected, onMessage, onPartialMessage, username }) {
     onConnected = toCallback(onConnected);
     onDisconnected = toCallback(onDisconnected);
     onMessage = toCallback(onMessage);
     username = toCallback(username);
 
+
     const state = { isConnected: false, locked: false, send: _data => { } };
+    const firstLoadTask = getOnboardingTask("FIRST_LOAD_DESCRIBE_OPERATION");
+    if (!firstLoadTask.completed) {
+        setTimeout(() => {
+            onMessage("👋 Welcome to ChatNLLM!");
+            onMessage("💡 Here you can join a room and chat with a not-large language model (or 'NLLM' for short)");
+            onMessage("💡 Once you join a room, you can chat with other users in your room too!");
+            onMessage("💡 ChatNLLM was designed for educational purposes, so bear with us if anything goes wrong!");
+        });
+    }
     const start = async () => {
         if (state.isConnected || state.locked) {
             return Promise.resolve(false);
@@ -105,6 +115,9 @@ export function createWebSocket({ onConnected, onDisconnected, onMessage, onPart
             state.send = data => {
                 try {
                     websocket.send(data);
+                    if (!firstLoadTask.completed) {
+                        firstLoadTask.complete();
+                    }
                     return true;
                 } catch (error) {
                     console.error("Failed to send user message", error);
