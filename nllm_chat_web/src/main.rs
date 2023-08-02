@@ -21,8 +21,12 @@ use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 use tracing::metadata::LevelFilter;
 
+use crate::tower_ext::ApiServiceExt;
+
 mod inference;
 mod model;
+mod tower_ext;
+
 struct AppState {
     // We require unique usernames. This tracks which usernames have been taken.
     user_set: Mutex<HashSet<String>>,
@@ -75,7 +79,7 @@ async fn main() {
         .route("/diagnostics/ws.js", get(diagnostics_ws_js))
         .route("/websocket", get(websocket_handler))
         .route("/keepalive", get(keepalive_websocket_handler))
-        .nest_service("/scripts", ServeDir::new("public/scripts"))
+        .nest_service("/scripts", ServeDir::new("public/scripts").no_cache())
         .nest_service("/icons", ServeDir::new("public/icons"))
         .nest_service("/images", ServeDir::new("public/images"))
         .with_state(app_state);
@@ -177,7 +181,7 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
             }
         }
     });
-    
+
     let client_tx1 = client_tx.clone();
     tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
@@ -216,7 +220,7 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
                     }
                     Err(err_response) => {
                         client_tx.send(format!("❓ {err_response}")).unwrap();
-                    },
+                    }
                 }
                 continue;
             }
