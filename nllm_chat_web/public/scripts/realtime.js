@@ -69,7 +69,6 @@ export function createWebSocket({ onConnected, onDisconnected, onMessage, onPart
                 }
 
                 if (e.data.startsWith(chatBotCompletedPrefix)) {
-                    console.log("received message: " + e.data);
                     let wasMatch = false;
                     const exec = x => {
                         const matches = getMatches(x);
@@ -78,6 +77,7 @@ export function createWebSocket({ onConnected, onDisconnected, onMessage, onPart
                     };
                     onPartialMessage({ completed: true, exec, payload: e.data });
                     if (wasMatch) {
+                        console.log("received message: " + e.data);
                         return;
                     }
                 }

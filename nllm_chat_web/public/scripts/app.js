@@ -2,6 +2,7 @@
 import {
     createEffect,
     createSignal,
+    mergeProps,
     onCleanup,
 } from "https://cdn.skypack.dev/solid-js";
 import { render } from "https://cdn.skypack.dev/solid-js/web";
@@ -9,7 +10,7 @@ import html from "https://cdn.skypack.dev/solid-js/html";
 
 import { TopBar, Footer } from "./navigation.js";
 import { InsertEmojiIcon, SendMessageIcon, UploadImageIcon, UserIcon } from "./svg.js";
-import { storageGetUsername, generateDefaultUsername } from "./utils.js";
+import { eventHandler, storageGetUsername, generateDefaultUsername } from "./utils.js";
 import { createWebSocket } from "./realtime.js";
 
 function App() {
@@ -76,7 +77,7 @@ function Conversation() {
                 return;
             }
         }
-        
+
         const msg = messageInputValue();
         if (msg) {
             wsSend(msg);
@@ -109,10 +110,7 @@ function Conversation() {
                             onInput=${e => setUsernameValue(e.currentTarget.value)}
                             onKeyDown=${onUsernameKeyDown}>
                     </form>
-                    <button class="text-white absolute right-2.5 bottom-2.5 bg-green-700 hover:bg-green-800 focus:ring-4 focus:outline-none focus:ring-green-300 font-medium rounded-lg text-sm px-4 py-2 dark:bg-green-600 dark:hover:bg-green-700 dark:focus:ring-green-800"
-                        type="submit" disabled=${connectDisabled} onClick=${onConnectClick}>
-                            Join Chat
-                    </button>
+                    <${Button} disabled=${connectDisabled} onClick=${eventHandler(onConnectClick)} text="Join Chat" />
                 </div>
             </div>
 
@@ -144,6 +142,26 @@ function Conversation() {
             </div>
 
         </div>
+    `;
+}
+
+function Button(props) {
+    const merged = mergeProps({ disabled: () => false, text: "Button", onClick: () => { } }, props);
+
+    const connectClassList = () => {
+        const enabledClassList = "bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 focus:ring-4 focus:ring-green-300 dark:focus:ring-green-800";
+        const disabledClassList = "bg-gray-200 dark:bg-gray-600 text-gray-300";
+
+        const disabled = typeof merged.disabled === "function" ? merged.disabled() : merged.disabled;
+        return { [disabled ? disabledClassList : enabledClassList]: true };
+    };
+
+    return html`
+        <button class="text-white absolute right-2.5 bottom-2.5 focus:outline-none font-medium rounded-lg text-sm px-4 py-2"
+            classList=${connectClassList}
+            type="submit" disabled=${merged.disabled} onClick=${merged.onClick}>
+                ${merged.text}
+        </button>
     `;
 }
 
