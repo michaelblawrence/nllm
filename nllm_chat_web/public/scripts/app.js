@@ -23,9 +23,11 @@ function App() {
 
 function Conversation() {
     const initialUsername = storageGetUsername() || generateDefaultUsername();
+    const initialConnectText = "Join Chat";
     const [messageInputValue, setMessageInputValue] = createSignal("");
     const [usernameValue, setUsernameValue] = createSignal(initialUsername);
     const [textAreaValue, setTextAreaValue] = createSignal("");
+    const [connectText, setConnectText] = createSignal(initialConnectText);
     const [connectDisabled, setConnectDisabled] = createSignal(false);
 
     const chatTextArea = html`
@@ -36,8 +38,11 @@ function Conversation() {
     `;
 
     const [wsStart, wsSend] = createWebSocket({
-        onConnected: () => setConnectDisabled(true),
-        onDisconnected: () => setConnectDisabled(false),
+        onConnected: () => setConnectText("Joined"),
+        onDisconnected: () => {
+            setConnectText(initialConnectText);
+            setConnectDisabled(false);
+        },
         onMessage: msg => {
             setTextAreaValue(value => value + msg + "\n\n");
             chatTextArea.scrollTop = chatTextArea.scrollHeight;
@@ -50,6 +55,13 @@ function Conversation() {
         username: () => usernameValue(),
     });
 
+    const startConnection = async () => {
+        if (connectDisabled()) { return false; }
+        setConnectDisabled(true);
+        setConnectText(connectText => connectText == initialConnectText ? "Joining..." : connectText);
+        return await wsStart();
+    }
+
     const onUsernameKeyDown = e => {
         if (e.key == "Enter") {
             e.preventDefault();
@@ -58,7 +70,7 @@ function Conversation() {
     };
 
     const onConnectClick = () => {
-        wsStart();
+        startConnection();
     }
 
     const onMessageKeyDown = e => {
@@ -71,7 +83,7 @@ function Conversation() {
     const onMessageSubmit = async () => {
         if (!connectDisabled()) {
             try {
-                await wsStart();
+                await startConnection();
             }
             catch {
                 return;
@@ -110,7 +122,7 @@ function Conversation() {
                             onInput=${e => setUsernameValue(e.currentTarget.value)}
                             onKeyDown=${onUsernameKeyDown}>
                     </form>
-                    <${Button} disabled=${connectDisabled} onClick=${eventHandler(onConnectClick)} text="Join Chat" />
+                    <${Button} disabled=${() => connectDisabled} onClick=${eventHandler(onConnectClick)} text=${() => connectText} />
                 </div>
             </div>
 
@@ -146,7 +158,7 @@ function Conversation() {
 }
 
 function Button(props) {
-    const merged = mergeProps({ disabled: () => false, text: "Button", onClick: () => { } }, props);
+    const merged = mergeProps({ disabled: () => false, text: () => "Button", onClick: () => { } }, props);
 
     const connectClassList = () => {
         const enabledClassList = "bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 focus:ring-4 focus:ring-green-300 dark:focus:ring-green-800";
@@ -156,11 +168,13 @@ function Button(props) {
         return { [disabled ? disabledClassList : enabledClassList]: true };
     };
 
+    const textContent = () => typeof merged.text === "function" ? merged.text() : merged.text;
+
     return html`
         <button class="text-white absolute right-2.5 bottom-2.5 focus:outline-none font-medium rounded-lg text-sm px-4 py-2"
             classList=${connectClassList}
             type="submit" disabled=${merged.disabled} onClick=${merged.onClick}>
-                ${merged.text}
+                ${textContent}
         </button>
     `;
 }
