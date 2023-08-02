@@ -1,6 +1,6 @@
 ///@ts-check
 
-import { storageSetUsername, toCallback } from "./utils.js";
+import { storageSetUsername, toCallback, runOnboarding } from "./utils.js";
 
 /**
  * @param {{
@@ -10,6 +10,7 @@ import { storageSetUsername, toCallback } from "./utils.js";
  *     onPartialMessage: (event: { completed: boolean; exec: (chatHistory: string) => string[] | null; payload: string; }) => void;
  *     username: () => string;
  * }} options
+ * @returns {[() => Promise<boolean>, (payload: string) => void]}
  */
 export function createWebSocket({ onConnected, onDisconnected, onMessage, onPartialMessage, username }) {
     onConnected = toCallback(onConnected);
@@ -17,14 +18,13 @@ export function createWebSocket({ onConnected, onDisconnected, onMessage, onPart
     onMessage = toCallback(onMessage);
     username = toCallback(username);
 
-    const state = { isConnected: false, send: _data => { } };
+    const state = { isConnected: false, locked: false, send: _data => { } };
     const start = async () => {
-        if (state.isConnected) {
+        if (state.isConnected || state.locked) {
             return Promise.resolve(false);
         }
 
-        state.isConnected = true;
-        onConnected();
+        state.locked = true;
         return new Promise((resolve, reject) => {
             const websocket = new WebSocket(document.location.origin.replace(/^http/, "ws") + "/websocket");
 
@@ -33,17 +33,26 @@ export function createWebSocket({ onConnected, onDisconnected, onMessage, onPart
                 const usernameValue = username();
                 websocket.send(usernameValue);
                 storageSetUsername(usernameValue);
+
+                state.locked = false;
                 resolve(true);
             };
 
             websocket.onerror = function (e) {
-                onMessage("Connection error occured");
+                onMessage("There is an issue with your connection. Please try again later...");
+
+                state.locked = false;
                 reject(e);
             };
 
             websocket.onclose = function () {
-                console.log("connection closed");
-                onMessage("🚪 You have left the room for now. Tap 'Join Chat' to rejoin...");
+                if (state.isConnected) {
+                    console.log("connection closed");
+                    onMessage("🚪 You have left the room for now. Tap 'Join Chat' to rejoin...");
+                    state.isConnected = false;
+                } else {
+                    onMessage("🔌 You are not in a room. Tap 'Join Chat' to join...");
+                }
                 onDisconnected();
             };
 
@@ -70,6 +79,12 @@ export function createWebSocket({ onConnected, onDisconnected, onMessage, onPart
                 }
 
                 if (e.data.startsWith(chatBotCompletedPrefix)) {
+                    if (!state.isConnected) {
+                        state.isConnected = true;
+                        onConnected();
+                        onMessage("👋 You have joined the room. You can now talk to others users, and to our AI called 'Chat'");
+                        runOnboarding("PROMPT_TO_START_CONVO", () => onMessage("💡 To get started, why not introduce yourself or say hello to 'Chat'?"));
+                    }
                     let wasMatch = false;
                     const exec = x => {
                         const matches = getMatches(x);
@@ -87,7 +102,16 @@ export function createWebSocket({ onConnected, onDisconnected, onMessage, onPart
                 onMessage(e.data);
             };
 
-            state.send = data => websocket.send(data);
+            state.send = data => {
+                try {
+                    websocket.send(data);
+                    return true;
+                } catch (error) {
+                    console.error("Failed to send user message", error);
+                    onMessage("😢 Message could not send. Please try send again, or refresh the page");
+                    return false;
+                }
+            };
         });
     };
 
