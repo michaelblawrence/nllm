@@ -1,7 +1,8 @@
 ///@ts-check
 
 const storageKeys = {
-    lastUsername: "NLLM__LAST_USERNAME"
+    lastUsername: "NLLM__LAST_USERNAME",
+    onboardingProgress: "NLLM__ONBOARDING_PROGRESS"
 };
 
 export function generateDefaultUsername() {
@@ -24,6 +25,35 @@ export function storageSetUsername(username) {
 
 export function toCallback(fnOrValue) {
     return typeof fnOrValue === "function" ? fnOrValue : (() => fnOrValue);
+}
+
+/**
+ * @param {string} key
+ * @param {Function} fn
+ */
+export function runOnboarding(key, fn) {
+    let storage_key = key.toUpperCase();
+    const state = storageGetOnboardingProgress();
+
+    if (!state[storage_key]) { 
+        fn();
+        state[storage_key] = true;
+        storageSetOnboardingProgress(state);
+    }
+
+    function storageGetOnboardingProgress() {
+        try {
+            const json = localStorage.getItem(storageKeys.onboardingProgress) || "{}";
+            return JSON.parse(json);
+        }
+        catch {
+            return {};
+        }
+    }
+    function storageSetOnboardingProgress(state) {
+        const json = JSON.stringify(state || {});
+        localStorage.setItem(storageKeys.onboardingProgress, json);
+    }
 }
 
 /**
