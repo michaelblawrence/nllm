@@ -18,8 +18,15 @@ export function createWebSocketChat({ onConnected, onDisconnected, onMessage, on
     onMessage = toCallback(onMessage);
     username = toCallback(username);
 
-
-    const state = { isConnected: false, locked: false, send: _data => { } };
+    /**
+     * @type {{
+     *      isConnected: boolean;
+     *      locked: boolean;
+     *      pingTimeoutHandle: number | null;
+     *      send: (data: string) => void;
+     *  }}
+     * */
+    const state = { isConnected: false, locked: false, pingTimeoutHandle: null, send: _data => { } };
     const firstLoadTask = getOnboardingTask("FIRST_LOAD_DESCRIBE_OPERATION");
     if (!firstLoadTask.completed) {
         setTimeout(() => {
@@ -69,6 +76,7 @@ export function createWebSocketChat({ onConnected, onDisconnected, onMessage, on
             websocket.onmessage = function (e) {
                 const chatBotPartialPrefix = "[CHAT_PARTIAL]: ";
                 const chatBotCompletedPrefix = "Chat: ";
+                const pingMessage = "!PING";
                 const getMatches = value => {
                     const padIdx = value.lastIndexOf("　");
                     if (padIdx < 0)
@@ -80,6 +88,19 @@ export function createWebSocketChat({ onConnected, onDisconnected, onMessage, on
                     const chatEndIdx = padIdx + 1;
                     return [value, value.substring(0, chatStartIdx), value.substring(chatStartIdx, chatEndIdx), value.substring(chatEndIdx)];
                 };
+
+                state.pingTimeoutHandle && clearTimeout(state.pingTimeoutHandle);
+                state.pingTimeoutHandle = setTimeout(() => {
+                    console.log("Connection timed out on client");
+                    try {
+                        websocket.close();
+                    } catch { }
+                }, 20000);
+
+                if (e.data == pingMessage) {
+                    websocket.send("!PONG");
+                    return;
+                }
 
                 if (e.data.startsWith(chatBotPartialPrefix)) {
                     const partial = e.data.substring(chatBotPartialPrefix.length);
