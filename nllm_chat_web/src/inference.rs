@@ -48,11 +48,11 @@ pub async fn spawn_lambda_inference_client(
             use_beta_function,
         }) = model_rx.recv().await
         {
-            info!("Resolving lambda function url");
             // TODO: consider moving to env var
-            let lambda_qualifier = Some("beta").filter(|_| use_beta_function);
+            let lambda_qualifier = if use_beta_function { "beta" } else { "prod" };
+            info!("Resolving lambda function url (version = '{lambda_qualifier}')");
             let function_url =
-                match get_lambda_funtion_url(&client, &lambda_arn, lambda_qualifier).await {
+                match get_lambda_funtion_url(&client, &lambda_arn, Some(lambda_qualifier)).await {
                     Ok(url) => url,
                     Err(e) => {
                         error!("failed to retrieve lambda url: {e}");
@@ -60,7 +60,7 @@ pub async fn spawn_lambda_inference_client(
                     }
                 };
 
-            info!("Requesting inference from remote");
+            info!("Requesting inference from remote url = {function_url}");
             let body = json!({ "prompt": &prompt });
             let response = http_client.post(&function_url).json(&body).send().await;
             match response {
@@ -91,7 +91,7 @@ pub async fn spawn_lambda_inference_client(
                         last_line.push_str(&msg);
                         tx.send(msg).unwrap();
                     }
-                    info!("Completed streaming inference response from remote: {last_line}");
+                    info!("Completed streaming inference response from remote: response = `{last_line}`");
                 }
                 Err(e) => error!("Error starting inference streaming from remote: {e}"),
             }
