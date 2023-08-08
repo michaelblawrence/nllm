@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{info, error};
+use tracing::{error, info};
 
 use std::{
     ops::ControlFlow,
@@ -9,7 +9,8 @@ use std::{
 };
 
 use plane::ml::{
-    embeddings::builder::EmbeddingBuilder, seq2seq::transformer::CharacterTransformer, NodeValue, gdt::GenerativeDecoderTransformer,
+    embeddings::builder::EmbeddingBuilder, gdt::GenerativeDecoderTransformer,
+    seq2seq::transformer::CharacterTransformer, NodeValue,
 };
 
 use crate::{model::MLModel, training};
@@ -25,7 +26,7 @@ pub enum TrainerMessage {
     WriteEmbeddingTsvToDisk,
     RenameOutputLabel(String),
     WriteModelToDisk,
-    WriteModelAndMetadataToDisk(TrainerStateMetadata),
+    WriteModelAndMetadataToDisk(TrainerStateMetadata, TrainerModelCheckpointSource),
     MultiplyLearnRateBy(NodeValue),
     IncreaseMaxRounds(usize),
     PredictRandomPhrase,
@@ -82,16 +83,23 @@ impl TrainerMessage {
             TrainerMessage::WriteModelToDisk => {
                 TrainerHandleActions::DispatchWithMetadata(TrainerMessage::WriteModelToDisk)
             }
-            TrainerMessage::WriteModelAndMetadataToDisk(metadata) => {
+            TrainerMessage::WriteModelAndMetadataToDisk(metadata, source) => {
                 let path = training::writer::write_model_to_disk(
                     model,
                     &config,
                     &metadata,
                     "embed",
-                    &config.output_dir,
-                    &config.output_label,
+                    config.output_dir.as_deref(),
+                    config.output_label.as_deref(),
+                    if let TrainerModelCheckpointSource::Autosave = source {
+                        ".backup.json"
+                    } else {
+                        ".json"
+                    },
                 );
-                info!("Model written to disk: {}", path.to_string_lossy());
+                if let TrainerModelCheckpointSource::User = source {
+                    info!("Model written to disk: {}", path.to_string_lossy());
+                }
                 TrainerHandleActions::Nothing
             }
             TrainerMessage::WriteStatsToDisk => {
@@ -140,9 +148,10 @@ impl TrainerMessage {
     }
     pub fn create_response(&self, metadata: TrainerStateMetadata) -> Option<Self> {
         match self {
-            TrainerMessage::WriteModelToDisk => {
-                Some(TrainerMessage::WriteModelAndMetadataToDisk(metadata))
-            }
+            TrainerMessage::WriteModelToDisk => Some(TrainerMessage::WriteModelAndMetadataToDisk(
+                metadata,
+                TrainerModelCheckpointSource::User,
+            )),
             TrainerMessage::PlotTrainingLossGraph => {
                 Some(TrainerMessage::PlotTrainingLossGraphDispatch(metadata))
             }
@@ -180,10 +189,10 @@ impl TrainerHandleActions {
         match self {
             TrainerHandleActions::Nothing => (),
             TrainerHandleActions::LearnRateMulMut(factor) => {
-                let old_learn_rate = state.learn_rate;
-                state.learn_rate *= factor;
-                let learn_rate = state.learn_rate;
-                info!("Changed learn rate from {old_learn_rate} to {learn_rate}");
+                let old_learn_rate = state.learn_rate();
+                let new_learn_rate = old_learn_rate * factor;
+                state.set_learn_rate(new_learn_rate);
+                info!("Changed learn rate from {old_learn_rate} to {new_learn_rate}");
             }
             TrainerHandleActions::TogglePrintAllStatus => {
                 state.force_report_all = !state.force_report_all
@@ -219,13 +228,13 @@ impl TrainerHandleActions {
                     if let Some(_) = state.model.as_embedding() {
                         match EmbeddingBuilder::from_snapshot(&snapshot).and_then(|x| x.build()) {
                             Ok(model) => {
-                                state.model = model.into();
+                                state.model = M::from_embedding(model, state.learn_rate());
                                 Ok(())
                             }
                             Err(e) => Err(e),
                         }
                     } else {
-                        panic!("can not reload s2s yet")
+                        Err(anyhow!("can not reload s2s yet"))
                     }
                 } else {
                     Err(anyhow!(
@@ -284,13 +293,18 @@ impl TrainerHandleActions {
                         new_shape, old_shape
                     );
                     }
-                    new_embedding.into()
+                    M::from_embedding(new_embedding, new_state.learn_rate)
                 } else if let Some(_) = state.model.as_s2s() {
                     let new_s2s = serde_json::from_str::<CharacterTransformer>(&snapshot).unwrap();
                     M::from_s2s(new_s2s, new_state.learn_rate)
                 } else if let Some(_) = state.model.as_gdt() {
-                    let new_gdt = serde_json::from_str::<GenerativeDecoderTransformer>(&snapshot).unwrap();
-                    M::from_gdt(new_gdt, new_state.learn_rate)
+                    let new_gdt =
+                        serde_json::from_str::<GenerativeDecoderTransformer>(&snapshot).unwrap();
+                    M::from_gdt(
+                        new_gdt,
+                        new_state.learn_rate,
+                        state.sample_from_pattern.clone(),
+                    )
                 } else {
                     panic!("can not restore unknown model");
                 };
@@ -303,6 +317,12 @@ impl TrainerHandleActions {
         }
         ControlFlow::Continue(())
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TrainerModelCheckpointSource {
+    User,
+    Autosave,
 }
 
 pub type TrainerHandleSender<T> = mpsc::Sender<T>;

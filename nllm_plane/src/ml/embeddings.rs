@@ -171,7 +171,7 @@ impl Embedding {
             .collect()
     }
 
-    pub fn sample_probabilities(&self, context_tokens: &[&str]) -> Result<LayerValues> {
+    pub fn sample_probabilities<T: AsRef<str>>(&self, context_tokens: &[T]) -> Result<LayerValues> {
         let network_input = self.get_padded_network_input(context_tokens)?;
         let output = self.network.compute(network_input)?;
         let probabilities = self.compute_probabilities(&output)?;
@@ -188,7 +188,7 @@ impl Embedding {
         Ok(probabilities)
     }
 
-    pub fn predict_next(&self, last_words: &[&str]) -> Result<String> {
+    pub fn predict_next<T: AsRef<str>>(&self, last_words: &[T]) -> Result<String> {
         let probabilities = self.sample_probabilities(last_words)?;
         let sampled_idx = self.rng.sample_uniform(&probabilities)?;
         let token = self.query_token(sampled_idx).cloned();
@@ -250,20 +250,21 @@ impl Embedding {
     }
 
     pub fn predict_iter<'a>(&'a self, seed_word: &str) -> impl Iterator<Item = String> + 'a {
+        let seed_word = seed_word.to_string(); // TODO: review whether really need to clone here to satisfy lifetimes?
         self.predict_from_iter(&[seed_word])
     }
 
-    pub fn predict_from_iter<'a>(
+    pub fn predict_from_iter<'a, T: AsRef<str>>(
         &'a self,
-        seed_tokens: &[&str],
+        seed_tokens: &[T],
     ) -> impl Iterator<Item = String> + 'a {
         let mut token_counts = HashMap::new();
         let (curr_token, seed_tokens) = seed_tokens
             .split_last()
             .expect("should have at lease one element");
 
-        let mut curr_token = curr_token.to_string();
-        let mut context_tokens = VecDeque::from_iter(seed_tokens.iter().map(|x| x.to_string()));
+        let mut curr_token = curr_token.as_ref().to_owned();
+        let mut context_tokens = VecDeque::from_iter(seed_tokens.iter().map(|x| x.as_ref().to_owned()));
 
         let input_stride_width = self.input_stride_width();
         let max_len = |token: &str| if token.len() > 1 { 4 } else { 40 };
