@@ -7,7 +7,7 @@ use std::{
 };
 
 use plane::ml::RngStrategy;
-use respond::{ExtractedModelConfig, PromptConfig};
+use respond::{ExtractedModelConfig, PromptChatMode, PromptConfig};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -27,6 +27,18 @@ fn run(model_fpath: &mut Option<String>) -> bool {
 
     println!("Starting... (character input mode = {char_mode})");
     println!("   - Commands available: [ '.load <path>' | '.reload' | '.supervise' | '.reset' | '.quit' ]");
+
+    // TODO: add inference mode hint to model json?
+    let detected_human_ctx_chat_format = model.description() == "GenerativeDecoderTransformer"
+        && model.vocab().keys().any(|token| token.starts_with("###"));
+
+    let chat_mode = if detected_human_ctx_chat_format {
+        println!("Detected triple hash prompt encoding");
+        PromptChatMode::TripleHashHumanPrompt
+    } else {
+        PromptChatMode::DirectPrompt
+    };
+    
     println!("");
 
     let stdin = io::stdin();
@@ -68,6 +80,7 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             use_gdt: state.use_gdt,
             char_mode,
             vocab_supervised_predictions_enabled,
+            chat_mode,
             vocab: vocab.as_ref(),
         };
         let response = match respond::process_prompt(&model, &rng, &input_txt, &config) {

@@ -1,17 +1,17 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fs::File,
     io::Read,
     path::Path,
 };
 
 use anyhow::{bail, Context, Result};
-use itertools::Itertools;
+
 use plane::ml::{
     embeddings::{builder::EmbeddingBuilder, Embedding},
     gdt::GenerativeDecoderTransformer,
     seq2seq::transformer::CharacterTransformer,
-    LayerValues, RngStrategy, SamplingRng,
+    LayerValues, RngStrategy,
 };
 
 pub enum RespondModel {
@@ -61,30 +61,60 @@ impl RespondModel {
     }
     pub fn predict_from_iter<'a>(
         &'a self,
-        seed_tokens: &[&str],
+        input_txt: &str,
     ) -> Box<dyn Iterator<Item = String> + 'a> {
         match self {
             RespondModel::Embedding(embedding) => {
-                Box::new(embedding.predict_from_iter(seed_tokens))
+                let append_space = embedding.vocab().contains_key(" ");
+                let token_sequence: Vec<String> =
+                    to_context_tokens(input_txt, true, append_space).collect();
+                Box::new(embedding.predict_from_iter(&token_sequence))
             }
-            RespondModel::S2S(s2s) => Box::new(
-                s2s.predict_from_iter(&to_chars(seed_tokens))
-                    .map(|c| c.to_string()),
-            ),
-            RespondModel::GDT(gdt) => Box::new(
-                gdt.predict_from_iter(&gdt.vocab().encode(&seed_tokens.join("")).unwrap())
-                    .map(|c| c.appendable()),
-            ),
+            RespondModel::S2S(s2s) => {
+                let mut token_sequence: Vec<char> = input_txt.chars().collect();
+                if s2s.vocab().contains_key(&' ') {
+                    token_sequence.push(' ');
+                }
+                Box::new(
+                    s2s.predict_from_iter(&token_sequence)
+                        .map(|c| c.to_string()),
+                )
+            }
+            RespondModel::GDT(gdt) => {
+                let token_sequence = match gdt.vocab().encode(input_txt) {
+                    Ok(token_sequence) => token_sequence,
+                    Err(e) => {
+                        println!("Failed to encode prompt sequence: {e}");
+                        return Box::new(std::iter::empty());
+                    }
+                };
+                Box::new(
+                    gdt.predict_from_iter(&token_sequence)
+                        .map(|c| c.appendable()),
+                )
+            }
         }
     }
 
-    pub fn predict_next(&self, last_words: &[&str]) -> Result<String> {
+    pub fn predict_next(&self, input_txt: &str) -> Result<String> {
         match self {
-            RespondModel::Embedding(embedding) => embedding.predict_next(last_words),
-            RespondModel::S2S(s2s) => Ok(s2s.predict_next(&to_chars(last_words))?.to_string()),
-            RespondModel::GDT(gdt) => Ok(gdt
-                .predict_next(&gdt.vocab().encode(&last_words.join("")).unwrap())?
-                .to_string()),
+            RespondModel::Embedding(embedding) => {
+                let append_space = embedding.vocab().contains_key(" ");
+                let token_sequence: Vec<String> =
+                    to_context_tokens(input_txt, true, append_space).collect();
+                embedding.predict_next(&token_sequence)
+            }
+            RespondModel::S2S(s2s) => {
+                let mut token_sequence: Vec<char> = input_txt.chars().collect();
+                if s2s.vocab().contains_key(&' ') {
+                    token_sequence.push(' ');
+                }
+                Ok(s2s.predict_next(&token_sequence)?.to_string())
+            }
+            RespondModel::GDT(gdt) => {
+                let token_sequence = gdt.vocab().encode(input_txt)?;
+                Ok(gdt.predict_next(&token_sequence)?.to_string())
+            }
         }
     }
 
@@ -96,19 +126,27 @@ impl RespondModel {
         }
     }
 
-    pub fn sample_probabilities(&self, context_tokens: &[&str]) -> Result<LayerValues> {
+    pub fn sample_probabilities(&self, input_txt: &str) -> Result<LayerValues> {
         match self {
-            RespondModel::Embedding(embedding) => embedding.sample_probabilities(context_tokens),
-            RespondModel::S2S(s2s) => s2s.sample_probabilities(&to_chars(context_tokens)),
+            RespondModel::Embedding(embedding) => {
+                let append_space = embedding.vocab().contains_key(" ");
+                let token_sequence: Vec<String> =
+                    to_context_tokens(input_txt, true, append_space).collect();
+                embedding.sample_probabilities(&token_sequence)
+            }
+            RespondModel::S2S(s2s) => {
+                let mut token_sequence: Vec<char> = input_txt.chars().collect();
+                if s2s.vocab().contains_key(&' ') {
+                    token_sequence.push(' ');
+                }
+                s2s.sample_probabilities(&token_sequence)
+            }
             RespondModel::GDT(gdt) => {
-                gdt.sample_probabilities(&gdt.vocab().encode(&context_tokens.join("")).unwrap())
+                let token_sequence = gdt.vocab().encode(input_txt)?;
+                gdt.sample_probabilities(&token_sequence)
             }
         }
     }
-}
-
-fn to_chars(value: &[&str]) -> Vec<char> {
-    value.iter().flat_map(|x| x.chars().next()).collect_vec()
 }
 
 pub fn load(model_fpath: Option<&str>) -> Result<(RespondModel, ExtractedModelConfig)> {
@@ -154,8 +192,15 @@ pub fn from_json(json: &str) -> Result<(RespondModel, ExtractedModelConfig)> {
 pub struct PromptConfig<'a> {
     pub use_gdt: bool,
     pub char_mode: bool,
-    pub vocab_supervised_predictions_enabled: bool,
-    pub vocab: Option<&'a HashSet<String>>,
+    pub vocab_supervised_predictions_enabled: bool, // TODO: remove
+    pub chat_mode: PromptChatMode,
+    pub vocab: Option<&'a HashSet<String>>, // TODO: remove
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PromptChatMode {
+    DirectPrompt,
+    TripleHashHumanPrompt,
 }
 
 pub fn process_prompt<'a>(
@@ -165,21 +210,25 @@ pub fn process_prompt<'a>(
     PromptConfig {
         use_gdt,
         char_mode,
-        vocab_supervised_predictions_enabled,
-        vocab,
+        vocab_supervised_predictions_enabled: _,
+        chat_mode,
+        vocab: _,
     }: &PromptConfig,
-) -> Result<Box<dyn Iterator<Item = (String, &'a str)> + 'a>> {
+) -> Result<impl Iterator<Item = (String, &'a str)> + 'a> {
     let (char_mode, use_gdt) = (*char_mode, *use_gdt);
-    let vocab_supervised_predictions_enabled = *vocab_supervised_predictions_enabled;
     let append_space = char_mode && model.vocab().contains_key(" ");
 
-    let default_min_word_len = 3;
+    let prompt_txt = match chat_mode {
+        PromptChatMode::DirectPrompt => input_txt.to_string(),
+        PromptChatMode::TripleHashHumanPrompt => {
+            format!(
+                r#"###human: {} ###ctx__: "" ###chat_: "#,
+                input_txt.to_ascii_lowercase()
+            )
+        }
+    };
 
-    let context_tokens: Vec<String> =
-        to_context_tokens(&input_txt, char_mode, append_space).collect();
-    let context_tokens: Vec<&str> = context_tokens.iter().map(|x| x.as_str()).collect();
-
-    match model.predict_next(&context_tokens) {
+    match model.predict_next(&prompt_txt) {
         Err(e) => {
             println!("Error retrieving response: ({e})");
             return Err(e);
@@ -187,17 +236,7 @@ pub fn process_prompt<'a>(
         _ => (),
     };
 
-    let response: Box<dyn Iterator<Item = String>> = if let (Some(vocab), true) = (
-        vocab.as_ref(),
-        char_mode && vocab_supervised_predictions_enabled,
-    ) {
-        Box::new(
-            predict_supervised(&model, &context_tokens, vocab, default_min_word_len, &rng)
-                .into_iter(),
-        )
-    } else {
-        model.predict_from_iter(&context_tokens)
-    };
+    let response = model.predict_from_iter(&prompt_txt);
 
     let response: Box<dyn Iterator<Item = (String, &str)>> = if use_gdt {
         Box::new(response.into_iter().map(|x| (x, "")))
@@ -206,7 +245,7 @@ pub fn process_prompt<'a>(
             Box::new(response.into_iter().map(|x| (x, "")))
         } else {
             Box::new(
-                [(input_txt.to_string(), "")]
+                [(prompt_txt.to_string(), "")]
                     .into_iter()
                     .chain(response.into_iter().skip(1).map(|x| (x, ""))),
             )
@@ -215,7 +254,14 @@ pub fn process_prompt<'a>(
         Box::new(response.into_iter().map(|x| (x, " ")))
     };
 
-    Ok(response)
+    match chat_mode {
+        PromptChatMode::DirectPrompt => Ok(response),
+        PromptChatMode::TripleHashHumanPrompt => {
+            Ok(Box::new(response.take_while(|(token, _separator)| {
+                !token.trim_start().starts_with("###")
+            })))
+        }
+    }
 }
 
 fn read_model_file(fpath_arg: Option<&str>) -> Option<String> {
@@ -234,10 +280,11 @@ fn read_model_file(fpath_arg: Option<&str>) -> Option<String> {
         }
     };
 
-    let mut file = File::open(path).unwrap();
+    let mut file = File::open(path).expect("failed to open file");
     let mut buf = String::new();
 
-    file.read_to_string(&mut buf).unwrap();
+    file.read_to_string(&mut buf)
+        .expect("failed to read file contents");
 
     Some(buf)
 }
@@ -260,127 +307,6 @@ fn to_context_tokens<'a>(
             .collect()
     };
     context_tokens.into_iter()
-}
-
-fn predict_supervised(
-    model: &RespondModel,
-    context_tokens: &Vec<&str>,
-    vocab: &HashSet<String>,
-    min_word_len: usize,
-    rng: &RngStrategy,
-) -> Vec<String> {
-    let ctrl_token = model.control_vocab();
-    let word_separator_token = " ".to_string();
-    let max_vocab_len: usize = vocab.iter().map(|x| x.len()).max().unwrap();
-
-    let mut context_queue = VecDeque::from_iter(context_tokens.iter().map(|x| x.to_string()));
-    let mut word_queue = vec![];
-    let mut generated_queue = vec![];
-    let mut last_token = context_tokens.last().cloned().unwrap_or(&ctrl_token);
-
-    while last_token != &ctrl_token {
-        let context_tokens_str: Vec<&str> = context_queue.iter().map(|x| x.as_str()).collect();
-        let generated_token = match model.predict_next(&context_tokens_str) {
-            Ok(token) => token,
-            Err(e) => {
-                println!("Error retrieving response: ({e})");
-                continue;
-            }
-        };
-
-        if !is_token_alphabetic(&generated_token) {
-            word_queue.clear();
-        } else if &generated_token == &ctrl_token {
-            break;
-        } else {
-            word_queue.push(generated_token.to_string());
-        }
-
-        generated_queue.push(generated_token.to_string());
-        context_queue.push_back(generated_token);
-
-        let possible_vocab_word = word_queue.join("");
-        let insert_separator = if vocab.contains(&possible_vocab_word) {
-            true
-        } else if (min_word_len..max_vocab_len)
-            .into_iter()
-            .rev()
-            .any(|distance| {
-                let start_idx = possible_vocab_word.len().saturating_sub(distance + 1);
-                let trucated_vocab_word = &possible_vocab_word[start_idx..];
-
-                let contains = vocab.contains(trucated_vocab_word);
-                if contains {
-                    generated_queue.truncate(generated_queue.len() - word_queue.len());
-                    context_queue.truncate(context_queue.len() - word_queue.len());
-                    trucated_vocab_word.chars().for_each(|c| {
-                        generated_queue.push(c.to_string());
-                        context_queue.push_back(c.to_string());
-                    });
-                }
-
-                contains
-            })
-        {
-            true
-        } else {
-            false
-        };
-
-        if insert_separator {
-            word_queue.clear();
-
-            let context_tokens_str: Vec<&str> = context_queue.iter().map(|x| x.as_str()).collect();
-            let word_separator_token =
-                match predict_word_separator_token(model, rng, &context_tokens_str) {
-                    Ok(token) => token,
-                    Err(e) => {
-                        println!("Error sampling separator token: ({e})");
-                        word_separator_token.to_string()
-                    }
-                };
-
-            generated_queue.push(word_separator_token.clone());
-            context_queue.push_back(word_separator_token.clone());
-        }
-
-        last_token = &context_queue.back().unwrap();
-    }
-
-    while generated_queue.last().unwrap() != &ctrl_token {
-        generated_queue.pop();
-    }
-
-    generated_queue
-}
-
-fn predict_word_separator_token(
-    model: &RespondModel,
-    rng: &RngStrategy,
-    context_tokens_str: &[&str],
-) -> Result<String> {
-    let token_probabilites = model.sample_probabilities(&context_tokens_str)?;
-    let vocab = model.vocab();
-    let ordered_tokens: Vec<_> = vocab
-        .iter()
-        .sorted_by_key(|(_, &id)| id)
-        .map(|(token, _)| token)
-        .collect();
-
-    let word_separator_probabilites: Vec<_> = ordered_tokens
-        .iter()
-        .zip(token_probabilites.iter())
-        .filter(|(token, _)| !is_token_alphabetic(&token))
-        .collect();
-
-    let probabilities = word_separator_probabilites.iter().map(|(_, &x)| x);
-    let sum_probabilities: f64 = probabilities.clone().sum();
-    let probabilities = probabilities.map(|x| x / sum_probabilities).collect();
-
-    let idx = rng.sample_uniform(&probabilities)?;
-    let token = *word_separator_probabilites[idx].0;
-
-    Ok(token.clone())
 }
 
 fn is_token_alphabetic(token: &String) -> bool {

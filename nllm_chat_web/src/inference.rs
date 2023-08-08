@@ -141,14 +141,13 @@ pub fn infer<'a>(
     state: &'a respond::ExtractedModelConfig,
     rng: &'a RngStrategy,
 ) -> anyhow::Result<impl Iterator<Item = String> + 'a> {
-    let char_mode = state.char_mode.expect("missing char_mode");
+    let config = to_prompt_config(state);
+
+    let env_timeout_secs = std::env::var("NLLM_INFER_TIMEOUT_MS").ok();
+    let env_timeout_secs = env_timeout_secs.and_then(|x| x.parse::<u64>().ok());
+    let default_timeout_ms = 15_000;
+    let timeout_duration = Duration::from_millis(env_timeout_secs.unwrap_or(default_timeout_ms));
     let inference_started = std::time::Instant::now();
-    let config = respond::PromptConfig {
-        use_gdt: state.use_gdt,
-        char_mode,
-        vocab_supervised_predictions_enabled: false,
-        vocab: None,
-    };
 
     enum State {
         Infer(String),
@@ -166,7 +165,7 @@ pub fn infer<'a>(
             if let Some((token, separator)) = response.next() {
                 response_msg += &format!("{token}{separator}");
 
-                if inference_started.elapsed() > Duration::from_secs(15) {
+                if inference_started.elapsed() > timeout_duration {
                     info!("Timed out on prompt `{prompt}`");
 
                     state = Some(State::Complete);
@@ -189,6 +188,26 @@ pub fn infer<'a>(
     }))
 }
 
+pub fn to_prompt_config(state: &respond::ExtractedModelConfig) -> respond::PromptConfig<'_> {
+    use respond::PromptChatMode::*;
+    let char_mode = state.char_mode.expect("missing char_mode");
+    let use_human_ctx_chat_format = std::env::var("NLLM_TRIPLE_HASH_PROMPT")
+        .map(|x| x != "0")
+        .unwrap_or(false);
+    let chat_mode = if use_human_ctx_chat_format {
+        TripleHashHumanPrompt
+    } else {
+        DirectPrompt
+    };
+    respond::PromptConfig {
+        use_gdt: state.use_gdt,
+        char_mode,
+        vocab_supervised_predictions_enabled: false,
+        chat_mode,
+        vocab: None,
+    }
+}
+
 pub fn run_inference(
     prompt: &str,
     model: &respond::RespondModel,
@@ -196,14 +215,9 @@ pub fn run_inference(
     rng: &RngStrategy,
     tx: &tokio::sync::broadcast::Sender<String>,
 ) {
-    let char_mode = state.char_mode.expect("missing char_mode");
     let inference_started = std::time::Instant::now();
-    let config = respond::PromptConfig {
-        use_gdt: state.use_gdt,
-        char_mode,
-        vocab_supervised_predictions_enabled: false,
-        vocab: None,
-    };
+    let config = to_prompt_config(&state);
+
     let response = match respond::process_prompt(&model, &rng, &prompt, &config) {
         Ok(x) => x,
         Err(_) => return,
