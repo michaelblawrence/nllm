@@ -9,5 +9,6 @@ members = [
     "nllm_chat_functions",
 ]
 
-[profile.release]
-debug = true
+# TODO: consider removing - disabled to prevent large binaries pushed to s3
+# [profile.release]
+# debug = true
