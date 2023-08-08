@@ -31,9 +31,9 @@ pub struct TrainEmbeddingConfig {
     #[serde(default)]
     pub use_character_tokens: bool,
 
-    #[arg(short = 'N', long, default_value_t = false)]
+    #[arg(short = 'N', long, default_value = None)]
     #[serde(default)]
-    pub sample_from_newline: bool,
+    pub sample_from_pattern: Option<String>,
 
     #[arg(short = 'L', long, default_value_t = false)]
     #[serde(default)]
@@ -64,6 +64,10 @@ pub struct TrainEmbeddingConfig {
     #[arg(short = 'p', long, default_value_t = false)]
     #[serde(default)]
     pub pause_on_start: bool,
+
+    #[arg(short = 'a', long, default_value_t = 15)]
+    #[serde(default = "default_autosave_interval_mins")]
+    pub autosave_interval_mins: u64,
 
     #[arg(short = 'o', long, default_value = None)]
     #[serde(default)]
@@ -195,6 +199,12 @@ impl Into<NetworkActivationMode> for LayerActivationConfig {
         }
     }
 }
+
+
+fn default_autosave_interval_mins() -> u64 {
+    15
+}
+
 
 fn parse_range<T>(
     s: &str,
