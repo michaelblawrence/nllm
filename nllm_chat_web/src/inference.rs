@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use aws_sdk_lambda::types::InvokeMode;
 use plane::ml::RngStrategy;
 use serde_json::json;
@@ -6,33 +6,24 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use tracing::{error, info};
 
+#[derive(Debug, Clone)]
+pub struct ModelPromptRequest {
+    pub prompt: String,
+    pub use_beta_function: bool,
+}
+
 pub async fn spawn_lambda_inference_client(
     lambda_arn: &str,
     tx: broadcast::Sender<String>,
-) -> broadcast::Sender<String> {
-    let (model_tx, mut model_rx) = broadcast::channel::<String>(100);
+) -> broadcast::Sender<ModelPromptRequest> {
+    let (model_tx, mut model_rx) = broadcast::channel::<ModelPromptRequest>(100);
 
     use aws_sdk_lambda::{primitives::Blob, types::InvocationType, Client as LambdaClient};
 
     let shared_config = aws_config::load_from_env().await;
     let client = LambdaClient::new(&shared_config);
     let lambda_arn = lambda_arn.to_owned();
-    let function_url_config = client
-        .get_function_url_config()
-        .function_name(&lambda_arn)
-        .send()
-        .await
-        .expect("error extracting lambda url config");
-
-    match function_url_config.invoke_mode() {
-        Some(InvokeMode::ResponseStream) => {}
-        Some(_) => panic!("lambda response streaming is not enabled on server"),
-        None => panic!("lambda config missing function invoke mode"),
-    }
-    let function_url = function_url_config
-        .function_url()
-        .expect("lambda config missing function url")
-        .to_owned();
+    _ = get_lambda_funtion_url(&client, &lambda_arn, None).await;
 
     let function_name = client.invoke().function_name(&lambda_arn);
     let factory = move |prompt: Option<&str>| {
@@ -52,14 +43,27 @@ pub async fn spawn_lambda_inference_client(
 
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
-        while let Ok(prompt) = model_rx.recv().await {
+        while let Ok(ModelPromptRequest {
+            prompt,
+            use_beta_function,
+        }) = model_rx.recv().await
+        {
+            info!("Resolving lambda function url");
+            // TODO: consider moving to env var
+            let lambda_qualifier = Some("beta").filter(|_| use_beta_function);
+            let function_url =
+                match get_lambda_funtion_url(&client, &lambda_arn, lambda_qualifier).await {
+                    Ok(url) => url,
+                    Err(e) => {
+                        error!("failed to retrieve lambda url: {e}");
+                        continue;
+                    }
+                };
+
             info!("Requesting inference from remote");
-            match http_client
-                .post(&function_url)
-                .json(&json!({ "prompt": &prompt }))
-                .send()
-                .await
-            {
+            let body = json!({ "prompt": &prompt });
+            let response = http_client.post(&function_url).json(&body).send().await;
+            match response {
                 Ok(response) => {
                     use futures::StreamExt;
                     use tokio::io::AsyncBufReadExt;
@@ -96,18 +100,19 @@ pub async fn spawn_lambda_inference_client(
 
     model_tx
 }
+
 pub fn spawn_local_inference(
     model_fpath: Option<&str>,
     tx: broadcast::Sender<String>,
-) -> broadcast::Sender<String> {
+) -> broadcast::Sender<ModelPromptRequest> {
     let (model, state) = respond::load(model_fpath).unwrap();
-    let (model_tx, mut model_rx) = broadcast::channel::<String>(100);
+    let (model_tx, mut model_rx) = broadcast::channel::<ModelPromptRequest>(100);
 
     let rng = RngStrategy::default();
     let ctx = Arc::new((model, state, rng, tx.clone()));
 
     tokio::spawn(async move {
-        while let Ok(prompt) = model_rx.recv().await {
+        while let Ok(ModelPromptRequest { prompt, .. }) = model_rx.recv().await {
             let ctx = ctx.clone();
 
             let prompt: Arc<str> = prompt.into();
@@ -186,6 +191,35 @@ pub fn infer<'a>(
             None
         }
     }))
+}
+
+async fn get_lambda_funtion_url(
+    client: &aws_sdk_lambda::Client,
+    lambda_arn: &str,
+    lambda_qualifier: Option<&str>,
+) -> anyhow::Result<String> {
+    let function_url_config_builder = client.get_function_url_config().function_name(lambda_arn);
+    let function_url_config_builder = if let Some(qualifier) = lambda_qualifier {
+        function_url_config_builder.qualifier(qualifier)
+    } else {
+        function_url_config_builder
+    };
+    let function_url_config = function_url_config_builder
+        .send()
+        .await
+        .context("error extracting lambda url config")?;
+
+    match function_url_config.invoke_mode() {
+        Some(InvokeMode::ResponseStream) => {}
+        Some(_) => bail!("lambda response streaming is not enabled on server"),
+        None => bail!("lambda config missing function invoke mode"),
+    }
+    let function_url = function_url_config
+        .function_url()
+        .context("lambda config missing function url")?
+        .to_owned();
+
+    Ok(function_url)
 }
 
 pub fn to_prompt_config(state: &respond::ExtractedModelConfig) -> respond::PromptConfig<'_> {

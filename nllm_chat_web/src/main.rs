@@ -40,7 +40,7 @@ mod env {
 struct AppState {
     user_set: Mutex<HashSet<String>>,
     tx: broadcast::Sender<String>,
-    model_tx: broadcast::Sender<String>,
+    model_tx: broadcast::Sender<inference::ModelPromptRequest>,
 }
 
 #[tokio::main]
@@ -178,11 +178,11 @@ enum ClientPayload {
 }
 
 async fn get_username(
-    receiver: &SplitStream<WebSocket>,
+    receiver: &mut SplitStream<WebSocket>,
     state: &AppState,
 ) -> Result<String, &'static str> {
     // Loop until a text message is found.
-    if let Some(Ok(message::Text(name))) = receiver.next().await {
+    if let Some(Ok(Message::Text(name))) = receiver.next().await {
         // If username that is sent by client is not taken, fill username string.
         match check_username(&state, &name) {
             CheckUsernameAction::FoundNew => Ok(name),
@@ -201,11 +201,11 @@ async fn get_username(
 // receiving / sending chat messages).
 async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     // By splitting, we can send and receive at the same time.
-    let (mut sender, receiver) = stream.split();
+    let (mut sender, mut receiver) = stream.split();
     let (client_tx, client_rx) = broadcast::channel(10);
 
     // Username gets set in the receive loop, if it's valid.
-    let name = match get_username(&receiver, &state).await {
+    let name = match get_username(&mut receiver, &state).await {
         Ok(username) => username,
         Err(msg) => {
             let _ = sender.send(Message::Text(String::from(msg))).await;
@@ -232,7 +232,12 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
 
     // Spawn a task that takes messages from the websocket, prepends the user
     // name, and sends them to all broadcast subscribers.
-    let mut recv_task = tokio::spawn(forward_ws_to_broadcast(receiver, client_tx, state.clone(), &name));
+    let mut recv_task = tokio::spawn(forward_ws_to_broadcast(
+        receiver,
+        client_tx,
+        state.clone(),
+        name.clone(),
+    ));
 
     // If any one of the tasks run to completion, we abort the other.
     tokio::select! {
@@ -256,11 +261,18 @@ async fn forward_ws_to_broadcast(
     name: String,
 ) {
     let name = name.to_owned();
+    let mut beta_mode = false;
     while let Some(Ok(Message::Text(text))) = ws_receiver.next().await {
         if text.starts_with('!') {
             let message = match process_cmd(&text[1..], &state, &client_tx) {
                 PromptAction::ReportSuccess(cmd_response) => {
                     ClientPayload::Message(format!("🤖 {cmd_response}"))
+                }
+                PromptAction::ToggleBetaMode => {
+                    beta_mode = !beta_mode;
+                    ClientPayload::Message(format!(
+                        "🤖 Experimental inference model enabled = {beta_mode}"
+                    ))
                 }
                 PromptAction::ReportUnknownCommand(err_response) => {
                     ClientPayload::Message(format!("❓ {err_response}"))
@@ -275,8 +287,11 @@ async fn forward_ws_to_broadcast(
         for prefix in chatbot_prefixes {
             if text.to_lowercase().starts_with(prefix) {
                 let query = text[prefix.len()..].trim_start_matches(|c: char| !c.is_alphabetic());
-
-                let _ = state.model_tx.send(query.to_string());
+                let prompt_request = inference::ModelPromptRequest {
+                    prompt: query.to_string(),
+                    use_beta_function: beta_mode,
+                };
+                let _ = state.model_tx.send(prompt_request);
                 break;
             }
         }
@@ -348,6 +363,7 @@ enum PromptAction {
     ReportSuccess(String),
     ReportUnknownCommand(String),
     DiscardMessage,
+    ToggleBetaMode,
 }
 
 fn process_cmd(
@@ -368,6 +384,7 @@ fn process_cmd(
             client_tx.send(ClientPayload::PingNotification).unwrap();
             PromptAction::DiscardMessage
         }
+        "BETA" => PromptAction::ToggleBetaMode,
         _ => PromptAction::ReportUnknownCommand("Invalid Command".to_string()),
     }
 }
