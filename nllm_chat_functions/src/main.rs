@@ -8,12 +8,20 @@ use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, BufReader};
 use tracing::info;
 
+mod env {
+    pub const MODEL_S3_BUCKET: &str = "NLLM_MODEL_S3_BUCKET";
+    pub const MODEL_S3_KEY: &str = "NLLM_MODEL_S3_KEY";
+    pub const MODEL_PATH: &str = "NLLM_MODEL_PATH";
+    pub const TRIPLE_HASH_PROMPT: &str = "NLLM_TRIPLE_HASH_PROMPT";
+}
+
 async fn func(
     event: LambdaEvent<Value>,
     ctx: Arc<(
         respond::RespondModel,
         respond::ExtractedModelConfig,
         RngStrategy,
+        respond::PromptChatMode
     )>,
 ) -> Result<Response<Body>, Error> {
     let prompt_txt = extract_prompt(event)?;
@@ -30,8 +38,8 @@ async fn func(
     let (tx, mut rx) = tokio::sync::broadcast::channel(100);
 
     tokio::task::spawn_blocking(move || {
-        let (model, state, rng) = &*ctx;
-        for message in infer(&prompt_txt, &model, &state, &rng)? {
+        let (model, state, rng, chat_mode) = &*ctx;
+        for message in infer(&prompt_txt, &model, &state, *chat_mode, &rng)? {
             tx.send(message)?;
         }
         <Result<(), Error>>::Ok(())
@@ -80,10 +88,10 @@ async fn main() -> Result<(), Error> {
         .without_time()
         .init();
 
-    let rng = RngStrategy::default();
+    let rng = RngStrategy::testable(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_millis());
     let (model, state) = match (
-        std::env::var("NLLM_MODEL_S3_BUCKET"),
-        std::env::var("NLLM_MODEL_S3_KEY"),
+        std::env::var(env::MODEL_S3_BUCKET),
+        std::env::var(env::MODEL_S3_KEY),
     ) {
         (Ok(s3_bucket), Ok(s3_key)) => {
             info!("Loading model from S3...");
@@ -93,12 +101,21 @@ async fn main() -> Result<(), Error> {
         }
         _ => {
             info!("Loading model from file...");
-            let model_fpath = std::env::var("NLLM_MODEL_PATH").ok();
+            let model_fpath = std::env::var(env::MODEL_PATH).ok();
             respond::load(model_fpath.as_deref())?
         }
     };
 
-    let ctx = Arc::new((model, state, rng));
+    let use_human_ctx_chat_format = std::env::var(env::TRIPLE_HASH_PROMPT)
+        .map(|x| x != "0")
+        .unwrap_or(false);
+    let chat_mode = if use_human_ctx_chat_format {
+        respond::PromptChatMode::TripleHashHumanPrompt
+    } else {
+        respond::PromptChatMode::DirectPrompt
+    };
+
+    let ctx = Arc::new((model, state, rng, chat_mode));
     let handler = service_fn(|event| func(event, ctx.clone()));
 
     lambda_runtime::run_with_streaming_response(handler).await?;
@@ -136,6 +153,7 @@ pub fn infer<'a>(
     prompt: &'a str,
     model: &'a respond::RespondModel,
     state: &'a respond::ExtractedModelConfig,
+    chat_mode: respond::PromptChatMode,
     rng: &'a RngStrategy,
 ) -> anyhow::Result<impl Iterator<Item = String> + 'a> {
     let char_mode = state.char_mode.expect("missing char_mode");
@@ -144,6 +162,7 @@ pub fn infer<'a>(
         use_gdt: state.use_gdt,
         char_mode,
         vocab_supervised_predictions_enabled: false,
+        chat_mode,
         vocab: None,
     };
 
