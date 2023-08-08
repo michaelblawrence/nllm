@@ -427,6 +427,7 @@ pub mod token {
                 corpus: &str,
                 token_len: usize,
                 sequence_count: usize,
+                sample_from_pattern: Option<&str>,
                 rng: &RngStrategy,
             ) -> Result<Vec<(Vec<usize>, Vec<usize>)>> {
                 let mut batch_samples: Vec<Vec<Token>> = vec![];
@@ -436,7 +437,10 @@ pub mod token {
                         let corpus_len = corpus.chars().count();
                         for _ in 0..sequence_count {
                             let start_idx = sample_next_word_boundary_idx(corpus, corpus_len, rng);
-                            let indexed_corpus = &corpus[start_idx..];
+                            let start_offset = sample_from_pattern
+                                .and_then(|pattern| corpus[start_idx..].find(pattern))
+                                .unwrap_or_default();
+                            let indexed_corpus = &corpus[start_idx + start_offset..];
                             let chars: String = indexed_corpus
                                 .lines()
                                 .map(|x| x.split_whitespace().take(token_len + 1).join(" "))
@@ -468,7 +472,10 @@ pub mod token {
                         let corpus_len = corpus.chars().count();
                         for _ in 0..sequence_count {
                             let start_idx = sample_next_word_boundary_idx(corpus, corpus_len, rng);
-                            let indexed_corpus = &corpus[start_idx..];
+                            let start_offset = sample_from_pattern
+                                .and_then(|pattern| corpus[start_idx..].find(pattern))
+                                .unwrap_or_default();
+                            let indexed_corpus = &corpus[start_idx + start_offset..];
                             let chars: String = indexed_corpus
                                 .lines()
                                 .map(|x| x.split_whitespace().take(token_len + 1).join(" "))
@@ -501,12 +508,18 @@ pub mod token {
                         for _ in 0..sequence_count {
                             let exclusive_max = corpus_len - token_len;
                             let start_index = rng.rand_range(0, exclusive_max);
-                            let chars: String = corpus
-                                .chars()
-                                .skip(start_index)
-                                .take(token_len + 1)
-                                .collect();
+                            let substring = {
+                                let mut chars = corpus.chars();
+                                // TODO replace with `chars.advance_by(start_index)` once iter api is stable
+                                chars.nth(start_index.saturating_sub(1))
+                                    .expect("start index should be in range");
+                                chars.as_str()
+                            };
+                            let position = sample_from_pattern
+                                .and_then(|pattern| substring.find(pattern))
+                                .unwrap_or_default();
 
+                            let chars: String = substring.chars().skip(position).take(token_len + 1).collect();
                             let sequence = self.encode(&chars)?;
                             batch_samples.push(sequence);
                         }
@@ -861,14 +874,13 @@ impl GenerativeDecoderTransformer {
     }
 
     #[instrument(level = "info", name = "embed_train", skip_all)]
-    pub fn train<B: Into<TrainBatchConfig>, T: Deref<Target = O>, O: OptimizerSource>(
+    pub fn train<T: Deref<Target = O>, O: OptimizerSource>(
         &mut self,
         corpus: &str,
         optimizer: T,
-        batch_size: B,
+        train_context: &TrainContext,
     ) -> Result<NodeValue> {
-        let batch_size: TrainBatchConfig = batch_size.into();
-        let batches = self.into_batches(corpus, batch_size)?;
+        let batches = self.into_batches(corpus, train_context)?;
         let (encoder_output, encoder_mask) = (None, None);
 
         #[cfg(feature = "threadpool")]
@@ -939,12 +951,17 @@ impl GenerativeDecoderTransformer {
     fn into_batches(
         &self,
         corpus: &str,
-        batch_size: TrainBatchConfig,
+        ctx: &TrainContext,
     ) -> Result<Vec<(Vec<usize>, Vec<usize>)>> {
-        match &batch_size {
+        match &ctx.batch_size {
             &TrainBatchConfig::SingleBatch(batch_size) | &TrainBatchConfig::Batches(batch_size) => {
-                self.vocab
-                    .sample_batch(corpus, self.context_length, batch_size, &self.rng)
+                self.vocab.sample_batch(
+                    corpus,
+                    self.context_length,
+                    batch_size,
+                    ctx.sample_from_pattern,
+                    &self.rng,
+                )
             }
         }
     }
@@ -1154,6 +1171,23 @@ impl GenerativeDecoderTransformer {
     }
 }
 
+pub struct TrainContext<'a> {
+    batch_size: TrainBatchConfig,
+    sample_from_pattern: Option<&'a str>,
+}
+
+impl<'a> TrainContext<'a> {
+    pub fn new<B: Into<TrainBatchConfig>>(
+        batch_size: B,
+        sample_from_pattern: Option<&'a str>,
+    ) -> Self {
+        Self {
+            batch_size: batch_size.into(),
+            sample_from_pattern,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use test_log::test;
@@ -1196,10 +1230,11 @@ mod tests {
             // .with_feed_forward_hidden_dimension(8)
             .with_dropout_rate(0.0);
 
-        let transformer = training::setup_and_train_transformer(training::TestGptConfig {
+        let transformer = training::setup_and_train_transformer(training::TestGdtConfig {
             builder,
             training_rounds: 100,
             batch_size: 1,
+            sample_from_pattern: None,
             optimizer,
             vocab,
             training_corpus: corpus.clone(),
@@ -1230,10 +1265,11 @@ mod tests {
             // .with_feed_forward_hidden_dimension(8)
             .with_dropout_rate(0.0);
 
-        let transformer = training::setup_and_train_transformer(training::TestGptConfig {
+        let transformer = training::setup_and_train_transformer(training::TestGdtConfig {
             builder,
             training_rounds: 25,
             batch_size: 1,
+            sample_from_pattern: None,
             optimizer,
             vocab,
             training_corpus: corpus.clone(),
@@ -1264,10 +1300,11 @@ mod tests {
             .with_attention_dense_layer_init_strategy(LayerInitStrategy::KaimingZeroBias)
             .with_feed_forward_init_strategy(LayerInitStrategy::KaimingZeroBias);
 
-        let transformer = training::setup_and_train_transformer(training::TestGptConfig {
+        let transformer = training::setup_and_train_transformer(training::TestGdtConfig {
             builder,
             training_rounds: 750,
             batch_size: 1,
+            sample_from_pattern: None,
             optimizer,
             vocab,
             training_corpus: corpus.clone(),
@@ -1278,6 +1315,46 @@ mod tests {
         let token1 = transformer.vocab().token_encode(&Token::char('c')).unwrap();
         let prob1 = dbg!(probabilities[token1]);
         assert!(prob1 > 0.95);
+    }
+
+    #[test]
+    fn transformer_works_on_regular_prefix_patterns() {
+        let corpus = "|-->1|-->2|-->3|-->4".to_string();
+        let vocab = Vocab::new_builder(token::VocabTokenType::Char)
+            .from_corpus(&corpus)
+            .build()
+            .unwrap();
+        let optimizer = solver::AdamOptimizer::new_cache(0.001);
+        let builder = DecoderBuilder::new(4, 12, vocab.len())
+            .with_block_count(6)
+            .with_dropout_rate(0.0)
+            .with_embedding_init_strategy(LayerInitStrategy::KaimingZeroBias)
+            // .with_output_dense_init_strategy(LayerInitStrategy::FullRandom)
+            .with_output_dense_init_strategy(LayerInitStrategy::KaimingZeroBias)
+            .with_attention_kqv_weights_init_strategy(LayerInitStrategy::ScaledFullRandom)
+            .with_attention_dense_layer_init_strategy(LayerInitStrategy::KaimingZeroBias)
+            .with_feed_forward_init_strategy(LayerInitStrategy::KaimingZeroBias);
+
+        let transformer = training::setup_and_train_transformer(training::TestGdtConfig {
+            builder,
+            training_rounds: 750,
+            batch_size: 1,
+            sample_from_pattern: Some("|-->"),
+            optimizer,
+            vocab,
+            training_corpus: corpus.clone(),
+            testing_corpus: corpus,
+        });
+
+        let probabilities = sample_probabilities(&transformer, &['|', '-']);
+        let token1 = transformer.vocab().token_encode(&Token::char('-')).unwrap();
+        let prob1 = dbg!(probabilities[token1]);
+        assert!(prob1 > 0.95);
+
+        let probabilities = sample_probabilities(&transformer, &['|', '-', '-']);
+        let token2 = transformer.vocab().token_encode(&Token::char('>')).unwrap();
+        let prob2 = dbg!(probabilities[token2]);
+        assert!(prob2 > 0.95);
     }
 
     #[test]
@@ -1312,10 +1389,11 @@ mod tests {
             .with_attention_dense_layer_init_strategy(LayerInitStrategy::KaimingZeroBias)
             .with_feed_forward_init_strategy(LayerInitStrategy::KaimingZeroBias);
 
-        let transformer = training::setup_and_train_transformer(training::TestGptConfig {
+        let transformer = training::setup_and_train_transformer(training::TestGdtConfig {
             builder,
             training_rounds: *inject_env_values.get(1).unwrap_or(&2000.0) as usize,
             batch_size: 1,
+            sample_from_pattern: None,
             optimizer,
             vocab,
             training_corpus: corpus.clone(),
@@ -1371,11 +1449,12 @@ mod tests {
             .with_attention_dense_layer_init_strategy(LayerInitStrategy::KaimingZeroBias)
             .with_feed_forward_init_strategy(LayerInitStrategy::KaimingZeroBias);
 
-        let t = training::setup_and_train_transformer(training::TestGptConfig {
+        let t = training::setup_and_train_transformer(training::TestGdtConfig {
             builder,
             training_rounds: 3000,
             // training_rounds: 10000,
             batch_size: 16,
+            sample_from_pattern: None,
             optimizer,
             vocab,
             training_corpus: corpus.clone(),
@@ -1445,11 +1524,12 @@ mod tests {
             .with_attention_dense_layer_init_strategy(LayerInitStrategy::KaimingZeroBias)
             .with_feed_forward_init_strategy(LayerInitStrategy::KaimingZeroBias);
 
-        let t = training::setup_and_train_transformer(training::TestGptConfig {
+        let t = training::setup_and_train_transformer(training::TestGdtConfig {
             builder,
             training_rounds: 3000,
             // training_rounds: 10000,
             batch_size: 5,
+            sample_from_pattern: None,
             optimizer,
             vocab,
             training_corpus: corpus.clone(),
@@ -1520,22 +1600,18 @@ mod tests {
     }
 
     mod training {
-        use std::time::Instant;
-
-        use itertools::Itertools;
-        use tracing::info;
-
         use crate::ml::{
-            gdt::{token::Vocab, GenerativeDecoderTransformer},
+            gdt::{token::Vocab, GenerativeDecoderTransformer, TrainContext},
             transformer::{decoder::builder::DecoderBuilder, solver::source::OptimizerSource},
-            NodeValue, RngStrategy,
+            RngStrategy,
         };
 
         #[derive(Clone)]
-        pub struct TestGptConfig<O> {
+        pub struct TestGdtConfig<O> {
             pub builder: DecoderBuilder,
             pub training_rounds: usize,
             pub batch_size: usize,
+            pub sample_from_pattern: Option<&'static str>,
             pub optimizer: O,
             pub vocab: Vocab,
             pub training_corpus: String,
@@ -1543,7 +1619,7 @@ mod tests {
         }
 
         pub fn setup_and_train_transformer<O: OptimizerSource>(
-            config: TestGptConfig<O>,
+            config: TestGdtConfig<O>,
         ) -> GenerativeDecoderTransformer {
             let rng = RngStrategy::testable(1234);
             let builder = config.builder.with_rng(rng);
@@ -1551,137 +1627,17 @@ mod tests {
             let mut transformer =
                 GenerativeDecoderTransformer::from_builder(builder, config.vocab, rng).unwrap();
 
-            let mut last_report_time: Option<(Instant, usize)> = None;
-
-            for round in 0..config.training_rounds {
-                let training_error = transformer
+            for _ in 0..config.training_rounds {
+                transformer
                     .train(
                         &config.training_corpus,
                         &config.optimizer,
-                        config.batch_size,
+                        &TrainContext::new(config.batch_size, config.sample_from_pattern),
                     )
                     .unwrap();
-
-                let ms_per_round = last_report_time.map(|(last_dt, last_round)| {
-                    last_dt.elapsed().as_millis() / (round - last_round).max(1) as u128
-                });
-
-                if should_report_round(round, config.training_rounds, ms_per_round) {
-                    // let (validation_errors, predictions_pct) =
-                    //     validate_test_set(&transformer, &config.testing_corpus);
-
-                    // report_training_round(
-                    //     round,
-                    //     training_error,
-                    //     validation_errors,
-                    //     predictions_pct,
-                    //     ms_per_round,
-                    // );
-
-                    last_report_time = Some((std::time::Instant::now(), round));
-                }
             }
 
             transformer
         }
-
-        fn should_report_round(
-            round: usize,
-            training_rounds: usize,
-            ms_per_round: Option<u128>,
-        ) -> bool {
-            let round_1based = round + 1;
-            let target_report_interval_ms = 10_000.0;
-
-            let ten_factor = 100; //ms_per_round.map_or(100, |ms_per_round| {
-                                  //     let ten_exp = (target_report_interval_ms / (ms_per_round as f64 + 1e-8))
-                                  //         .log10()
-                                  //         .floor()
-                                  //         .max(1.0) as u32;
-
-            //     10_usize.pow(ten_exp)
-            // });
-
-            round_1based <= 3 || (round_1based % ten_factor == 0) || round_1based == training_rounds
-        }
-
-        fn report_training_round(
-            round: usize,
-            training_error: f64,
-            validation_errors: Vec<(f64, f64)>,
-            predictions_pct: f64,
-            ms_per_round: Option<u128>,
-        ) {
-            let val_count = validation_errors.len() as NodeValue;
-            let (validation_error, nll) =
-                validation_errors
-                    .iter()
-                    .fold((0.0, 0.0), |sum, (validation_error, nll)| {
-                        (
-                            sum.0 + (validation_error / val_count),
-                            sum.1 + (nll / val_count),
-                        )
-                    });
-
-            let ms_per_round = ms_per_round
-                .map(|ms_per_round| format!("(ms/round={ms_per_round:<4.1})"))
-                .unwrap_or_default();
-
-            info!(
-                    "round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<6.3} {ms_per_round}",
-                    round + 1, training_error, predictions_pct, validation_error, nll
-                );
-        }
-
-        // fn validate_test_set(
-        //     transformer: &GenerativeDecoderTransformer,
-        //     testing_phrases: &String,
-        // ) -> (Vec<(f64, f64)>, f64) {
-        //     let testing_phrase_windows = &testing_phrases
-        //         .chars()
-        //         .chunks(transformer.input_stride_width() + 1)
-        //         .into_iter()
-        //         .map(|chunk| chunk.collect_vec())
-        //         .collect_vec();
-
-        //     #[cfg(feature = "threadpool")]
-        //     use rayon::prelude::*;
-
-        //     let testing_phrase_windows_iter = {
-        //         #[cfg(feature = "threadpool")]
-        //         {
-        //             testing_phrase_windows.par_iter()
-        //         }
-        //         #[cfg(not(feature = "threadpool"))]
-        //         {
-        //             testing_phrase_windows.iter()
-        //         }
-        //     };
-
-        //     let (validation_errors, correct_first_word_predictions): (Vec<(f64, f64)>, Vec<usize>) =
-        //         testing_phrase_windows_iter
-        //             .map(|testing_phrase_window| {
-        //                 let (&last_token, context_tokens) =
-        //                     testing_phrase_window.split_last().unwrap();
-
-        //                 let predicted = transformer.predict_next(&context_tokens).unwrap();
-        //                 let actual = last_token;
-        //                 let correct_first_word_count = if predicted == actual { 1 } else { 0 };
-
-        //                 let error = transformer
-        //                     .compute_error(&[context_tokens, &[actual]].concat())
-        //                     .unwrap();
-
-        //                 let nll = transformer.nll(&context_tokens, actual).unwrap();
-        //                 ((error, nll), correct_first_word_count)
-        //             })
-        //             .unzip();
-
-        //     let correct_count = correct_first_word_predictions.iter().sum::<usize>();
-        //     let predictions_pct =
-        //         correct_count as NodeValue * 100.0 / validation_errors.len() as NodeValue;
-
-        //     (validation_errors, predictions_pct)
-        // }
     }
 }

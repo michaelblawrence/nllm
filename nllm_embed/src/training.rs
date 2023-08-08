@@ -32,22 +32,25 @@ pub struct TrainerState<M> {
     pub model: M,
     pub handle_tx: TrainerHandleSender<TrainerMessage>,
     pub output_label: Option<String>,
-    pub learn_rate: f64,
     pub training_rounds: usize,
     pub print_round_number: bool,
     pub supress_auto_report: bool,
     pub force_report_all: bool,
+    pub sample_from_pattern: Option<String>,
     pub snapshot: (Option<String>, Instant),
     pub last_report: Option<(Instant, TrainerReport)>,
     paused: bool,
     batches_trained: usize,
     pub round: usize,
+    learn_rate: f64,
     training_loss_logger: BoundedValueLogger<(usize, f64)>,
     rounds_until_pause_enabled: usize,
     halt: bool,
     force_report_test_set: bool,
     force_report_train_set: bool,
     round_reported: bool,
+    last_autosave: Instant,
+    autosave_interval: Duration,
     total_train_time: Duration,
     inital_config: TrainEmbeddingConfig,
 }
@@ -66,6 +69,7 @@ impl<M: MLModel> TrainerState<M> {
             learn_rate: config.train_rate,
             training_rounds: config.training_rounds,
             paused: config.pause_on_start,
+            sample_from_pattern: config.sample_from_pattern.clone(),
             snapshot: (None, Instant::now()),
             training_loss_logger: BoundedValueLogger::new(1000),
             round_reported: false,
@@ -77,6 +81,8 @@ impl<M: MLModel> TrainerState<M> {
             last_report: None,
             rounds_until_pause_enabled: 0,
             halt: false,
+            last_autosave: Instant::now(),
+            autosave_interval: Duration::from_secs(config.autosave_interval_mins * 60),
             total_train_time: Duration::ZERO,
             batches_trained: 0,
             round: 0,
@@ -89,7 +95,7 @@ impl<M: MLModel> TrainerState<M> {
         }
         let started = Instant::now();
 
-        let train_error = self.model.train(phrases, self.learn_rate, batch_size);
+        let train_error = self.model.train(phrases, batch_size);
 
         let train_duration = started.elapsed();
         self.total_train_time += train_duration;
@@ -160,6 +166,18 @@ impl<M: MLModel> TrainerState<M> {
             self.trigger_round_report_test_set();
             self.pause();
             return;
+        }
+
+        if !self.paused && self.last_autosave.elapsed() > self.autosave_interval {
+            let metadata = self.metadata();
+            let msg = TrainerMessage::WriteModelAndMetadataToDisk(
+                metadata,
+                crate::messages::TrainerModelCheckpointSource::Autosave,
+            );
+            match self.handle_tx.send(msg) {
+                Ok(_) => self.last_autosave = Instant::now(),
+                Err(_) => {}
+            };
         }
 
         if !self.training_paused() {
@@ -271,9 +289,11 @@ impl<M: MLModel> TrainerState<M> {
         self.model = model;
         self.round = metadata.current_round;
         self.training_rounds = metadata.training_rounds;
-        self.learn_rate = metadata.learn_rate;
         self.output_label = metadata.output_label;
         self.total_train_time = Duration::from_secs(metadata.total_train_seconds);
+
+        self.learn_rate = metadata.learn_rate;
+        self.model.set_learn_rate(metadata.learn_rate);
 
         self.training_loss_logger = {
             let logger_capacity = self.training_loss_logger.capacity();
@@ -307,7 +327,10 @@ impl<M: MLModel> TrainerState<M> {
 
         if quit_on_complete && run_completed && !self.halt {
             let metadata = self.metadata();
-            let msg = TrainerMessage::WriteModelAndMetadataToDisk(metadata);
+            let msg = TrainerMessage::WriteModelAndMetadataToDisk(
+                metadata,
+                crate::messages::TrainerModelCheckpointSource::User,
+            );
 
             self.handle_tx
                 .send(msg)
@@ -321,6 +344,15 @@ impl<M: MLModel> TrainerState<M> {
 
     pub fn batches_trained_since_process_started(&self) -> usize {
         self.batches_trained
+    }
+
+    pub fn learn_rate(&self) -> f64 {
+        self.learn_rate
+    }
+
+    pub fn set_learn_rate(&mut self, learn_rate: f64) {
+        self.model.set_learn_rate(learn_rate);
+        self.learn_rate = learn_rate;
     }
 }
 
@@ -441,9 +473,12 @@ where
     };
     let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, rng.to_arc());
     let mut testing_phrases = match config.phrase_test_set_split_pct.filter(|x| *x > 0.0) {
-        Some(pct) => {
-            split_training_and_testing(&mut phrases, pct, config.phrase_test_set_max_tokens)
-        }
+        Some(pct) => split_training_and_testing(
+            &mut phrases,
+            pct,
+            config.phrase_test_set_max_tokens,
+            config.sample_from_pattern.as_deref(),
+        ),
         None => phrases.clone(),
     };
 
@@ -538,8 +573,7 @@ where
         };
 
         let s2s = CharacterTransformer::from_builder_ordered(builder, &vocab, rng).unwrap();
-
-        s2s.into()
+        M::from_s2s(s2s, config.train_rate)
     } else if let (true, Some(vocab)) = (config.use_gdt, gdt_vocab) {
         info!("Using GenerativeDecoderTransformer (GDT)...");
         let builder = DecoderBuilder::new(
@@ -578,7 +612,7 @@ where
 
         let gdt = GenerativeDecoderTransformer::from_builder(builder, vocab, rng).unwrap();
 
-        gdt.into()
+        M::from_gdt(gdt, config.train_rate, config.sample_from_pattern.clone())
     } else if let Some(vocab) =
         str_vocab.or(char_vocab.map(|x| x.into_iter().map(|c| c.to_string()).collect()))
     {
@@ -594,7 +628,7 @@ where
             .build()
             .unwrap();
 
-        embedding.into()
+        M::from_embedding(embedding, config.train_rate)
     } else {
         panic!("invalid config build state");
     };
@@ -612,11 +646,11 @@ fn report_round<M: MLModel>(
     let validation_results = if let Some(embedding) = state.model.as_embedding() {
         validate::validate_embeddings(embedding, testing_phrases)
     } else if let Some(s2s) = state.model.as_s2s() {
-        let testing_phrases = TrainerState::<M>::join_phrases(&testing_phrases, Some(true));
+        let testing_phrases = TrainerState::<M>::join_phrases(&testing_phrases, Some(true)); // TODO: remove from hot path
         Ok(validate::validate_s2s(s2s, &testing_phrases))
     } else if let Some(gdt) = state.model.as_gdt() {
         let char_mode = gdt.vocab().token_type().is_char();
-        let testing_phrases = TrainerState::<M>::join_phrases(&testing_phrases, Some(char_mode));
+        let testing_phrases = TrainerState::<M>::join_phrases(&testing_phrases, Some(char_mode)); // TODO: remove from hot path
         validate::validate_gdt(gdt, &testing_phrases)
     } else {
         panic!("unknown model type: unable to run validation")
@@ -800,6 +834,7 @@ pub fn split_training_and_testing(
     phrases: &mut Vec<Vec<String>>,
     test_phrases_pct: f64,
     test_set_max_tokens: Option<usize>,
+    _sample_from_pattern: Option<&str>, // TODO: use for sampling test phrases
 ) -> Vec<Vec<String>> {
     let testing_sample_count = {
         let testing_ratio = test_phrases_pct as NodeValue / 100.0;
@@ -1119,23 +1154,24 @@ pub mod writer {
         config: &TrainEmbeddingConfig,
         state: &TrainerStateMetadata,
         label: &str,
-        output_dir: &Option<String>,
-        output_label: &Option<String>,
+        output_dir: Option<&str>,
+        output_label: Option<&str>,
+        output_ext: &str,
     ) -> PathBuf {
         let snapshot = embedding.snapshot().unwrap();
         let mut snapshot: Value = serde_json::from_str(&snapshot).unwrap();
 
-        let output_label = state.output_label.as_ref().or(output_label.as_ref());
+        let output_label = state.output_label.as_deref().or(output_label);
         let mut config = config.clone();
-        config.output_label = output_label.cloned();
+        config.output_label = output_label.map(|x| x.to_string());
 
         snapshot["_trainer_config"] = serde_json::to_value(&config).unwrap();
         snapshot["_trainer_state"] = serde_json::to_value(&state).unwrap();
 
         let snapshot_pretty = serde_json::to_string_pretty(&snapshot).unwrap();
         let fpath = path::create_output_fpath(
-            ("model", ".json"),
-            output_dir.as_ref(),
+            ("model", output_ext),
+            output_dir,
             output_label,
             Some(state),
             label,
@@ -1159,15 +1195,15 @@ pub mod writer {
 
         let fpath_vectors = path::create_output_fpath(
             ("embedding", "_vectors.tsv"),
-            output_dir.as_ref(),
-            output_label.as_ref(),
+            output_dir.as_deref(),
+            output_label.as_deref(),
             None,
             label,
         );
         let fpath_labels = path::create_output_fpath(
             ("embedding", "_labels.tsv"),
-            output_dir.as_ref(),
-            output_label.as_ref(),
+            output_dir.as_deref(),
+            output_label.as_deref(),
             None,
             label,
         );
@@ -1264,22 +1300,44 @@ pub mod writer {
 
         use crate::messages::TrainerStateMetadata;
 
+        pub struct CreateExportPathOptions<'a> {
+            fname_prefix_ext: (&'a str, &'a str),
+            output_dir: Option<&'a str>,
+            output_label: Option<&'a str>,
+            label: &'a str,
+            is_unique_path: bool,
+        }
+
         pub fn create_output_fpath(
             fname_prefix_ext: (&str, &str),
-            output_dir: Option<&String>,
-            output_label: Option<&String>,
+            output_dir: Option<&str>,
+            output_label: Option<&str>,
             state: Option<&TrainerStateMetadata>,
             label: &str,
         ) -> PathBuf {
-            let dir_path = create_output_dir(output_dir, output_label.clone());
-            let fname_description = match (output_label, state) {
-                (Some(_), Some(state)) => metadata_fname_description(state),
-                _ => default_fname_description(label),
+            let options = CreateExportPathOptions {
+                fname_prefix_ext,
+                output_dir: output_dir,
+                output_label: output_label,
+                label,
+                is_unique_path: true,
             };
-            let (fname_prefix, fname_ext) = fname_prefix_ext;
+            create_output_fpath_advanced(options, state)
+        }
+
+        pub fn create_output_fpath_advanced(
+            options: CreateExportPathOptions,
+            state: Option<&TrainerStateMetadata>,
+        ) -> PathBuf {
+            let dir_path = create_output_dir(options.output_dir, options.output_label.clone());
+            let fname_description = match (options.output_label, state) {
+                (Some(_), Some(state)) => metadata_fname_description(state),
+                _ => default_fname_description(options.label),
+            };
+            let (fname_prefix, fname_ext) = options.fname_prefix_ext;
             let fpath = dir_path.join(format!("{fname_prefix}-{fname_description}{fname_ext}"));
 
-            if let Ok(true) = fpath.try_exists() {
+            if let (Ok(true), true) = (fpath.try_exists(), options.is_unique_path) {
                 let fpath_prefix = dir_path.join(format!("{fname_prefix}-{fname_description}"));
                 if let Some(value) = get_next_path(fpath_prefix, fname_ext.to_string()) {
                     return value;
@@ -1319,11 +1377,8 @@ pub mod writer {
             None
         }
 
-        fn create_output_dir(
-            output_dir: Option<&String>,
-            output_label: Option<&String>,
-        ) -> PathBuf {
-            let output_dir = output_dir.cloned().unwrap_or("out".to_string());
+        fn create_output_dir(output_dir: Option<&str>, output_label: Option<&str>) -> PathBuf {
+            let output_dir = output_dir.unwrap_or("out");
             let dir_path = Path::new(&output_dir);
             let dir_path = match output_label {
                 Some(label) => dir_path.join(label),
