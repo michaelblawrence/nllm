@@ -8,3 +8,6 @@ members = [
     "nllm_chat_web",
     "nllm_chat_functions",
 ]
+
+[profile.release]
+debug = true
