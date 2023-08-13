@@ -126,7 +126,11 @@ fn parse_repl_char(
         ',' => tx.send(TrainerMessage::MultiplyLearnRateBy(0.5))?,
         '.' => tx.send(TrainerMessage::MultiplyLearnRateBy(2.0))?,
         'e' => tx.send(TrainerMessage::IncreaseMaxRounds(config.training_rounds))?,
-        '/' => tx.send(TrainerMessage::UnpauseForSingleIteration)?,
+        '/' => tx.send(TrainerMessage::UnpauseForIterations(1))?,
+        '_' => tx.send(prompt("iterations", |x| match x.parse::<usize>() {
+            Ok(n) => TrainerMessage::UnpauseForIterations(n),
+            Err(_) => TrainerMessage::NoOp,
+        }))?,
         'p' => tx.send(TrainerMessage::TogglePause)?,
         'c' => tx.send(TrainerMessage::PrintConfig)?,
         'l' => tx.send(prompt("output_label", |x| {
