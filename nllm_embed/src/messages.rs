@@ -39,7 +39,7 @@ pub enum TrainerMessage {
     PlotTrainingLossGraphDispatch(TrainerStateMetadata),
     Yield,
     NoOp,
-    UnpauseForSingleIteration,
+    UnpauseForIterations(usize),
     PlotHeatMapGraphs,
     PrintConfig,
 }
@@ -54,8 +54,8 @@ impl TrainerMessage {
             TrainerMessage::PrintTrainingStatus => TrainerHandleActions::PrintTrainingStatus,
             TrainerMessage::PrintStatus => TrainerHandleActions::PrintStatus,
             TrainerMessage::Halt => TrainerHandleActions::Halt,
-            TrainerMessage::UnpauseForSingleIteration => {
-                TrainerHandleActions::UnpauseForSingleIteration
+            TrainerMessage::UnpauseForIterations(n) => {
+                TrainerHandleActions::UnpauseForIterations(n)
             }
             TrainerMessage::TogglePause => TrainerHandleActions::TogglePause,
             TrainerMessage::TogglePrintAllStatus => TrainerHandleActions::TogglePrintAllStatus,
@@ -177,7 +177,7 @@ pub enum TrainerHandleActions {
     ReplaceEmbeddingState(String, TrainerStateMetadata),
     SuppressAutoPrintStatus,
     PrintEachRoundNumber,
-    UnpauseForSingleIteration,
+    UnpauseForIterations(usize),
 }
 
 impl TrainerHandleActions {
@@ -197,9 +197,13 @@ impl TrainerHandleActions {
             TrainerHandleActions::TogglePrintAllStatus => {
                 state.force_report_all = !state.force_report_all
             }
-            TrainerHandleActions::UnpauseForSingleIteration => {
-                info!("Pausing after next round...");
-                state.defer_pause(1);
+            TrainerHandleActions::UnpauseForIterations(n) => {
+                if n == 1 {
+                    info!("Pausing after next round...");
+                } else {
+                    info!("Pausing after {n} rounds...");
+                }
+                state.defer_pause(n);
                 return ControlFlow::Break(());
             }
             TrainerHandleActions::TogglePause => {
