@@ -26,7 +26,7 @@ fn run(model_fpath: &mut Option<String>) -> bool {
     let char_mode = state.char_mode.expect("missing char_mode");
 
     println!("Starting... (character input mode = {char_mode})");
-    println!("   - Commands available: [ '.load <path>' | '.reload' | '.supervise' | '.reset' | '.quit' ]");
+    println!("   - Commands available: [ '.load <path>' | '.reload' | '.quit' ]");
 
     // TODO: add inference mode hint to model json?
     let detected_human_ctx_chat_format = model.description() == "GenerativeDecoderTransformer"
@@ -42,11 +42,6 @@ fn run(model_fpath: &mut Option<String>) -> bool {
     println!("");
 
     let stdin = io::stdin();
-
-    let mut vocab_supervised_predictions_enabled = false;
-    let mut vocab: Option<HashSet<String>> = None;
-
-    let default_min_word_len = 3;
     let rng = RngStrategy::default();
 
     loop {
@@ -64,13 +59,6 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             CliReplActions::Quit => {
                 return false;
             }
-            CliReplActions::SetVocabSupervisionEnabled(enabled) => {
-                vocab_supervised_predictions_enabled = enabled;
-                if vocab_supervised_predictions_enabled {
-                    configure_vocab(&mut vocab, &state, default_min_word_len);
-                }
-                continue;
-            }
             CliReplActions::Reprompt => {
                 continue;
             }
@@ -79,9 +67,7 @@ fn run(model_fpath: &mut Option<String>) -> bool {
         let config = PromptConfig {
             use_gdt: state.use_gdt,
             char_mode,
-            vocab_supervised_predictions_enabled,
             chat_mode,
-            vocab: vocab.as_ref(),
         };
         let response = match respond::process_prompt(&model, &rng, &input_txt, &config) {
             Ok(x) => x,
@@ -178,21 +164,12 @@ enum CliReplActions {
     ProcessInput,
     Reload(String),
     Quit,
-    SetVocabSupervisionEnabled(bool),
     Reprompt,
 }
 
 fn process_repl_commands(input_txt: &str, model_fpath: Option<&String>) -> CliReplActions {
     if input_txt == ".quit" {
         return CliReplActions::Quit;
-    }
-
-    if input_txt == ".supervise" {
-        return CliReplActions::SetVocabSupervisionEnabled(true);
-    }
-
-    if input_txt == ".reset" {
-        return CliReplActions::SetVocabSupervisionEnabled(false);
     }
 
     if input_txt.starts_with(".load") {

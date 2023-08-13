@@ -9,9 +9,9 @@ use anyhow::{bail, Context, Result};
 
 use plane::ml::{
     embeddings::{builder::EmbeddingBuilder, Embedding},
-    gdt::GenerativeDecoderTransformer,
+    gdt::{GenerativeDecoderTransformer, InferContext, InferSampling},
     seq2seq::transformer::CharacterTransformer,
-    LayerValues, RngStrategy,
+    LayerValues, NodeValue, RngStrategy,
 };
 
 pub enum RespondModel {
@@ -88,9 +88,22 @@ impl RespondModel {
                         return Box::new(std::iter::empty());
                     }
                 };
+                let temp = std::env::var("NLLM_TEMP")
+                    .ok()
+                    .and_then(|x| x.parse::<NodeValue>().ok())
+                    .unwrap_or_else(|| {
+                        println!("PLEASE SET 'NLLM_TEMP' env var");
+                        1.0
+                    });
                 Box::new(
-                    gdt.predict_from_iter(&token_sequence)
-                        .map(|c| c.appendable()),
+                    gdt.generate_sequence_iter(
+                        &token_sequence,
+                        InferContext {
+                            sampling: InferSampling::Temperature(temp),
+                            max_len: 40,
+                        },
+                    )
+                    .map(|c| c.appendable()),
                 )
             }
         }
@@ -189,12 +202,10 @@ pub fn from_json(json: &str) -> Result<(RespondModel, ExtractedModelConfig)> {
     Ok((model, state))
 }
 
-pub struct PromptConfig<'a> {
+pub struct PromptConfig {
     pub use_gdt: bool,
     pub char_mode: bool,
-    pub vocab_supervised_predictions_enabled: bool, // TODO: remove
     pub chat_mode: PromptChatMode,
-    pub vocab: Option<&'a HashSet<String>>, // TODO: remove
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -210,9 +221,7 @@ pub fn process_prompt<'a>(
     PromptConfig {
         use_gdt,
         char_mode,
-        vocab_supervised_predictions_enabled: _,
         chat_mode,
-        vocab: _,
     }: &PromptConfig,
 ) -> Result<impl Iterator<Item = (String, &'a str)> + 'a> {
     let (char_mode, use_gdt) = (*char_mode, *use_gdt);
@@ -236,31 +245,30 @@ pub fn process_prompt<'a>(
         _ => (),
     };
 
-    let response = model.predict_from_iter(&prompt_txt);
+    let response_iter = model.predict_from_iter(&prompt_txt);
 
-    let response: Box<dyn Iterator<Item = (String, &str)>> = if use_gdt {
-        Box::new(response.into_iter().map(|x| (x, "")))
+    let token_separator_pair_iter: Box<dyn Iterator<Item = (String, &str)>> = if use_gdt {
+        Box::new(response_iter.map(|x| (x, "")))
     } else if char_mode {
         if append_space {
-            Box::new(response.into_iter().map(|x| (x, "")))
+            Box::new(response_iter.map(|x| (x, "")))
         } else {
             Box::new(
                 [(prompt_txt.to_string(), "")]
                     .into_iter()
-                    .chain(response.into_iter().skip(1).map(|x| (x, ""))),
+                    .chain(response_iter.skip(1).map(|x| (x, ""))),
             )
         }
     } else {
-        Box::new(response.into_iter().map(|x| (x, " ")))
+        Box::new(response_iter.map(|x| (x, " ")))
     };
 
     match chat_mode {
-        PromptChatMode::DirectPrompt => Ok(response),
-        PromptChatMode::TripleHashHumanPrompt => {
-            Ok(Box::new(response.take_while(|(token, _separator)| {
-                !token.trim_start().starts_with("###")
-            })))
-        }
+        PromptChatMode::DirectPrompt => Ok(token_separator_pair_iter),
+        PromptChatMode::TripleHashHumanPrompt => Ok(Box::new(
+            token_separator_pair_iter
+                .take_while(|(token, _separator)| !token.trim_start().starts_with("###")),
+        )),
     }
 }
 
