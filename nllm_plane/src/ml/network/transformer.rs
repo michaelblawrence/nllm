@@ -538,10 +538,11 @@ pub mod decoder {
 
             pub fn build(self) -> Result<Decoder> {
                 let head_count = match self.head_count.or_else(|| self.get_default_head_count()) {
-                    Some(head_count) if self.model_dimension % head_count == 0 => {
-                        head_count
-                    }
-                    _ => Err(anyhow!("head_count is not a factor of model_dimension={}", self.model_dimension))?,
+                    Some(head_count) if self.model_dimension % head_count == 0 => head_count,
+                    _ => Err(anyhow!(
+                        "head_count is not a factor of model_dimension={}",
+                        self.model_dimension
+                    ))?,
                 };
                 if self.padding_token >= self.target_vocab_size {
                     Err(anyhow!(
@@ -3827,12 +3828,15 @@ pub mod linear {
     }
 
     impl<'a> LinearIter<'a> {
+        /// returns underlying data stride dimension size (or 'width')
         pub fn stride(&self) -> usize {
             self.stride
         }
+        /// returns underlying data count dimension size (or 'height')
         pub fn count(&self) -> usize {
             self.count
         }
+        /// returns owned result of performing matrix multiplication of (Self * Rhs.T)
         pub fn matrix_transpose_product(self, rhs_transpose: Self) -> Linear {
             assert_eq!(
                 self.stride, rhs_transpose.stride,
@@ -3866,6 +3870,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise multiplication
         pub fn dot_product(self, other: Self) -> Self {
             assert_eq!(self.stride, other.stride, "mismatched stride dimension");
             assert_eq!(self.count, other.count, "mismatched count dimension");
@@ -3875,6 +3880,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise division
         pub fn div(self, rhs: Self, epsilon: Option<NodeValue>) -> Self {
             assert_eq!(self.stride, rhs.stride, "mismatched stride dimension");
             assert_eq!(self.count, rhs.count, "mismatched count dimension");
@@ -3887,6 +3893,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise addition
         pub fn add(self, other: Self) -> Self {
             assert_eq!(self.stride, other.stride, "mismatched stride dimension");
             assert_eq!(self.count, other.count, "mismatched count dimension");
@@ -3896,6 +3903,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise addition by scalar constant
         pub fn add_scalar(self, rhs: NodeValue) -> Self {
             Self {
                 inner: Box::new(self.inner.map(move |x| x + rhs)),
@@ -3903,6 +3911,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise subtraction
         pub fn sub(self, rhs: Self) -> Self {
             assert_eq!(self.stride, rhs.stride, "mismatched stride dimension");
             assert_eq!(self.count, rhs.count, "mismatched count dimension");
@@ -3912,6 +3921,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise subtraction by scalar constant
         pub fn sub_scalar(self, rhs: NodeValue) -> Self {
             Self {
                 inner: Box::new(self.inner.map(move |x| x - rhs)),
@@ -3919,6 +3929,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise multiplication by scalar constant
         pub fn multiply_scalar(self, rhs: NodeValue) -> Self {
             Self {
                 inner: Box::new(self.inner.map(move |x| x * rhs)),
@@ -3926,6 +3937,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise raise to the power of scalar integer constant
         pub fn powi_scalar(self, n: i32) -> Self {
             Self {
                 inner: Box::new(self.inner.map(move |x| x.powi(n))),
@@ -3933,6 +3945,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise raise to the power of scalar floting point constant
         pub fn powf_scalar(self, n: NodeValue) -> Self {
             Self {
                 inner: Box::new(self.inner.map(move |x| x.powf(n))),
@@ -3940,6 +3953,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise round to fixed point decimal
         pub fn round(self, decimals: u32) -> Self {
             let mul = 10u32.pow(decimals) as f64;
             Self {
@@ -3948,6 +3962,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise absolute value computation
         pub fn abs(self) -> Self {
             Self {
                 inner: Box::new(self.inner.map(move |x| x.abs())),
@@ -3955,6 +3970,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise square root value computation
         pub fn sqrt(self) -> Self {
             Self {
                 inner: Box::new(self.inner.map(move |x| x.sqrt())),
@@ -3983,6 +3999,8 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// point-wise mask-based value overwrite computation.
+        /// Note: a value at given position is set to masked_value only where the value of the mask is 0.0
         pub fn set_mask(self, mask: Self, masked_value: NodeValue) -> Self {
             assert_eq!(self.stride, mask.stride, "mismatched stride dimension");
             assert_eq!(self.count, mask.count, "mismatched count dimensions");
@@ -3998,6 +4016,8 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// extends stride dimension by copying duplicating column values
+        /// Note: stride dimension must be equal to 1
         pub fn grow(self, stride: usize) -> Self {
             assert_eq!(self.stride, 1, "can only grow when stride dimension = 1");
             assert_ne!(stride, 0, "invalid stride dimension");
@@ -4007,6 +4027,8 @@ pub mod linear {
                 count: self.count,
             }
         }
+        /// extends count dimension by copying duplicating row values
+        /// Note: count dimension must be equal to 1
         pub fn stack(self, count: usize) -> Self {
             assert_eq!(self.count, 1, "can only stack when count dimension = 1");
             assert_ne!(count, 0, "invalid stride dimension");
@@ -4099,7 +4121,9 @@ pub mod linear {
         pub fn flatten_stddev(self, mean: Self, corrected: bool) -> Linear {
             assert_eq!(self.count, mean.count, "mismatched count dimension");
             assert_eq!(mean.stride, 1, "invalid mean stride dimension");
-            assert!(self.stride > 1, "invalid stride dimension");
+            if self.stride == 1 {
+                return Linear::with_value(self.count, 1, 0.0);
+            }
             let factor = if corrected {
                 ((self.stride - 1) as NodeValue).powf(-0.5)
             } else {
@@ -4519,6 +4543,10 @@ pub mod params {
         }
         fn dequeue_all(&self) -> Vec<Linear> {
             self.1.lock().unwrap().drain(..).collect()
+        }
+        pub fn peek_gradients<T>(&self, action: impl FnOnce(&Linear) -> T) -> T {
+            let gradients = self.0.read().unwrap();
+            action(&*gradients)
         }
     }
 
