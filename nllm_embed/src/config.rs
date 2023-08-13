@@ -107,6 +107,10 @@ pub struct TrainEmbeddingConfig {
 
     #[arg(long, default_value = None)]
     #[serde(default)]
+    pub phrase_disable_shuffle: bool,
+
+    #[arg(long, default_value = None)]
+    #[serde(default)]
     pub phrase_split_seed: Option<isize>,
 
     #[arg(short = 'm', long, value_enum, default_value_t = LayerActivationConfig::Tanh)]

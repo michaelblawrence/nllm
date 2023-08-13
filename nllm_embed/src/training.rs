@@ -275,9 +275,10 @@ impl<M: MLModel> TrainerState<M> {
     }
 
     pub fn batch_size(&self) -> TrainBatchConfig {
-        match self.inital_config.single_batch_iterations {
-            true => TrainBatchConfig::SingleBatch(self.inital_config.batch_size),
-            false => self.inital_config.batch_size.into(),
+        if self.inital_config.single_batch_iterations {
+            TrainBatchConfig::SingleBatch(self.inital_config.batch_size)
+        } else {
+            TrainBatchConfig::Batches(self.inital_config.batch_size)
         }
     }
 
@@ -713,12 +714,14 @@ pub fn init_phrases_and_vocab(
             counts
         });
 
-    phrases.sort_by_cached_key(|phrase| {
-        phrase
-            .iter()
-            .map(|word| -(vocab_counts.get(word).unwrap_or(&1).pow(2) as i128))
-            .sum::<i128>()
-    });
+    if !config.phrase_disable_shuffle {
+        phrases.sort_by_cached_key(|phrase| {
+            phrase
+                .iter()
+                .map(|word| -(vocab_counts.get(word).unwrap_or(&1).pow(2) as i128))
+                .sum::<i128>()
+        });
+    }
 
     if let Some(phrase_train_set_size) = config.phrase_train_set_size {
         phrases.truncate(phrase_train_set_size);
@@ -741,7 +744,9 @@ pub fn init_phrases_and_vocab(
 
     let vocab = compute_vocab(&phrases, None);
 
-    plane::ml::ShuffleRng::shuffle_vec(&rng, &mut phrases);
+    if !config.phrase_disable_shuffle {
+        plane::ml::ShuffleRng::shuffle_vec(&rng, &mut phrases);
+    }
 
     // TODO: cleanup
     Some(&phrases)
