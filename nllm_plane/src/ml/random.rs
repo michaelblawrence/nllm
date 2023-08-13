@@ -181,7 +181,7 @@ impl RNG for JsRng {
 }
 
 mod rc {
-    use std::{sync::Arc, ops::Deref};
+    use std::{ops::Deref, sync::Arc};
 
     use super::{RngStrategy, RNG};
 
@@ -278,9 +278,9 @@ pub struct SeedableTestRng(MutexCell<algo::mersenne_twister::MersenneTwister>);
 
 impl SeedableTestRng {
     pub fn new(seed: u32) -> Self {
-        Self(MutexCell::new(algo::mersenne_twister::MersenneTwister::new(
-            seed,
-        )))
+        Self(MutexCell::new(
+            algo::mersenne_twister::MersenneTwister::new(seed),
+        ))
     }
 }
 
@@ -478,17 +478,18 @@ impl<T: Deref<Target = dyn RNG>> ShuffleRng for T {
 
 impl<T: Deref<Target = dyn RNG>> SamplingRng for T {
     fn sample_uniform(&self, probabilities: &Vec<NodeValue>) -> Result<usize> {
-        let (sampled_idx, _) = probabilities.iter().enumerate().fold(
-            (None, self.rand()),
-            |(sampled_idx, state), (p_idx, p)| {
-                let next_state = state - p;
-                match sampled_idx {
-                    Some(sampled_idx) => (Some(sampled_idx), next_state),
-                    None if next_state <= 0.0 => (Some(p_idx), next_state),
-                    None => (None, next_state),
+        let sampled_idx = probabilities
+            .iter()
+            .enumerate()
+            .scan(self.rand(), |state, (p_idx, p)| {
+                if *state > 0.0 {
+                    *state -= p;
+                    Some(p_idx)
+                } else {
+                    None
                 }
-            },
-        );
+            })
+            .last();
 
         let sampled_idx = sampled_idx.with_context(|| {
             format!("failed to sample from provided probabilities: {probabilities:?}")
