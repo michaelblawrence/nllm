@@ -443,16 +443,35 @@ pub mod token {
                             let indexed_corpus = &corpus[start_idx + start_offset..];
                             let chars: String = indexed_corpus
                                 .lines()
-                                .map(|x| x.split_whitespace().take(token_len + 1).join(" "))
+                                .scan(token_len + 1, |budget, x| {
+                                    let peekable = &mut x
+                                        .split_whitespace()
+                                        .take_while(|_| {
+                                            let can_decrement = *budget > 0;
+                                            if can_decrement {
+                                                *budget -= 1;
+                                            }
+                                            can_decrement
+                                        })
+                                        .peekable();
+                                    peekable.peek()?;
+                                    Some(peekable.join(" "))
+                                })
                                 .join("\n");
 
-                            let sequence = self.encode_truncated(&chars, Some(token_len + 1))?;
+                            let mut sequence =
+                                self.encode_truncated(&chars, Some(token_len + 1))?;
                             let sequence = if sequence.len() > token_len + 1 {
-                                let max_start_idx = sequence.len().saturating_sub(token_len + 1);
-                                let start_idx = rng.rand_range(0, max_start_idx);
-                                let end_idx = start_idx + token_len + 1;
+                                if sample_from_pattern.is_none() {
+                                    let max_start_idx = sequence.len().saturating_sub(token_len + 1);
+                                    let start_idx = rng.rand_range(0, max_start_idx);
+                                    let end_idx = start_idx + token_len + 1;
 
-                                sequence[start_idx..end_idx].to_vec()
+                                    sequence[start_idx..end_idx].to_vec()
+                                } else {
+                                    sequence.truncate(token_len + 1);
+                                    sequence
+                                }
                             } else if sequence.len() < token_len + 1 {
                                 let control_token = self.control_token();
                                 let pad_count = (token_len + 1).saturating_sub(sequence.len());
@@ -511,7 +530,8 @@ pub mod token {
                             let substring = {
                                 let mut chars = corpus.chars();
                                 // TODO replace with `chars.advance_by(start_index)` once iter api is stable
-                                chars.nth(start_index.saturating_sub(1))
+                                chars
+                                    .nth(start_index.saturating_sub(1))
                                     .expect("start index should be in range");
                                 chars.as_str()
                             };
@@ -519,7 +539,11 @@ pub mod token {
                                 .and_then(|pattern| substring.find(pattern))
                                 .unwrap_or_default();
 
-                            let chars: String = substring.chars().skip(position).take(token_len + 1).collect();
+                            let chars: String = substring
+                                .chars()
+                                .skip(position)
+                                .take(token_len + 1)
+                                .collect();
                             let sequence = self.encode(&chars)?;
                             batch_samples.push(sequence);
                         }
@@ -1025,6 +1049,26 @@ impl GenerativeDecoderTransformer {
         token.context("sampled token should be in vocab dict")
     }
 
+    pub fn predict_next_with_temperature(
+        &self,
+        last_tokens: &[token::Token],
+        temperature: NodeValue,
+    ) -> Result<token::Token> {
+        let logits = {
+            let mut probabilities = self.sample_probabilities(last_tokens)?;
+            let logit_factor = 1.0 / (temperature + 1e-8);
+            probabilities
+                .iter_mut()
+                .for_each(|p| *p = p.ln() * logit_factor);
+            probabilities
+        };
+        let scaled_probabilities = self.compute_probabilities_row(&logits)?;
+        let sampled_idx = self.rng.sample_uniform(&scaled_probabilities)?;
+        let token = self.vocab.token_decode(sampled_idx);
+
+        token.context("sampled token should be in vocab dict")
+    }
+
     pub fn predict_from(&self, last_word: &str) -> Result<token::Token> {
         let last_tokens = self.vocab.encode(last_word)?;
         self.predict_next(&last_tokens)
@@ -1092,6 +1136,20 @@ impl GenerativeDecoderTransformer {
         &'a self,
         seed_tokens: &[token::Token],
     ) -> impl Iterator<Item = token::Token> + 'a {
+        self.generate_sequence_iter(
+            seed_tokens,
+            InferContext {
+                sampling: InferSampling::Uniform,
+                max_len: 40,
+            },
+        )
+    }
+
+    pub fn generate_sequence_iter<'a>(
+        &'a self,
+        seed_tokens: &[token::Token],
+        context: InferContext,
+    ) -> impl Iterator<Item = token::Token> + 'a {
         let mut token_counts = HashMap::new();
         let (curr_token, seed_tokens) = match seed_tokens.split_last() {
             Some((curr_token, seed_tokens)) => (Some(curr_token), seed_tokens),
@@ -1104,9 +1162,17 @@ impl GenerativeDecoderTransformer {
 
         let input_stride_width = self.input_stride_width();
         let control_vocab = self.control_vocab();
-        let max_len = 40;
+        let next_token: Box<dyn Fn(&[token::Token]) -> Option<token::Token>> =
+            match context.sampling {
+                InferSampling::Uniform => {
+                    Box::new(|context_tokens| self.predict_next(&context_tokens).ok())
+                }
+                InferSampling::Temperature(t) => Box::new(move |context_tokens| {
+                    self.predict_next_with_temperature(&context_tokens, t).ok()
+                }),
+            };
 
-        std::iter::from_fn(move || {
+        std::iter::from_fn(move || -> Option<token::Token> {
             if curr_token
                 .as_ref()
                 .map(|x| x == &control_vocab)
@@ -1117,7 +1183,7 @@ impl GenerativeDecoderTransformer {
             } else if *token_counts
                 .get(curr_token.as_ref().unwrap_or(&control_vocab))
                 .unwrap_or(&0)
-                > max_len
+                > context.max_len
             {
                 None
             } else {
@@ -1134,8 +1200,8 @@ impl GenerativeDecoderTransformer {
                 };
 
                 let context_tokens_slice = context_tokens.iter().cloned().collect::<Vec<_>>();
-
-                curr_token = Some(self.predict_next(&context_tokens_slice).ok()?);
+                let token = next_token(&context_tokens_slice)?;
+                curr_token = Some(token);
                 tokens_generated += 1;
 
                 while context_tokens.len() > input_stride_width {
@@ -1169,6 +1235,16 @@ impl GenerativeDecoderTransformer {
     pub fn vocab(&self) -> &token::Vocab {
         &self.vocab
     }
+}
+
+pub struct InferContext {
+    pub sampling: InferSampling,
+    pub max_len: usize,
+}
+
+pub enum InferSampling {
+    Uniform,
+    Temperature(NodeValue),
 }
 
 pub struct TrainContext<'a> {
