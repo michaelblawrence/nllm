@@ -2,6 +2,7 @@
 name = "embed"
 version = "0.1.0"
 edition = "2021"
+default-run = "embed"
 
 # [profile.release]
 # debug = true
