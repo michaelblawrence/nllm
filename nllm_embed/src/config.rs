@@ -5,22 +5,22 @@ use plane::ml::{NetworkActivationMode, NodeValue};
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 pub struct TrainEmbeddingConfig {
-    #[arg(short = 'n', long, default_value_t = 4)]
+    #[arg(short = 'n', long, default_value_t = 128)]
     pub embedding_size: usize,
 
-    #[arg(short = 'h', long, default_value_t = 75)]
+    #[arg(short = 'h', long, default_value_t = 128)]
     pub hidden_layer_nodes: usize,
 
     #[arg(short = 'H', long, default_value = None)]
     pub hidden_deep_layer_nodes: Option<String>,
 
-    #[arg(short = 'c', long, default_value_t = 1000)]
+    #[arg(short = 'c', long, default_value_t = 10000)]
     pub training_rounds: usize,
 
-    #[arg(short = 'w', long, default_value_t = 3)]
+    #[arg(short = 'w', long, default_value_t = 64)]
     pub input_stride_width: usize,
 
-    #[arg(short = 'b', long, default_value_t = 16)]
+    #[arg(short = 'b', long, default_value_t = 32)]
     pub batch_size: usize,
 
     #[arg(short = 's', long, default_value_t = false)]
@@ -54,7 +54,7 @@ pub struct TrainEmbeddingConfig {
     #[arg(long, default_value_t = 1000)]
     pub gdt_bpe_vocab_size: usize,
 
-    #[arg(short = 'r', long, default_value_t = 1e-3)]
+    #[arg(short = 'r', long, default_value_t = 4e-3)]
     pub train_rate: NodeValue,
 
     #[arg(short = 'q', long, default_value_t = false)]
@@ -69,7 +69,7 @@ pub struct TrainEmbeddingConfig {
     #[serde(default = "default_autosave_interval_mins")]
     pub autosave_interval_mins: u64,
 
-    #[arg(short = 'o', long, default_value = None)]
+    #[arg(short = 'o', long, default_value = "out")]
     #[serde(default)]
     pub output_dir: Option<String>,
 
@@ -95,7 +95,7 @@ pub struct TrainEmbeddingConfig {
     #[arg(short = 'T', long, default_value = None)]
     pub phrase_train_set_size: Option<usize>,
 
-    #[arg(short = 'B', long, value_parser = parse_range::<usize>, default_value = "5..10")]
+    #[arg(short = 'B', long, value_parser = parse_range::<usize>, default_value = "..")]
     pub phrase_word_length_bounds: (Option<usize>, Option<usize>),
 
     #[arg(short = 'X', long, default_value = "20")]
