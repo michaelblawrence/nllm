@@ -484,7 +484,7 @@ where
     };
 
     let (char_vocab, str_vocab, gdt_vocab) = if config.use_character_tokens && !config.use_gdt {
-        info!("Tranforming vocab and train/test sets to character-level tokens");
+        info!("Transforming vocab and train/test sets to character-level tokens");
         phrases = characterize_phrases(phrases);
         testing_phrases = characterize_phrases(testing_phrases);
         vocab = compute_vocab(&phrases, Some(&testing_phrases));
@@ -496,13 +496,15 @@ where
 
         (Some(char_vocab), None, None)
     } else if config.use_gdt {
-        let vocab_builder = gdt::token::Vocab::new_builder(if config.gdt_bpe_enable {
+        let token_type = if config.gdt_bpe_enable {
             gdt::token::VocabTokenType::BPE
         } else if config.gdt_word_mode {
             gdt::token::VocabTokenType::Word
         } else {
             gdt::token::VocabTokenType::Char
-        })
+        };
+        info!("Building GDT vocab (type = {token_type:?})...");
+        let vocab_builder = gdt::token::Vocab::new_builder(token_type)
         .with_max_vocab_size(config.gdt_bpe_vocab_size);
 
         let vocab_builder = phrases
