@@ -511,7 +511,9 @@ where
             .iter()
             .chain(testing_phrases.iter())
             .fold(vocab_builder, |builder, x| {
-                builder.from_corpus(&x.join(" "))
+                let mut phrase = x.join(" ");
+                phrase.push('\n');
+                builder.from_corpus(&phrase)
             });
 
         let gdt_vocab = vocab_builder.with_char_fallback().build().unwrap();
