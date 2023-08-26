@@ -222,7 +222,7 @@ async fn get_lambda_funtion_url(
     Ok(function_url)
 }
 
-pub fn to_prompt_config(state: &respond::ExtractedModelConfig) -> respond::PromptConfig<'_> {
+pub fn to_prompt_config(state: &respond::ExtractedModelConfig) -> respond::PromptConfig {
     use respond::PromptChatMode::*;
     let char_mode = state.char_mode.expect("missing char_mode");
     let use_human_ctx_chat_format = std::env::var("NLLM_TRIPLE_HASH_PROMPT")
@@ -236,9 +236,7 @@ pub fn to_prompt_config(state: &respond::ExtractedModelConfig) -> respond::Promp
     respond::PromptConfig {
         use_gdt: state.use_gdt,
         char_mode,
-        vocab_supervised_predictions_enabled: false,
         chat_mode,
-        vocab: None,
     }
 }
 

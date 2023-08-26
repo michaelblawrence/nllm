@@ -161,9 +161,7 @@ pub fn infer<'a>(
     let config = respond::PromptConfig {
         use_gdt: state.use_gdt,
         char_mode,
-        vocab_supervised_predictions_enabled: false,
         chat_mode,
-        vocab: None,
     };
 
     enum State {
