@@ -90,9 +90,8 @@ impl MLModel for EmbedModel {
                 model.train(phrases, *learn_rate, batch_size)
             }
             EmbedModel::GDT(model, GDTTrainContext(opt, _, train_corpus, sample_from_pattern)) => {
-                let char_mode = model.vocab().token_type().is_char();
                 let train_corpus = &*train_corpus.get_or_insert_with(move || {
-                    training::TrainerState::<()>::join_phrases(phrases, Some(char_mode))
+                    training::TrainerState::<()>::join_phrases(phrases, Some(false))
                 });
                 let train_context = TrainContext::new(batch_size, sample_from_pattern.as_deref());
                 model.train(train_corpus, opt, &train_context)
