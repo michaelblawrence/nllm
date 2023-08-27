@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -505,16 +504,17 @@ where
         };
         info!("Building GDT vocab (type = {token_type:?})...");
         let vocab_builder = gdt::token::Vocab::new_builder(token_type)
-        .with_max_vocab_size(config.gdt_bpe_vocab_size);
+            .with_max_vocab_size(config.gdt_bpe_vocab_size);
 
-        let vocab_builder = phrases
-            .iter()
-            .chain(testing_phrases.iter())
-            .fold(vocab_builder, |builder, x| {
-                let mut phrase = x.join(" ");
-                phrase.push('\n');
-                builder.from_corpus(&phrase)
-            });
+        let vocab_builder =
+            phrases
+                .iter()
+                .chain(testing_phrases.iter())
+                .fold(vocab_builder, |builder, x| {
+                    let mut phrase = x.join(" ");
+                    phrase.push('\n');
+                    builder.from_corpus(&phrase)
+                });
 
         let gdt_vocab = vocab_builder.with_char_fallback().build().unwrap();
 

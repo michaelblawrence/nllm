@@ -113,7 +113,7 @@ pub mod token {
                 match &self.inner {
                     GDTToken::Word(x) => x.chars().count(),
                     GDTToken::Subword(x) => x.chars().count(),
-                    GDTToken::Char(x) => 1,
+                    GDTToken::Char(_) => 1,
                 }
             }
             pub fn appendable(&self) -> String {

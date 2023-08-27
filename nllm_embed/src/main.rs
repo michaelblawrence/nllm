@@ -1,4 +1,4 @@
-use std::{io::Write, ops::ControlFlow, rc::Rc, thread};
+use std::{io::Write, ops::ControlFlow, thread};
 
 use anyhow::Result;
 use tracing::metadata::LevelFilter;
