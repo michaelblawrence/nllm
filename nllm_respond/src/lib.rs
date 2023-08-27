@@ -1,9 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fs::File,
-    io::Read,
-    path::Path,
-};
+use std::{collections::HashMap, fs::File, io::Read, path::Path};
 
 use anyhow::{bail, Context, Result};
 
@@ -216,7 +211,6 @@ pub enum PromptChatMode {
 
 pub fn process_prompt<'a>(
     model: &'a RespondModel,
-    rng: &RngStrategy,
     input_txt: &'a str,
     PromptConfig {
         use_gdt,
@@ -315,10 +309,6 @@ fn to_context_tokens<'a>(
             .collect()
     };
     context_tokens.into_iter()
-}
-
-fn is_token_alphabetic(token: &String) -> bool {
-    token.chars().next().unwrap_or(' ').is_alphabetic()
 }
 
 pub struct ExtractedModelConfig {

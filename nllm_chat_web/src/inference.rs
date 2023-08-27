@@ -1,10 +1,10 @@
 use anyhow::{bail, Context};
 use aws_sdk_lambda::types::InvokeMode;
-use plane::ml::RngStrategy;
 use serde_json::json;
-use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use tracing::{error, info};
+
+use std::{sync::Arc, time::Duration};
 
 #[derive(Debug, Clone)]
 pub struct ModelPromptRequest {
@@ -108,8 +108,7 @@ pub fn spawn_local_inference(
     let (model, state) = respond::load(model_fpath).unwrap();
     let (model_tx, mut model_rx) = broadcast::channel::<ModelPromptRequest>(100);
 
-    let rng = RngStrategy::default();
-    let ctx = Arc::new((model, state, rng, tx.clone()));
+    let ctx = Arc::new((model, state, tx.clone()));
 
     tokio::spawn(async move {
         while let Ok(ModelPromptRequest { prompt, .. }) = model_rx.recv().await {
@@ -119,8 +118,8 @@ pub fn spawn_local_inference(
             let infer_task = tokio::task::spawn_blocking({
                 let prompt = prompt.clone();
                 move || {
-                    let (model, state, rng, tx) = &*ctx;
-                    let messages = infer(&prompt, &model, &state, &rng)?;
+                    let (model, state, tx) = &*ctx;
+                    let messages = infer(&prompt, &model, &state)?;
                     for msg in messages {
                         tx.send(msg)?;
                     }
@@ -144,7 +143,6 @@ pub fn infer<'a>(
     prompt: &'a str,
     model: &'a respond::RespondModel,
     state: &'a respond::ExtractedModelConfig,
-    rng: &'a RngStrategy,
 ) -> anyhow::Result<impl Iterator<Item = String> + 'a> {
     let config = to_prompt_config(state);
 
@@ -159,7 +157,7 @@ pub fn infer<'a>(
         Complete,
     }
     let mut state: Option<State> = None;
-    let mut response = respond::process_prompt(&model, &rng, &prompt, &config)?;
+    let mut response = respond::process_prompt(&model, &prompt, &config)?;
 
     Ok(std::iter::from_fn(move || match state.take() {
         None => {
@@ -238,36 +236,4 @@ pub fn to_prompt_config(state: &respond::ExtractedModelConfig) -> respond::Promp
         char_mode,
         chat_mode,
     }
-}
-
-pub fn run_inference(
-    prompt: &str,
-    model: &respond::RespondModel,
-    state: &respond::ExtractedModelConfig,
-    rng: &RngStrategy,
-    tx: &tokio::sync::broadcast::Sender<String>,
-) {
-    let inference_started = std::time::Instant::now();
-    let config = to_prompt_config(&state);
-
-    let response = match respond::process_prompt(&model, &rng, &prompt, &config) {
-        Ok(x) => x,
-        Err(_) => return,
-    };
-
-    _ = tx.send(format!("Chat: 　"));
-    let mut response_msg = String::new();
-    for (token, separator) in response {
-        response_msg += &format!("{token}{separator}");
-        _ = tx.send(format!("[CHAT_PARTIAL]: {response_msg}"));
-
-        if inference_started.elapsed() > Duration::from_secs(15) {
-            info!("Timed out on prompt `{prompt}`");
-            _ = tx.send(format!("Chat: {response_msg}..."));
-            return;
-        }
-    }
-
-    info!("Completed user prompt response");
-    _ = tx.send(format!("Chat: {response_msg}"));
 }

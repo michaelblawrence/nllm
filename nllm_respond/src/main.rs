@@ -1,13 +1,10 @@
 use std::{
-    collections::HashSet,
     env,
-    fs::File,
     io::{self, Write},
     path::Path,
 };
 
-use plane::ml::RngStrategy;
-use respond::{ExtractedModelConfig, PromptChatMode, PromptConfig};
+use respond::{PromptChatMode, PromptConfig};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -38,11 +35,10 @@ fn run(model_fpath: &mut Option<String>) -> bool {
     } else {
         PromptChatMode::DirectPrompt
     };
-    
+
     println!("");
 
     let stdin = io::stdin();
-    let rng = RngStrategy::default();
 
     loop {
         println!("");
@@ -69,12 +65,12 @@ fn run(model_fpath: &mut Option<String>) -> bool {
             char_mode,
             chat_mode,
         };
-        let response = match respond::process_prompt(&model, &rng, &input_txt, &config) {
+        let response = match respond::process_prompt(&model, &input_txt, &config) {
             Ok(x) => x,
             Err(_) => return false,
         };
 
-        print_prompt_response(response, &state);
+        print_prompt_response(response);
     }
 }
 
@@ -84,56 +80,7 @@ fn read_line(stdin: &io::Stdin) -> String {
     input_txt.trim().to_string()
 }
 
-fn parse_word_level_vocab(input_txt_path: &str, min_word_len: Option<usize>) -> HashSet<String> {
-    use io::{BufRead, BufReader};
-
-    let file = File::open(Path::new(&input_txt_path)).unwrap();
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    let mut words = HashSet::new();
-
-    if let Some(min_word_len) = min_word_len {
-        while let Some(Ok(line)) = lines.next() {
-            for word in line.split_whitespace().filter(|w| w.len() >= min_word_len) {
-                words.insert(word.to_string());
-            }
-        }
-    } else {
-        while let Some(Ok(line)) = lines.next() {
-            for word in line.split_whitespace() {
-                let word = word.trim_matches(|c| !char::is_alphanumeric(c));
-                words.insert(word.to_string());
-            }
-        }
-    }
-
-    words
-}
-
-fn configure_vocab(
-    vocab: &mut Option<HashSet<String>>,
-    state: &ExtractedModelConfig,
-    default_min_word_len: usize,
-) {
-    let min_word_len = Some(default_min_word_len);
-    match &state.input_txt_path {
-        Some(input_txt_path) => {
-            vocab.get_or_insert_with(|| {
-                println!("Loading input_txt vocab...");
-                parse_word_level_vocab(&input_txt_path, min_word_len)
-            });
-            println!("Enabled word-level response generation supervison!");
-        }
-        None => {
-            println!("Failed to enable word-level response generation supervison: input_txt vocab file path is missing");
-        }
-    }
-}
-
-fn print_prompt_response<'a>(
-    mut response_iter: impl Iterator<Item = (String, &'a str)>,
-    state: &ExtractedModelConfig,
-) {
+fn print_prompt_response<'a>(mut response_iter: impl Iterator<Item = (String, &'a str)>) {
     print!("Model Response:        ");
     io::stdout().flush().unwrap();
 

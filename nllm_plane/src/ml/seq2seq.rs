@@ -586,11 +586,6 @@ pub mod transformer {
         }
 
         mod training {
-            use std::{
-                collections::HashSet,
-                time::{Duration, Instant},
-            };
-
             use itertools::Itertools;
             use tracing::info;
 
@@ -621,8 +616,6 @@ pub mod transformer {
                     CharacterTransformer::from_builder_ordered(builder, &config.vocab, rng)
                         .unwrap();
 
-                let mut last_report_time: Option<(Instant, usize)> = None;
-
                 for round in 0..config.training_rounds {
                     let training_error = transformer
                         .train(
@@ -632,11 +625,7 @@ pub mod transformer {
                         )
                         .unwrap();
 
-                    let ms_per_round = last_report_time.map(|(last_dt, last_round)| {
-                        last_dt.elapsed().as_millis() / (round - last_round).max(1) as u128
-                    });
-
-                    if should_report_round(round, config.training_rounds, ms_per_round) {
+                    if should_report_round(round, config.training_rounds) {
                         let (validation_errors, predictions_pct) =
                             validate_test_set(&transformer, &config.testing_corpus);
 
@@ -645,23 +634,15 @@ pub mod transformer {
                             training_error,
                             validation_errors,
                             predictions_pct,
-                            ms_per_round,
                         );
-
-                        last_report_time = Some((std::time::Instant::now(), round));
                     }
                 }
 
                 transformer
             }
 
-            fn should_report_round(
-                round: usize,
-                training_rounds: usize,
-                ms_per_round: Option<u128>,
-            ) -> bool {
+            fn should_report_round(round: usize, training_rounds: usize) -> bool {
                 let round_1based = round + 1;
-                let target_report_interval_ms = 10_000.0;
 
                 let ten_factor = 100; //ms_per_round.map_or(100, |ms_per_round| {
                                       //     let ten_exp = (target_report_interval_ms / (ms_per_round as f64 + 1e-8))
@@ -682,7 +663,6 @@ pub mod transformer {
                 training_error: f64,
                 validation_errors: Vec<(f64, f64)>,
                 predictions_pct: f64,
-                ms_per_round: Option<u128>,
             ) {
                 let val_count = validation_errors.len() as NodeValue;
                 let (validation_error, nll) =
@@ -695,12 +675,8 @@ pub mod transformer {
                             )
                         });
 
-                let ms_per_round = ms_per_round
-                    .map(|ms_per_round| format!("(ms/round={ms_per_round:<4.1})"))
-                    .unwrap_or_default();
-
                 info!(
-                    "round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<6.3} {ms_per_round}",
+                    "round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<6.3}",
                     round + 1, training_error, predictions_pct, validation_error, nll
                 );
             }

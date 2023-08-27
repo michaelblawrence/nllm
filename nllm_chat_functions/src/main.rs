@@ -2,11 +2,11 @@ use anyhow::Context;
 use aws_sdk_s3::Client as S3Client;
 use hyper::{body::Body, Response};
 use lambda_runtime::{service_fn, Error, LambdaEvent};
-use plane::ml::RngStrategy;
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, BufReader};
 use tracing::info;
+
+use std::{sync::Arc, time::Duration};
 
 mod env {
     pub const MODEL_S3_BUCKET: &str = "NLLM_MODEL_S3_BUCKET";
@@ -20,7 +20,6 @@ async fn func(
     ctx: Arc<(
         respond::RespondModel,
         respond::ExtractedModelConfig,
-        RngStrategy,
         respond::PromptChatMode
     )>,
 ) -> Result<Response<Body>, Error> {
@@ -38,8 +37,8 @@ async fn func(
     let (tx, mut rx) = tokio::sync::broadcast::channel(100);
 
     tokio::task::spawn_blocking(move || {
-        let (model, state, rng, chat_mode) = &*ctx;
-        for message in infer(&prompt_txt, &model, &state, *chat_mode, &rng)? {
+        let (model, state, chat_mode) = &*ctx;
+        for message in infer(&prompt_txt, &model, &state, *chat_mode)? {
             tx.send(message)?;
         }
         <Result<(), Error>>::Ok(())
@@ -88,7 +87,6 @@ async fn main() -> Result<(), Error> {
         .without_time()
         .init();
 
-    let rng = RngStrategy::testable(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_millis());
     let (model, state) = match (
         std::env::var(env::MODEL_S3_BUCKET),
         std::env::var(env::MODEL_S3_KEY),
@@ -115,7 +113,7 @@ async fn main() -> Result<(), Error> {
         respond::PromptChatMode::DirectPrompt
     };
 
-    let ctx = Arc::new((model, state, rng, chat_mode));
+    let ctx = Arc::new((model, state, chat_mode));
     let handler = service_fn(|event| func(event, ctx.clone()));
 
     lambda_runtime::run_with_streaming_response(handler).await?;
@@ -154,7 +152,6 @@ pub fn infer<'a>(
     model: &'a respond::RespondModel,
     state: &'a respond::ExtractedModelConfig,
     chat_mode: respond::PromptChatMode,
-    rng: &'a RngStrategy,
 ) -> anyhow::Result<impl Iterator<Item = String> + 'a> {
     let char_mode = state.char_mode.expect("missing char_mode");
     let inference_started = std::time::Instant::now();
@@ -169,7 +166,7 @@ pub fn infer<'a>(
         Complete,
     }
     let mut state: Option<State> = None;
-    let mut response = respond::process_prompt(&model, &rng, &prompt, &config)?;
+    let mut response = respond::process_prompt(&model, &prompt, &config)?;
 
     Ok(std::iter::from_fn(move || match state.take() {
         None => {

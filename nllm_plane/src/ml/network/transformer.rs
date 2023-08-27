@@ -2250,33 +2250,45 @@ pub mod layers {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct DropoutLayer {
         dropout_rate: NodeValue,
-        // rng: RngStrategy,
+        #[serde(default)]
+        rng: RngStrategy,
     }
 
     impl DropoutLayer {
         pub fn new(dropout_rate: NodeValue, rng: &RngStrategy) -> Self {
-            // let rng = rng.clone().upgrade();
-            Self {
-                dropout_rate,
-                // rng
-            }
+            let rng = rng.clone().upgrade();
+            Self { dropout_rate, rng }
         }
 
         pub fn forward(&self, input: &Linear) -> Result<Linear> {
+            Ok(self.forward_advanced(&input)?.0)
+        }
+
+        pub fn forward_advanced(&self, input: &Linear) -> Result<(Linear, Linear)> {
             let rng = RngStrategy::default();
-            Ok(input.iter().dropout(self.dropout_rate, rng).collect())
+            let dropout_mask = input.iter().dropout_mask(self.dropout_rate, rng);
+            let masked_output = input.iter().dot_product(dropout_mask.iter()).collect();
+            Ok((masked_output, dropout_mask))
         }
 
         pub fn forward_if_enabled(&self, input: Linear, enabled: bool) -> Result<Linear> {
             if enabled {
-                self.forward(&input)
+                Ok(self.forward_advanced(&input)?.0)
             } else {
                 Ok(input)
             }
         }
 
-        pub fn backward(&mut self, input: &Linear, output_gradients: &Linear) -> Result<Linear> {
-            todo!("complete backprop or scale gradients at least")
+        pub fn backward(
+            &mut self,
+            dropout_mask: &Linear,
+            output_gradients: &Linear,
+        ) -> Result<Linear> {
+            let grad_input = output_gradients
+                .iter()
+                .dot_product(dropout_mask.iter())
+                .collect();
+            Ok(grad_input)
         }
     }
 
@@ -3978,26 +3990,25 @@ pub mod linear {
                 count: self.count,
             }
         }
-        pub fn dropout(self, dropout_rate: f64, rng: RngStrategy) -> Self {
+        pub fn dropout_mask(&self, dropout_rate: f64, rng: RngStrategy) -> Linear {
             assert!(
                 dropout_rate <= 1.0 && dropout_rate >= 0.0,
                 "invalid dropout rate"
             );
-            if dropout_rate == 0.0 {
-                return self;
-            }
+            let mut linear = Linear::new(self.count, self.stride);
 
-            Self {
-                inner: Box::new(self.inner.map(move |x| {
-                    if rng.rand() < dropout_rate {
+            if dropout_rate != 0.0 {
+                let normalized_value = 1.0 / (1.0 - dropout_rate);
+                linear.rows_iter_mut().flat_map(|x| x).for_each(move |x| {
+                    *x = if rng.rand() < dropout_rate {
                         0.0
                     } else {
-                        x / (1.0 - dropout_rate)
+                        normalized_value
                     }
-                })),
-                stride: self.stride,
-                count: self.count,
+                });
             }
+
+            linear
         }
         /// point-wise mask-based value overwrite computation.
         /// Note: a value at given position is set to masked_value only where the value of the mask is 0.0
