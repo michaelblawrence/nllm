@@ -29,8 +29,8 @@ cargo-respond input_file:
     {{input_file}}
 
 cargo-flamegraph input_file:
-  sudo cargo flamegraph --features="single_threaded thread" --package embed -- \
-    load out/labelled/train/dev-model-qa-e24-L64x1/model-r24957-41pct.json \
+  sudo cargo flamegraph --no-default-features --features="single_threaded thread" --package embed -- \
+    load {{input_file}} \
     --repl="pr"
 
 run input_file="./res/tinyshakespeare.txt" rounds="100000":
@@ -57,7 +57,7 @@ wasi-run input_file="./res/tinyshakespeare.txt" rounds="100000" output_label=(mo
     --training-rounds {{rounds}} -i {{input_file}} -o out -O {{model_output_label}}
 
 run-like-wasi-testrun:
-  cargo run --features="single_threaded" --release --package embed -- \
+  cargo run --no-default-features --features="single_threaded" --release --package embed -- \
     --quit-on-complete --single-batch-iterations --char --training-rounds 100000 \
     --batch-size 64 --phrase-test-set-max-tokens 5 \
     -i ./res/tinyshakespeare.txt -o out -O dev-model-wasi
