@@ -4053,7 +4053,7 @@ pub mod linear {
                 dropout_rate <= 1.0 && dropout_rate >= 0.0,
                 "invalid dropout rate"
             );
-            let mut linear = Linear::new(self.count, self.stride);
+            let mut linear = Linear::with_value(self.count, self.stride, 1.0);
 
             if dropout_rate != 0.0 {
                 let normalized_value = 1.0 / (1.0 - dropout_rate);
