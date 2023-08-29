@@ -211,13 +211,13 @@ pub mod decoder {
             encoder_gradients: &Vec<Option<Linear>>,
         ) -> Result<Linear> {
             let zero: Linear = Linear::with_dimensions(encoder_outputs);
-            let mut sum_outputs_grads = zero.iter();
+            let mut sum_outputs_grads = zero.iter().boxed();
             for outputs_grads in encoder_gradients.iter() {
                 let grads = outputs_grads
                     .as_ref()
                     .context("missing gradient for encoder")?;
 
-                sum_outputs_grads = sum_outputs_grads.add(grads.iter());
+                sum_outputs_grads = sum_outputs_grads.add(grads.iter()).boxed();
             }
             Ok(sum_outputs_grads.collect())
         }
@@ -1916,10 +1916,10 @@ pub mod layers {
             kqv_input_grads: Vec<(Linear, Linear, Linear)>,
         ) -> Result<Linear> {
             let zero: Linear = Linear::with_dimensions(inputs);
-            let mut sum_inputs_grads = zero.iter();
+            let mut sum_inputs_grads = zero.iter().boxed();
             for (k_grads, q_grads, v_grads) in &kqv_input_grads {
                 let sum = Linear::sum([k_grads, q_grads, v_grads].into_iter()).unwrap();
-                sum_inputs_grads = sum_inputs_grads.add(sum);
+                sum_inputs_grads = sum_inputs_grads.add(sum).boxed();
             }
             Ok(sum_inputs_grads.collect())
         }
@@ -2029,13 +2029,13 @@ pub mod layers {
             kqv_input_grads: Vec<(Linear, Linear, Linear)>,
         ) -> Result<(Linear, Linear)> {
             let zero: Linear = Linear::with_dimensions(inputs);
-            let mut sum_kv_inputs_grads = zero.iter();
-            let mut sum_q_inputs_grads = zero.iter();
+            let mut sum_kv_inputs_grads = zero.iter().boxed();
+            let mut sum_q_inputs_grads = zero.iter().boxed();
 
             for (k_grads, q_grads, v_grads) in &kqv_input_grads {
                 let sum_kv = Linear::sum([k_grads, v_grads].into_iter()).unwrap();
-                sum_kv_inputs_grads = sum_kv_inputs_grads.add(sum_kv);
-                sum_q_inputs_grads = sum_q_inputs_grads.add(q_grads.iter());
+                sum_kv_inputs_grads = sum_kv_inputs_grads.add(sum_kv).boxed();
+                sum_q_inputs_grads = sum_q_inputs_grads.add(q_grads.iter()).boxed();
             }
 
             let kv_inputs_grads = sum_kv_inputs_grads.collect();
@@ -2160,7 +2160,7 @@ pub mod layers {
                 .zip(output_gradients.rows_iter())
             {
                 let grad = Linear::from_iter(grad.len(), grad.iter().copied()).unwrap();
-                self.queue_gradients(EmbeddingVector, token, grad.iter());
+                self.queue_gradients(EmbeddingVector, token, grad.iter().boxed());
             }
 
             Ok(())
@@ -2351,8 +2351,8 @@ pub mod layers {
 
             let dloss_dbeta = Linear::from_values(&dloss_dbeta)?;
             let dloss_dgamma = Linear::from_values(&dloss_dgamma)?;
-            self.queue_gradients(LayerNormalizationBeta, dloss_dbeta.iter());
-            self.queue_gradients(LayerNormalizationGamma, dloss_dgamma.iter());
+            self.queue_gradients(LayerNormalizationBeta, dloss_dbeta.iter().boxed());
+            self.queue_gradients(LayerNormalizationGamma, dloss_dgamma.iter().boxed());
 
             Linear::from_values(&dloss_dx)
         }
@@ -2377,11 +2377,10 @@ pub mod layers {
             let x_minus_mean = x.iter().sub_scalar(mean_scalar).collect();
             let norm_input = x_minus_mean
                 .iter()
-                .multiply_scalar((std_dev_scalar + epsilon).powi(-1))
-                .collect();
+                .multiply_scalar((std_dev_scalar + epsilon).powi(-1));
 
             let dbeta = dl_dnorm.iter().flatten_sum();
-            let dgamma = dl_dnorm.iter().dot_product(norm_input.iter()).flatten_sum();
+            let dgamma = dl_dnorm.iter().dot_product(norm_input).flatten_sum();
 
             // dμ = ones(n, n) .* 1/n
             let dmean = 1.0 / batch_size;
@@ -2392,16 +2391,15 @@ pub mod layers {
                 .multiply_scalar((batch_size * std_dev_scalar).powi(-1)); // [1, N]
 
             // dx = (I(n) - dμ) ./ (stds[k] + model.ϵ) - dσ * transpose(x .- means[k]) ./ (stds[k] + model.ϵ).^2
-            let dx = Linear::with_value_identity(stride, 1.0)
+            let factor = gamma / (std_dev_scalar + epsilon);
+            let dx = Linear::with_value_identity(stride, factor)
                 .iter()
-                .sub_scalar(dmean)
-                .multiply_scalar((std_dev_scalar + epsilon).powi(-1))
+                .sub_scalar(dmean * factor)
                 .sub(
                     dstd.grow(stride)
                         .dot_product(x_minus_mean.iter().stack(stride))
-                        .multiply_scalar((std_dev_scalar + epsilon).powi(-2)),
+                        .multiply_scalar(gamma / ((std_dev_scalar * std_dev_scalar) + epsilon)),
                 )
-                .multiply_scalar(gamma)
                 .collect(); // [N, N]
 
             // dL/dx = dz/dx * dL/dz  =>  dloss_dx.T = dx * dl_dnorm.T  =>  dl_dnorm * dx.T = dloss_dx
@@ -2800,9 +2798,9 @@ pub mod attention {
             let dquery_weights = query_inputs.matrix_product_lhs_transposed(&dqueries);
             let dvalue_weights = value_inputs.matrix_product_lhs_transposed(&dvalues);
 
-            self.queue_gradients(AttentionKeyWeights, dkey_weights.iter());
-            self.queue_gradients(AttentionQueryWeights, dquery_weights.iter());
-            self.queue_gradients(AttentionValueWeights, dvalue_weights.iter());
+            self.queue_gradients(AttentionKeyWeights, dkey_weights.iter().boxed());
+            self.queue_gradients(AttentionQueryWeights, dquery_weights.iter().boxed());
+            self.queue_gradients(AttentionValueWeights, dvalue_weights.iter().boxed());
 
             let dkey_inputs = dkeys.matrix_product_rhs_transposed(self.key_weights.value());
             let dquery_inputs = dqueries.matrix_product_rhs_transposed(self.query_weights.value());
@@ -2824,10 +2822,10 @@ pub mod attention {
             let scaled_attention_scores = attention_scores.iter().multiply_scalar(scale_factor);
 
             let masked_attention_scores = match mask {
-                Some(mask) => {
-                    scaled_attention_scores.set_mask(mask.iter(), NodeValue::NEG_INFINITY)
-                }
-                None => scaled_attention_scores,
+                Some(mask) => scaled_attention_scores
+                    .set_mask(mask.iter(), NodeValue::NEG_INFINITY)
+                    .boxed(),
+                None => scaled_attention_scores.boxed(),
             };
 
             let stride = attention_scores.stride();
@@ -2856,10 +2854,10 @@ pub mod attention {
             let scaled_attention_scores = attention_scores.iter().multiply_scalar(scale_factor);
 
             let masked_attention_scores = match mask {
-                Some(mask) => {
-                    scaled_attention_scores.set_mask(mask.iter(), NodeValue::NEG_INFINITY)
-                }
-                None => scaled_attention_scores,
+                Some(mask) => scaled_attention_scores
+                    .set_mask(mask.iter(), NodeValue::NEG_INFINITY)
+                    .boxed(),
+                None => scaled_attention_scores.boxed(),
             };
 
             let stride = attention_scores.stride();
@@ -2885,13 +2883,13 @@ pub mod attention {
             // let dmasked_attention_scores = dattention_weights.softmax_d(&attention_weights);
 
             let dmasked_attention_scores = match &input_mask {
-                Some(mask) => softmax_grads.iter().set_mask(mask.iter(), 0.0),
-                None => softmax_grads.iter(),
+                Some(mask) => softmax_grads.iter().set_mask(mask.iter(), 0.0).boxed(),
+                None => softmax_grads.iter().boxed(),
             };
 
             let dscaled_attention_scores = match mask {
-                Some(mask) => dmasked_attention_scores.set_mask(mask.iter(), 0.0),
-                None => dmasked_attention_scores,
+                Some(mask) => dmasked_attention_scores.set_mask(mask.iter(), 0.0).boxed(),
+                None => dmasked_attention_scores.boxed(),
             };
 
             let dattention_scores = dscaled_attention_scores
@@ -3299,9 +3297,9 @@ pub mod dense {
             let weights_gradients =
                 inputs.matrix_product_lhs_transposed(&weighted_inputs_gradients);
 
-            self.queue_gradients(DenseWeight, weights_gradients.iter());
+            self.queue_gradients(DenseWeight, weights_gradients.iter().boxed());
             if self.bias.is_some() {
-                self.queue_gradients(DenseBias, bias_gradients.iter_transpose());
+                self.queue_gradients(DenseBias, bias_gradients.iter_transpose().boxed());
             }
 
             // -> output = inputs * weights
@@ -3450,7 +3448,7 @@ pub mod dense {
 }
 
 pub mod linear {
-    use std::iter;
+    use std::{cell::OnceCell, iter};
 
     use anyhow::{anyhow, Context, Result};
     use itertools::Itertools;
@@ -3601,15 +3599,18 @@ pub mod linear {
             strategy.apply(iter::empty(), self.inner.iter_mut(), self.count, &rng);
         }
 
-        pub fn iter(&self) -> LinearIter {
+        pub fn iter<'a>(&'a self) -> LinearIter<'a, impl Iterator<Item = NodeValue> + 'a> {
             LinearIter {
-                inner: Box::new(self.inner.iter().copied()),
+                inner: self.inner.iter().copied(),
                 stride: self.stride,
                 count: self.count,
+                parent: Some(&self),
             }
         }
 
-        pub fn iter_transpose(&self) -> LinearIter {
+        pub fn iter_transpose<'a>(
+            &'a self,
+        ) -> LinearIter<'a, impl Iterator<Item = NodeValue> + 'a> {
             let stride = self.stride;
             let count = self.count;
 
@@ -3620,17 +3621,20 @@ pub mod linear {
                 self.inner[inner_idx]
             });
             LinearIter {
-                inner: Box::new(x),
+                inner: x,
                 stride: count,
                 count: stride,
+                parent: None,
+                // parent: Some(&self), // TODO: could use this?
             }
         }
 
-        pub fn concat<'a>(&'a self, rhs: &'a Linear) -> LinearIter<'a> {
+        pub fn concat<'a>(&'a self, rhs: &'a Linear) -> BoxedLinearIter<'a> {
             assert_eq!(self.count, rhs.count, "mismatched count dimension");
             let self_items = self.inner.chunks(self.stride);
             let rhs_items = rhs.inner.chunks(rhs.stride);
-            LinearIter {
+            // TODO: does this need to be boxed?
+            BoxedLinearIter {
                 inner: Box::new(
                     self_items
                         .zip(rhs_items)
@@ -3640,6 +3644,7 @@ pub mod linear {
                 ),
                 stride: self.stride + rhs.stride,
                 count: self.count,
+                parent: None,
             }
         }
 
@@ -3804,11 +3809,13 @@ pub mod linear {
             self.inner.iter().sum()
         }
 
-        pub fn sum<'a, I: Iterator<Item = &'a Self> + 'a>(mut iter: I) -> Option<LinearIter<'a>> {
+        pub fn sum<'a, I: Iterator<Item = &'a Self> + 'a>(
+            mut iter: I,
+        ) -> Option<BoxedLinearIter<'a>> {
             let first = iter.next()?;
-            let mut sum_iter = first.iter();
+            let mut sum_iter = first.iter().boxed();
             for x in iter {
-                sum_iter = sum_iter.add(x.iter());
+                sum_iter = sum_iter.add(x.iter()).boxed();
             }
             Some(sum_iter)
         }
@@ -3832,14 +3839,20 @@ pub mod linear {
         }
     }
 
+    pub type BoxedLinearIter<'a> = LinearIter<'a, Box<dyn Iterator<Item = NodeValue> + 'a>>;
+
     #[must_use = "linear iterators are lazy and do nothing unless consumed"]
-    pub struct LinearIter<'a> {
-        inner: Box<dyn Iterator<Item = NodeValue> + 'a>,
+    pub struct LinearIter<'a, I> {
+        inner: I,
         stride: usize,
         count: usize,
+        parent: Option<&'a Linear>,
     }
 
-    impl<'a> LinearIter<'a> {
+    impl<'a, I> LinearIter<'a, I>
+    where
+        I: Iterator<Item = NodeValue> + 'a,
+    {
         /// returns underlying data stride dimension size (or 'width')
         pub fn stride(&self) -> usize {
             self.stride
@@ -3848,14 +3861,33 @@ pub mod linear {
         pub fn count(&self) -> usize {
             self.count
         }
+        pub fn boxed(self) -> BoxedLinearIter<'a> {
+            LinearIter {
+                inner: Box::new(self.inner),
+                stride: self.stride,
+                count: self.count,
+                parent: None,
+            }
+        }
         /// returns owned result of performing matrix multiplication of (Self * Rhs.T)
-        pub fn matrix_transpose_product(self, rhs_transpose: Self) -> Linear {
+        pub fn matrix_transpose_product(
+            self,
+            rhs_transpose: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+        ) -> Linear {
             assert_eq!(
                 self.stride, rhs_transpose.stride,
                 "mismatched stride dimension"
             );
-            let self_vec = self.inner.collect_vec();
-            let rhs_vec = rhs_transpose.inner.collect_vec();
+            let self_oc = OnceCell::new();
+            let rhs_oc = OnceCell::new();
+            let self_vec = self
+                .parent
+                .map(|x| x.inner.as_ref())
+                .unwrap_or_else(|| self_oc.get_or_init(|| self.inner.collect_vec()));
+            let rhs_vec = rhs_transpose
+                .parent
+                .map(|x| x.inner.as_ref())
+                .unwrap_or_else(|| rhs_oc.get_or_init(|| rhs_transpose.inner.collect_vec()));
 
             let self_strides = self_vec.chunks(self.stride);
             let rhs_strides = rhs_vec.chunks(rhs_transpose.stride);
@@ -3873,8 +3905,8 @@ pub mod linear {
                             .sum::<NodeValue>()
                     })
                 })
-                .enumerate()
-                .for_each(|(i, x)| inner[i] = x);
+                .zip(inner.iter_mut())
+                .for_each(|(x, i)| *i = x);
 
             Linear {
                 inner,
@@ -3883,111 +3915,137 @@ pub mod linear {
             }
         }
         /// point-wise multiplication
-        pub fn dot_product(self, other: Self) -> Self {
+        pub fn dot_product(
+            self,
+            other: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+        ) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
             assert_eq!(self.stride, other.stride, "mismatched stride dimension");
             assert_eq!(self.count, other.count, "mismatched count dimension");
-            Self {
-                inner: Box::new(self.inner.zip(other.inner).map(|(x, y)| x * y)),
+            LinearIter {
+                inner: self.inner.zip(other.inner).map(|(x, y)| x * y),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// point-wise division
-        pub fn div(self, rhs: Self, epsilon: Option<NodeValue>) -> Self {
+        pub fn div(
+            self,
+            rhs: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+            epsilon: Option<NodeValue>,
+        ) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
             assert_eq!(self.stride, rhs.stride, "mismatched stride dimension");
             assert_eq!(self.count, rhs.count, "mismatched count dimension");
-            Self {
-                inner: match epsilon {
-                    Some(e) => Box::new(self.inner.zip(rhs.inner).map(move |(x, y)| x / (y + e))),
-                    None => Box::new(self.inner.zip(rhs.inner).map(move |(x, y)| x / y)),
-                },
+            let e = epsilon.unwrap_or(0.0);
+            LinearIter {
+                inner: self.inner.zip(rhs.inner).map(move |(x, y)| x / (y + e)),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// point-wise addition
-        pub fn add(self, other: Self) -> Self {
+        pub fn add(
+            self,
+            other: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+        ) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
             assert_eq!(self.stride, other.stride, "mismatched stride dimension");
             assert_eq!(self.count, other.count, "mismatched count dimension");
-            Self {
-                inner: Box::new(self.inner.zip(other.inner).map(|(x, y)| x + y)),
+            LinearIter {
+                inner: self.inner.zip(other.inner).map(|(x, y)| x + y),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// point-wise addition by scalar constant
-        pub fn add_scalar(self, rhs: NodeValue) -> Self {
-            Self {
-                inner: Box::new(self.inner.map(move |x| x + rhs)),
+        pub fn add_scalar(self, rhs: NodeValue) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
+            LinearIter {
+                inner: self.inner.map(move |x| x + rhs),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// point-wise subtraction
-        pub fn sub(self, rhs: Self) -> Self {
+        pub fn sub(
+            self,
+            rhs: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+        ) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
             assert_eq!(self.stride, rhs.stride, "mismatched stride dimension");
             assert_eq!(self.count, rhs.count, "mismatched count dimension");
-            Self {
-                inner: Box::new(self.inner.zip(rhs.inner).map(|(x, y)| x - y)),
+            LinearIter {
+                inner: self.inner.zip(rhs.inner).map(|(x, y)| x - y),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// point-wise subtraction by scalar constant
-        pub fn sub_scalar(self, rhs: NodeValue) -> Self {
-            Self {
-                inner: Box::new(self.inner.map(move |x| x - rhs)),
+        pub fn sub_scalar(self, rhs: NodeValue) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
+            LinearIter {
+                inner: self.inner.map(move |x| x - rhs),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// point-wise multiplication by scalar constant
-        pub fn multiply_scalar(self, rhs: NodeValue) -> Self {
-            Self {
-                inner: Box::new(self.inner.map(move |x| x * rhs)),
+        pub fn multiply_scalar(
+            self,
+            rhs: NodeValue,
+        ) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
+            LinearIter {
+                inner: self.inner.map(move |x| x * rhs),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// point-wise raise to the power of scalar integer constant
-        pub fn powi_scalar(self, n: i32) -> Self {
-            Self {
-                inner: Box::new(self.inner.map(move |x| x.powi(n))),
+        pub fn powi_scalar(self, n: i32) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
+            LinearIter {
+                inner: self.inner.map(move |x| x.powi(n)),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// point-wise raise to the power of scalar floting point constant
-        pub fn powf_scalar(self, n: NodeValue) -> Self {
-            Self {
-                inner: Box::new(self.inner.map(move |x| x.powf(n))),
+        pub fn powf_scalar(self, n: NodeValue) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
+            LinearIter {
+                inner: self.inner.map(move |x| x.powf(n)),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// point-wise round to fixed point decimal
-        pub fn round(self, decimals: u32) -> Self {
+        pub fn round(self, decimals: u32) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
             let mul = 10u32.pow(decimals) as f64;
-            Self {
-                inner: Box::new(self.inner.map(move |x| (x * mul).round() / mul)),
+            LinearIter {
+                inner: self.inner.map(move |x| (x * mul).round() / mul),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// point-wise absolute value computation
-        pub fn abs(self) -> Self {
-            Self {
-                inner: Box::new(self.inner.map(move |x| x.abs())),
+        pub fn abs(self) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
+            LinearIter {
+                inner: self.inner.map(move |x| x.abs()),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// point-wise square root value computation
-        pub fn sqrt(self) -> Self {
-            Self {
-                inner: Box::new(self.inner.map(move |x| x.sqrt())),
+        pub fn sqrt(self) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
+            LinearIter {
+                inner: self.inner.map(move |x| x.sqrt()),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         pub fn dropout_mask(&self, dropout_rate: f64, rng: RngStrategy) -> Linear {
@@ -4012,10 +4070,14 @@ pub mod linear {
         }
         /// point-wise mask-based value overwrite computation.
         /// Note: a value at given position is set to masked_value only where the value of the mask is 0.0
-        pub fn set_mask(self, mask: Self, masked_value: NodeValue) -> Self {
+        pub fn set_mask(
+            self,
+            mask: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+            masked_value: NodeValue,
+        ) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
             assert_eq!(self.stride, mask.stride, "mismatched stride dimension");
             assert_eq!(self.count, mask.count, "mismatched count dimensions");
-            Self {
+            LinearIter {
                 inner: Box::new(self.inner.zip(mask.inner).map(move |(x, mask)| {
                     if mask == 0.0 {
                         masked_value
@@ -4025,34 +4087,37 @@ pub mod linear {
                 })),
                 stride: self.stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// extends stride dimension by copying duplicating column values
         /// Note: stride dimension must be equal to 1
-        pub fn grow(self, stride: usize) -> Self {
+        pub fn grow(self, stride: usize) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
             assert_eq!(self.stride, 1, "can only grow when stride dimension = 1");
             assert_ne!(stride, 0, "invalid stride dimension");
-            Self {
-                inner: Box::new(self.inner.flat_map(move |x| iter::repeat(x).take(stride))),
+            LinearIter {
+                inner: self.inner.flat_map(move |x| iter::repeat(x).take(stride)),
                 stride,
                 count: self.count,
+                parent: None,
             }
         }
         /// extends count dimension by copying duplicating row values
         /// Note: count dimension must be equal to 1
-        pub fn stack(self, count: usize) -> Self {
+        pub fn stack(self, count: usize) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
             assert_eq!(self.count, 1, "can only stack when count dimension = 1");
             assert_ne!(count, 0, "invalid stride dimension");
-            Self {
-                inner: Box::new(
-                    self.inner
-                        .collect_vec()
-                        .into_iter()
-                        .cycle()
-                        .take(self.stride * count),
-                ),
+            LinearIter {
+                inner: self
+                    .inner
+                    .collect_vec()
+                    .into_iter()
+                    .cycle()
+                    .take(self.stride * count),
+
                 stride: self.stride,
                 count,
+                parent: None,
             }
         }
         pub fn apply_one(self, lhs_inputs: &[NodeValue]) -> LayerValues {
@@ -4065,7 +4130,11 @@ pub mod linear {
                 .flat_map(|(row, input)| row.map(move |x| x * input))
                 .collect()
         }
-        pub fn apply_gradients(self, grads: LinearIter, learn_rate: f64) -> Linear {
+        pub fn apply_gradients(
+            self,
+            grads: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+            learn_rate: f64,
+        ) -> Linear {
             self.sub(grads.multiply_scalar(learn_rate)).collect()
         }
         pub fn softmax(self) -> Linear {
@@ -4126,10 +4195,17 @@ pub mod linear {
                 count: self.count,
             }
         }
-        pub fn flatten_stddev_corrected(self, mean: Self) -> Linear {
+        pub fn flatten_stddev_corrected(
+            self,
+            mean: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+        ) -> Linear {
             self.flatten_stddev(mean, true)
         }
-        pub fn flatten_stddev(self, mean: Self, corrected: bool) -> Linear {
+        pub fn flatten_stddev(
+            self,
+            mean: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+            corrected: bool,
+        ) -> Linear {
             assert_eq!(self.count, mean.count, "mismatched count dimension");
             assert_eq!(mean.stride, 1, "invalid mean stride dimension");
             if self.stride == 1 {
@@ -4402,17 +4478,17 @@ pub mod params {
     use anyhow::Result;
     use serde::{Deserialize, Serialize};
 
-    use crate::lazy_opt;
+    use crate::{lazy_opt, ml::NodeValue};
 
     use super::{
-        linear::{Linear, LinearIter},
+        linear::{BoxedLinearIter, Linear, LinearIter},
         solver::{source::OptimizerSource, Optimizer},
     };
 
     pub trait TrainableParameter<P: keys::TrainableParameterKey> {
         fn store(&self) -> Option<ParameterStore>;
         fn param_mut(&mut self) -> Option<&mut TrainableLinear>;
-        fn queue_gradients(&self, _: P, gradients: LinearIter) {
+        fn queue_gradients(&self, _: P, gradients: BoxedLinearIter) {
             if let Some(store) = self.store() {
                 store.add_gradients(gradients);
             }
@@ -4428,7 +4504,7 @@ pub mod params {
     pub trait TrainableCollection<P: keys::TrainableParameterKey> {
         fn store(&self, index: usize) -> Option<ParameterStore>;
         fn param_mut(&mut self) -> Option<&mut [TrainableLinear]>;
-        fn queue_gradients(&self, _: P, index: usize, gradients: LinearIter) {
+        fn queue_gradients(&self, _: P, index: usize, gradients: BoxedLinearIter) {
             if let Some(store) = self.store(index) {
                 store.add_gradients(gradients);
             }
@@ -4468,11 +4544,13 @@ pub mod params {
             &mut self.value
         }
 
-        pub fn iter(&self) -> LinearIter {
+        pub fn iter<'a>(&'a self) -> LinearIter<'a, impl Iterator<Item = NodeValue> + 'a> {
             self.value.iter()
         }
 
-        pub fn iter_transpose(&self) -> LinearIter {
+        pub fn iter_transpose<'a>(
+            &'a self,
+        ) -> LinearIter<'a, impl Iterator<Item = NodeValue> + 'a> {
             self.value.iter_transpose()
         }
 
@@ -4505,7 +4583,7 @@ pub mod params {
     }
 
     impl ParameterStore {
-        fn add_gradients(&self, gradients: LinearIter) {
+        fn add_gradients(&self, gradients: BoxedLinearIter) {
             let mut store = match self.0.try_write() {
                 Ok(store) => store,
                 Err(_) => {
@@ -4528,7 +4606,7 @@ pub mod params {
             mut param: Option<&mut TrainableLinear>,
         ) -> Result<()> {
             for pending in self.dequeue_all() {
-                self.add_gradients(pending.iter());
+                self.add_gradients(pending.iter().boxed());
             }
             self.with_gradients(move |gradients| {
                 if let Some(param) = param.as_mut() {
@@ -4549,7 +4627,7 @@ pub mod params {
             gradients.zero();
             Ok(())
         }
-        fn enqueue_gradient(&self, gradients: LinearIter) {
+        fn enqueue_gradient(&self, gradients: BoxedLinearIter) {
             self.1.lock().unwrap().push(gradients.collect());
         }
         fn dequeue_all(&self) -> Vec<Linear> {
