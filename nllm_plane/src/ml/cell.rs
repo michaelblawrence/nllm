@@ -41,28 +41,3 @@ impl<T: Clone> Clone for MutexCell<T> {
         Self::new(self.with_inner(|x| x.clone()))
     }
 }
-
-// mod store {
-//     use std::{cell::RefCell, any::Any, rc::Rc, collections::HashMap};
-
-//     thread_local! {
-//         static FOO: RefCell<HashMap<u64, Rc<dyn Any>>> = RefCell::new(HashMap::default());
-//     }
-
-//     #[derive(Debug)]
-//     struct GlobalRngStoreEntry<'a>(&'a dyn Any);
-
-//     pub struct GlobalRngStore;
-
-//     impl GlobalRngStore {
-//         pub fn get(rng: &dyn Any) -> Rc<dyn Any> {
-//             let entry = GlobalRngStoreEntry(rng);
-//             FOO.with(|foo| {
-//                 foo.borrow_mut()
-//                     .entry(entry.to_hash())
-//                     .or_insert_with(|| Rc::new(rng.clone()))
-//                     .clone()
-//             })
-//         }
-//     }
-// }
