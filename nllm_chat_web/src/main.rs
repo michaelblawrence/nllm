@@ -1,3 +1,4 @@
+use anyhow::{bail, Context};
 use axum::{
     body::Bytes,
     extract::{
@@ -47,6 +48,12 @@ struct AppState {
 async fn main() {
     configure_logging();
 
+    let app_state = configure_app_state().await;
+    if let Err(e) = configure_current_dir() {
+        eprintln!("Failed to locate content dir: {e}");
+        return;
+    }
+
     let app = Router::new()
         .route("/", get(index))
         .route("/diagnostics/ws.js", get(diagnostics_ws_js))
@@ -55,7 +62,7 @@ async fn main() {
         .nest_service("/scripts", ServeDir::new("public/scripts").no_cache())
         .nest_service("/icons", ServeDir::new("public/icons"))
         .nest_service("/images", ServeDir::new("public/images"))
-        .with_state(configure_app_state().await);
+        .with_state(app_state);
 
     let port = std::env::var(env::API_PORT).ok();
     let port = port.and_then(|x| x.parse().ok()).unwrap_or(3000_u16);
@@ -68,14 +75,11 @@ async fn main() {
         .unwrap();
 }
 
-// async fn index() -> (StatusCode, Html<&'static str>) {
 async fn index() -> (
     StatusCode,
     AppendHeaders<Vec<(HeaderName, &'static str)>>,
     Html<String>,
 ) {
-    // (StatusCode::OK, Html(include_str!("../index.html")))
-
     match std::fs::read_to_string("index.html") {
         Ok(html) => (
             StatusCode::OK,
@@ -169,6 +173,26 @@ async fn configure_app_state() -> Arc<AppState> {
         tx,
         model_tx,
     })
+}
+
+fn configure_current_dir() -> anyhow::Result<()> {
+    let index_html_path = std::path::Path::new("./index.html");
+    if !index_html_path.exists() {
+        let current_exe = std::env::current_exe().context("failed to get cwd")?;
+        let mut dir = Some(current_exe);
+        while let Some(current) = dir {
+            let index_test_path = current.join("nllm_chat_web/index.html");
+            if index_test_path.exists() {
+                std::env::set_current_dir(current.join("nllm_chat_web"))
+                    .context("failed to set current dir to content root")?;
+
+                return Ok(());
+            }
+            dir = current.parent().map(|x| x.to_path_buf());
+        }
+        bail!("failed to find index.html content root");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
