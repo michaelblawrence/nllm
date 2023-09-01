@@ -466,12 +466,12 @@ where
 {
     info!("Initialising vocab and train/test sets");
     let phrase_split_seed = config.phrase_split_seed.unwrap_or_default();
-    let rng: RngStrategy = if phrase_split_seed >= 0 {
+    let phrase_rng: RngStrategy = if phrase_split_seed >= 0 {
         RngStrategy::testable(phrase_split_seed as u32)
     } else {
         RngStrategy::default()
     };
-    let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, rng.to_arc());
+    let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, phrase_rng.to_arc());
     let mut testing_phrases = match config.phrase_test_set_split_pct.filter(|x| *x > 0.0) {
         Some(pct) => split_training_and_testing(
             &mut phrases,
@@ -481,6 +481,7 @@ where
         ),
         None => phrases.clone(),
     };
+    let rng = RngStrategy::default();
 
     let (char_vocab, str_vocab, gdt_vocab) = if config.use_character_tokens && !config.use_gdt {
         info!("Transforming vocab and train/test sets to character-level tokens");
@@ -587,6 +588,7 @@ where
             vocab.len(),
         );
         let builder = builder
+            // .with_rng(rng.clone()) // TODO: inject rng instance here?
             .with_dropout_rate(0.0)
             .with_feed_forward_hidden_dimension(config.hidden_layer_nodes);
 
