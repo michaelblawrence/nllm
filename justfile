@@ -2,6 +2,9 @@ model_output_label := "dev-model"
 ssh_user := env_var_or_default('SSH_USER', 'root')
 home_dir := env_var_or_default('USER_HOME_DIR', '/home/docker')
 
+default:
+  @just --list
+
 build:
   cargo build --features="multi_threaded" --release --package embed
 
