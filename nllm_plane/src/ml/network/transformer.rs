@@ -1646,7 +1646,7 @@ pub mod blocks {
             }
 
             pub fn build(self) -> Result<DecoderBlock> {
-                let self_attention_mask = Linear::with_value_diagonal(self.sequence_len, 1.0);
+                let self_attention_mask = Linear::identity(self.sequence_len);
                 let masked_self_attention = MultiHeadSelfAttentionLayer::new(
                     self.sequence_len,
                     self.model_dimension,
@@ -2337,24 +2337,21 @@ pub mod layers {
                 .map(|row| Linear::from_values(&[row.into()]));
             let gamma = self.gamma.value().values_iter().map(|(&g, ..)| g);
 
-            let mut dloss_dx = vec![];
-            let mut dloss_dbeta = vec![];
-            let mut dloss_dgamma = vec![];
+            let mut dloss_dx = Linear::with_dimensions(x);
+            let mut dloss_dbeta = Linear::with_dimensions(self.beta.value());
+            let mut dloss_dgamma = Linear::with_dimensions(self.gamma.value());
 
-            for ((row, grad), gamma) in row_x.zip(rows_grads).zip(gamma) {
+            for (i, ((row, grad), gamma)) in row_x.zip(rows_grads).zip(gamma).enumerate() {
                 let (dx, dbeta, dgamma) = self.backward_jacobian(&row?, gamma, &grad?)?;
-
-                dloss_dx.push(dx.as_single_stride()?);
-                dloss_dbeta.push(dbeta.as_single_stride()?);
-                dloss_dgamma.push(dgamma.as_single_stride()?);
+                dloss_dx.copy_stride_into(&dx, 0, i);
+                dloss_dbeta.copy_stride_into(&dbeta, 0, i);
+                dloss_dgamma.copy_stride_into(&dgamma, 0, i);
             }
 
-            let dloss_dbeta = Linear::from_values(&dloss_dbeta)?;
-            let dloss_dgamma = Linear::from_values(&dloss_dgamma)?;
             self.queue_gradients(LayerNormalizationBeta, dloss_dbeta.iter().boxed());
             self.queue_gradients(LayerNormalizationGamma, dloss_dgamma.iter().boxed());
 
-            Linear::from_values(&dloss_dx)
+            Ok(dloss_dx)
         }
 
         pub fn backward_jacobian(
@@ -2392,8 +2389,7 @@ pub mod layers {
 
             // dx = (I(n) - dμ) ./ (stds[k] + model.ϵ) - dσ * transpose(x .- means[k]) ./ (stds[k] + model.ϵ).^2
             let factor = gamma / (std_dev_scalar + epsilon);
-            let dx = Linear::with_value_identity(stride, factor)
-                .iter()
+            let dx = Linear::diagonal_iter(stride, factor)
                 .sub_scalar(dmean * factor)
                 .sub(
                     dstd.grow(stride)
@@ -3456,6 +3452,8 @@ pub mod linear {
 
     use crate::ml::{layer::LayerInitStrategy, LayerValues, NodeValue, RngStrategy};
 
+    use self::iter_ext::KnownSizeIterator;
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct Linear {
         inner: LayerValues,
@@ -3538,28 +3536,22 @@ pub mod linear {
             }
         }
 
-        pub fn with_value_identity(stride: usize, value: NodeValue) -> Self {
-            let inner = (0..stride)
-                .flat_map(|j| (0..stride).map(move |i| if i == j { value } else { 0.0 }))
-                .collect();
-
-            Self {
-                inner,
-                stride,
-                count: stride,
+        pub fn diagonal_iter<'a>(
+            size: usize,
+            diagonal_value: NodeValue,
+        ) -> LinearIter<'a, impl Iterator<Item = NodeValue> + 'a> {
+            LinearIter {
+                inner: (0..(size * size))
+                    .map(move |x| (x % size, x / size))
+                    .map(move |(i, j)| if i == j { diagonal_value } else { 0.0 }),
+                stride: size,
+                count: size,
+                parent: None,
             }
         }
 
-        pub fn with_value_diagonal(stride: usize, value: NodeValue) -> Self {
-            let inner = (0..stride)
-                .flat_map(|j| (0..stride).map(move |i| if i > j { 0.0 } else { value }))
-                .collect();
-
-            Self {
-                inner,
-                stride,
-                count: stride,
-            }
+        pub fn identity(stride: usize) -> Self {
+            Self::diagonal_iter(stride, 1.0).collect()
         }
 
         pub fn from_iter<I: Iterator<Item = NodeValue>>(stride: usize, values: I) -> Result<Self> {
@@ -3791,6 +3783,19 @@ pub mod linear {
                     self.stride
                 ))
             }
+        }
+
+        pub fn copy_stride_into(&mut self, src: &Self, src_row_idx: usize, dest_row_idx: usize) {
+            assert_eq!(self.stride, src.stride, "Mismatched stride dimension");
+            assert!(src.count > src_row_idx, "Invalid source row index");
+            assert!(self.count > dest_row_idx, "Invalid destination row index");
+            let start = src_row_idx * self.stride;
+            let end = start + self.stride;
+            let src = &src.inner[start..end];
+
+            let start = dest_row_idx * self.stride;
+            let end = start + self.stride;
+            self.inner[start..end].copy_from_slice(src);
         }
 
         pub fn as_single_stride(&self) -> Result<LayerValues> {
@@ -4104,22 +4109,34 @@ pub mod linear {
         }
         /// extends count dimension by copying duplicating row values
         /// Note: count dimension must be equal to 1
-        pub fn stack(self, count: usize) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
+        pub fn stack(self, count: usize) -> BoxedLinearIter<'a> {
             assert_eq!(self.count, 1, "can only stack when count dimension = 1");
             assert_ne!(count, 0, "invalid stride dimension");
             LinearIter {
-                inner: self
-                    .inner
-                    .collect_vec()
-                    .into_iter()
-                    .cycle()
-                    .take(self.stride * count),
+                inner: match self.parent {
+                    Some(parent) => Box::new(
+                        parent
+                            .inner
+                            .iter()
+                            .copied()
+                            .cycle()
+                            .take(self.stride * count),
+                    ),
+                    None => Box::new(
+                        self.inner
+                            .collect_vec()
+                            .into_iter()
+                            .cycle()
+                            .take(self.stride * count),
+                    ),
+                },
 
                 stride: self.stride,
                 count,
                 parent: None,
             }
         }
+
         pub fn apply_one(self, lhs_inputs: &[NodeValue]) -> LayerValues {
             assert_eq!(self.count, lhs_inputs.len(), "mismatched dimensions");
 
@@ -4232,11 +4249,41 @@ pub mod linear {
         }
         pub fn collect(self) -> Linear {
             Linear {
-                inner: self.inner.collect(),
+                inner: self.inner.with_size(self.stride * self.count).collect(),
                 stride: self.stride,
                 count: self.count,
             }
         }
+    }
+
+    mod iter_ext {
+        pub trait KnownSizeIterator: Iterator<Item = f64> {
+            fn with_size(self, size: usize) -> KnownSizedIter<Self>
+            where
+                Self: Sized,
+            {
+                KnownSizedIter { inner: self, size }
+            }
+        }
+
+        pub struct KnownSizedIter<I> {
+            size: usize,
+            inner: I,
+        }
+
+        impl<I: Iterator<Item = f64>> Iterator for KnownSizedIter<I> {
+            type Item = f64;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.inner.next()
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (self.size, Some(self.size))
+            }
+        }
+
+        impl<I: Iterator<Item = f64>> KnownSizeIterator for I {}
     }
 
     #[cfg(test)]
@@ -4414,7 +4461,7 @@ pub mod linear {
                 [-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0].into_iter(),
             )
             .unwrap();
-            let mask = Linear::with_value_diagonal(3, 1.0);
+            let mask = Linear::identity(3);
 
             let y = x
                 .iter()
@@ -4435,7 +4482,7 @@ pub mod linear {
 
         #[test]
         fn can_linear_perform_create_identity_matix() {
-            let x = Linear::with_value_identity(3, 1.0);
+            let x = Linear::identity(3);
             let expected =
                 Linear::from_iter(3, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0].into_iter())
                     .unwrap();
