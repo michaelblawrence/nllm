@@ -3623,8 +3623,8 @@ pub mod linear {
 
         pub fn concat<'a>(&'a self, rhs: &'a Linear) -> BoxedLinearIter<'a> {
             assert_eq!(self.count, rhs.count, "mismatched count dimension");
-            let self_items = self.inner.chunks(self.stride);
-            let rhs_items = rhs.inner.chunks(rhs.stride);
+            let self_items = self.inner.chunks_exact(self.stride);
+            let rhs_items = rhs.inner.chunks_exact(rhs.stride);
             // TODO: does this need to be boxed?
             BoxedLinearIter {
                 inner: Box::new(
@@ -3645,7 +3645,7 @@ pub mod linear {
             let stride = self.stride / n;
             (0..n)
                 .map(|i| {
-                    let self_items = self.inner.chunks(self.stride);
+                    let self_items = self.inner.chunks_exact(self.stride);
                     Self {
                         inner: self_items
                             .flat_map(|row| row.into_iter().skip(i * stride).take(stride))
@@ -3674,18 +3674,36 @@ pub mod linear {
 
         pub fn matrix_product(&self, rhs: &Linear) -> Linear {
             assert_eq!(self.stride, rhs.count, "mismatched dimensions");
-            self.iter().matrix_transpose_product(rhs.iter_transpose())
+
+            if self.count >= 64 && rhs.stride >= 64 && self.stride % 16 == 0 && rhs.stride % 16 == 0
+            {
+                self.iter().matrix_product_fast(rhs.iter())
+            } else {
+                self.iter().matrix_transpose_product(rhs.iter_transpose())
+            }
         }
 
         pub fn matrix_product_rhs_transposed(&self, rhs: &Linear) -> Linear {
             assert_eq!(self.stride, rhs.stride, "mismatched stride dimension");
-            self.iter().matrix_transpose_product(rhs.iter())
+
+            if self.count >= 64 && rhs.count >= 64 && self.count % 16 == 0 && rhs.count % 16 == 0 {
+                self.iter().matrix_product_fast(rhs.iter_transpose())
+            } else {
+                self.iter().matrix_transpose_product(rhs.iter())
+            }
         }
 
         pub fn matrix_product_lhs_transposed(&self, rhs: &Linear) -> Linear {
             assert_eq!(self.count, rhs.count, "mismatched count dimension");
-            self.iter_transpose()
-                .matrix_transpose_product(rhs.iter_transpose())
+
+            if self.stride % 16 == 0 && rhs.stride % 16 == 0 {
+                self.iter_transpose().matrix_product_fast(rhs.iter())
+            } else if self.stride % 4 == 0 && rhs.stride % 4 == 0 {
+                self.iter_transpose().matrix_product_fast_4x4(rhs.iter())
+            } else {
+                self.iter_transpose()
+                    .matrix_transpose_product(rhs.iter_transpose())
+            }
         }
 
         pub fn stride(&self) -> usize {
@@ -3704,6 +3722,10 @@ pub mod linear {
             state_counter::GlobalCounter::reset();
         }
 
+        #[cfg(not(feature = "plot"))]
+        pub fn show_heatmap_plot(&self, title: &'static str) {}
+
+        #[cfg(feature = "plot")]
         pub fn show_heatmap_plot(&self, title: &'static str) {
             use plotly::{common::ColorScalePalette, layout::Axis, HeatMap, Plot};
 
@@ -3759,11 +3781,11 @@ pub mod linear {
         }
 
         pub fn rows_iter(&self) -> impl Iterator<Item = &[NodeValue]> {
-            self.inner.chunks(self.stride)
+            self.inner.chunks_exact(self.stride)
         }
 
         pub fn rows_iter_mut(&mut self) -> impl Iterator<Item = &mut [NodeValue]> {
-            self.inner.chunks_mut(self.stride)
+            self.inner.chunks_exact_mut(self.stride)
         }
 
         pub fn values_iter(&self) -> impl Iterator<Item = (&NodeValue, usize, usize)> {
@@ -3834,6 +3856,32 @@ pub mod linear {
         }
     }
 
+    impl std::str::FromStr for Linear {
+        type Err = anyhow::Error;
+
+        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+            let lines = s
+                .lines()
+                .filter_map(|x| Some(x.trim()).filter(|x| !x.is_empty()))
+                .collect_vec();
+
+            let count = lines.len();
+            let elements: Result<Vec<NodeValue>, _> = lines
+                .into_iter()
+                .flat_map(|line| line.split_whitespace().map(|x| x.parse::<NodeValue>()))
+                .collect();
+
+            let elements = elements.context("invalid numerical found")?;
+            let stride = elements.len() / count;
+
+            if stride * count == elements.len() {
+                Linear::from_iter(stride, elements.into_iter())
+            } else {
+                Err(anyhow!("mismatch row length found"))
+            }
+        }
+    }
+
     impl Default for Linear {
         fn default() -> Self {
             Self {
@@ -3874,6 +3922,66 @@ pub mod linear {
                 parent: None,
             }
         }
+        /// returns owned result of performing matrix multiplication of (Self * Rhs)
+        pub fn matrix_product_fast(
+            self,
+            rhs: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+        ) -> Linear {
+            self.matrix_product_fast_n::<16>(rhs)
+        }
+        /// returns owned result of performing matrix multiplication of (Self * Rhs)
+        pub fn matrix_product_fast_4x4(
+            self,
+            rhs: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+        ) -> Linear {
+            self.matrix_product_fast_n::<4>(rhs)
+        }
+        /// returns owned result of performing matrix multiplication of (Self * Rhs)
+        pub fn matrix_product_fast_n<const N: usize>(
+            self,
+            rhs: LinearIter<'a, impl Iterator<Item = NodeValue>>,
+        ) -> Linear {
+            assert_eq!(self.stride % N, 0, "mismatched lhs stride alignment");
+            assert_eq!(rhs.stride % N, 0, "mismatched rhs stride alignment");
+            let m = self.count;
+            let n = rhs.stride;
+            let k = {
+                assert_eq!(self.stride, rhs.count, "mismatched stride dimension");
+                self.stride // equal to rhs.count
+            };
+            let self_oc = OnceCell::new();
+            let rhs_oc = OnceCell::new();
+            let a = self.get_or_init_inner(&self_oc);
+            let b = rhs.get_or_init_inner(&rhs_oc);
+
+            // a[k * (row) + (col)] where 0 <= row < m, and 0 <= col < k
+            // b[n * (row) + (col)] where 0 <= row < k, and 0 <= col < n
+            // c[n * (row) + (col)] where 0 <= row < m, and 0 <= col < n
+
+            let stride = n;
+            let count = m;
+            let mut c = vec![0.0; stride * count];
+
+            for (c_row, a_row) in c.chunks_exact_mut(n).zip(a.chunks_exact(k)) {
+                for (block_idx, c_row_block) in c_row.chunks_exact_mut(N).enumerate() {
+                    for (a_chunk, b_chunk_rows) in a_row.chunks_exact(N).zip(b.chunks_exact(n * N))
+                    {
+                        for (a, b_chunk_row) in a_chunk.iter().zip(b_chunk_rows.chunks_exact(n)) {
+                            let b_chunk = &b_chunk_row[(block_idx * N)..(block_idx * N + N)];
+                            for (c, b) in c_row_block.iter_mut().zip(b_chunk.iter()) {
+                                *c += a * b;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Linear {
+                inner: LayerValues::new(c),
+                stride,
+                count,
+            }
+        }
         /// returns owned result of performing matrix multiplication of (Self * Rhs.T)
         pub fn matrix_transpose_product(
             self,
@@ -3894,8 +4002,8 @@ pub mod linear {
                 .map(|x| x.inner.as_ref())
                 .unwrap_or_else(|| rhs_oc.get_or_init(|| rhs_transpose.inner.collect_vec()));
 
-            let self_strides = self_vec.chunks(self.stride);
-            let rhs_strides = rhs_vec.chunks(rhs_transpose.stride);
+            let self_strides = self_vec.chunks_exact(self.stride);
+            let rhs_strides = rhs_vec.chunks_exact(rhs_transpose.stride);
 
             let len = rhs_transpose.count * self.count;
             let mut inner = LayerValues::new(vec![0.0; len]);
@@ -3919,6 +4027,7 @@ pub mod linear {
                 count: self.count,
             }
         }
+
         /// point-wise multiplication
         pub fn dot_product(
             self,
@@ -4157,7 +4266,7 @@ pub mod linear {
         pub fn softmax(self) -> Linear {
             let inner_vec = self.inner.collect_vec();
             let mut exp_counts = inner_vec
-                .chunks(self.stride)
+                .chunks_exact(self.stride)
                 .flat_map(|chunk| {
                     let max = chunk
                         .iter()
@@ -4174,7 +4283,7 @@ pub mod linear {
                 })
                 .collect_vec();
             let inner = {
-                exp_counts.chunks_mut(self.stride).for_each(|chunk| {
+                exp_counts.chunks_exact_mut(self.stride).for_each(|chunk| {
                     let sum = chunk.iter().sum::<NodeValue>();
                     let sum = if sum != 0.0 { sum } else { 1e-8 };
                     chunk.iter_mut().for_each(|x| *x = *x / sum);
@@ -4247,6 +4356,14 @@ pub mod linear {
                 count: self.count,
             }
         }
+        fn get_or_init_inner<'b>(self, cell: &'b OnceCell<Vec<f64>>) -> &'b Vec<f64>
+        where
+            'a: 'b,
+        {
+            self.parent
+                .map(|x| x.inner.as_ref())
+                .unwrap_or_else(move || cell.get_or_init(|| self.inner.collect_vec()))
+        }
         pub fn collect(self) -> Linear {
             Linear {
                 inner: self.inner.with_size(self.stride * self.count).collect(),
@@ -4283,6 +4400,12 @@ pub mod linear {
             }
         }
 
+        impl<I: Iterator<Item = f64>> ExactSizeIterator for KnownSizedIter<I> {
+            fn len(&self) -> usize {
+                self.size
+            }
+        }
+
         impl<I: Iterator<Item = f64>> KnownSizeIterator for I {}
     }
 
@@ -4298,6 +4421,118 @@ pub mod linear {
 
             let expected = Linear::from_iter(2, [140.0, 146.0, 320.0, 335.0].into_iter()).unwrap();
             assert_eq!(expected, y);
+        }
+
+        #[test]
+        fn can_linear_perform_fast_mat_mul() {
+            let (n, k) = (64, 32);
+            let mut a = Linear::with_value(n, k, 0.0);
+            a.rows_iter_mut().enumerate().for_each(|(i, row)| {
+                row.split_at_mut(i.min(row.len() - 1))
+                    .0
+                    .iter_mut()
+                    .for_each(|x| *x = 1.0)
+            });
+
+            let mut b = Linear::with_value(k, n, 0.0);
+            b.rows_iter_mut().enumerate().for_each(|(i, row)| {
+                row.split_at_mut(i.min(row.len() - 1))
+                    .1
+                    .iter_mut()
+                    .for_each(|x| *x = 1.0)
+            });
+
+            let expected = a.iter().matrix_transpose_product(b.iter_transpose());
+            let y = a.iter().matrix_product_fast(b.iter());
+            assert_eq!(expected, y);
+        }
+
+        #[test]
+        fn can_linear_perform_fast_mat_mul_explicit() {
+            let a = r#"
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+            "#;
+
+            let b = r#"
+                1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+                0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+                0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+                0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1
+                0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1
+                0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1
+                0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1
+                0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1
+                0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1
+                0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1
+                0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1
+                0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1
+                0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+            "#;
+
+            let matrix_a : Linear = a.parse().unwrap();
+            let matrix_b : Linear = b.parse().unwrap();
+
+            let expected = r#"
+                0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0
+                1  1  1  1  1  1  1  1  1  1  1  1  1  1  1  1
+                1  2  2  2  2  2  2  2  2  2  2  2  2  2  2  2
+                1  2  3  3  3  3  3  3  3  3  3  3  3  3  3  3
+                1  2  3  4  4  4  4  4  4  4  4  4  4  4  4  4
+                1  2  3  4  5  5  5  5  5  5  5  5  5  5  5  5
+                1  2  3  4  5  6  6  6  6  6  6  6  6  6  6  6
+                1  2  3  4  5  6  7  7  7  7  7  7  7  7  7  7
+                1  2  3  4  5  6  7  8  8  8  8  8  8  8  8  8
+                1  2  3  4  5  6  7  8  9  9  9  9  9  9  9  9
+                1  2  3  4  5  6  7  8  9  10 10 10 10 10 10 10
+                1  2  3  4  5  6  7  8  9  10 11 11 11 11 11 11
+                1  2  3  4  5  6  7  8  9  10 11 12 12 12 12 12
+                1  2  3  4  5  6  7  8  9  10 11 12 13 13 13 13
+                1  2  3  4  5  6  7  8  9  10 11 12 13 14 14 14
+                1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 15
+            "#;
+            let expected_matrix: Linear = expected.parse().unwrap();
+
+            let c = matrix_a
+                .iter()
+                .matrix_transpose_product(matrix_b.iter_transpose());
+            assert_eq!(expected_matrix, c);
+
+            let c = matrix_a.iter().matrix_product_fast(matrix_b.iter());
+            assert_eq!(expected_matrix, c);
         }
 
         #[test]
