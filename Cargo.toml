@@ -6,6 +6,7 @@ members = [
     "nllm_respond",
     "nllm_chat_web",
     "nllm_chat_functions",
+    "nllm_chat_visulizer",
 ]
 
 # TODO: consider removing - disabled to prevent large binaries pushed to s3

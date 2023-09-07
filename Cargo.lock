@@ -1660,6 +1660,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nllm_chat_visulizer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "nllm_chat_web"
 version = "0.1.0"
 dependencies = [
