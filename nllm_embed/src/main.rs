@@ -64,6 +64,7 @@ fn main() -> Result<()> {
 fn main() -> Result<()> {
     configure_logging();
     let (config, resumed_state) = parse_cli_args()?;
+    parse_wait_for_input_repl(&config);
 
     let config_clone = config.clone();
     let (tx, handle) =
@@ -171,6 +172,17 @@ fn parse_repl_char(
         _ => (),
     }
     Ok(ControlFlow::Continue(()))
+}
+
+fn parse_wait_for_input_repl(config: &TrainEmbeddingConfig) {
+    if let Some(c) = config.repl.as_ref().and_then(|x| x.chars().next()) {
+        if c == '#' {
+            println!("Waiting for input...");
+            let stdin = std::io::stdin();
+            let mut tmp = String::new();
+            stdin.read_line(&mut tmp).unwrap();
+        }
+    }
 }
 
 #[cfg(feature = "cli")]
@@ -346,6 +358,9 @@ fn load_embedding(
     }
     if let Some(phrase_test_set_max_tokens) = load_config.phrase_test_set_max_tokens {
         config.phrase_test_set_max_tokens = Some(phrase_test_set_max_tokens);
+    }
+    if load_config.disable_sample_from_pattern {
+        config.sample_from_pattern = None;
     }
     if load_config.force_continue {
         config.quit_on_complete = false;

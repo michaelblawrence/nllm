@@ -146,6 +146,9 @@ pub struct LoadEmbeddingConfig {
     pub phrase_test_set_max_tokens: Option<usize>,
 
     #[arg(long, default_value_t = false)]
+    pub disable_sample_from_pattern: bool,
+
+    #[arg(long, default_value_t = false)]
     pub force_continue: bool,
 
     #[arg(long, default_value = None)]
