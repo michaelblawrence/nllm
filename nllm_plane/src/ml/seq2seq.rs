@@ -124,7 +124,7 @@ pub mod transformer {
                     );
 
                     let (output_gradients, train_error): (Vec<_>, Vec<_>) = output_gradients
-                        .collect::<Result<Vec<(LayerValues, f64)>>>()?
+                        .collect::<Result<Vec<(LayerValues, NodeValue)>>>()?
                         .into_iter()
                         .unzip();
                     let decoder_gradients = Linear::from_values(&output_gradients)?;
@@ -660,8 +660,8 @@ pub mod transformer {
 
             fn report_training_round(
                 round: usize,
-                training_error: f64,
-                validation_errors: Vec<(f64, f64)>,
+                training_error: NodeValue,
+                validation_errors: Vec<(NodeValue, NodeValue)>,
                 predictions_pct: f64,
             ) {
                 let val_count = validation_errors.len() as NodeValue;
@@ -684,7 +684,7 @@ pub mod transformer {
             fn validate_test_set(
                 transformer: &CharacterTransformer,
                 testing_phrases: &String,
-            ) -> (Vec<(f64, f64)>, f64) {
+            ) -> (Vec<(NodeValue, NodeValue)>, f64) {
                 let testing_phrase_windows = &testing_phrases
                     .chars()
                     .chunks(transformer.input_stride_width() + 1)
@@ -707,7 +707,7 @@ pub mod transformer {
                 };
 
                 let (validation_errors, correct_first_word_predictions): (
-                    Vec<(f64, f64)>,
+                    Vec<(NodeValue, NodeValue)>,
                     Vec<usize>,
                 ) = testing_phrase_windows_iter
                     .map(|testing_phrase_window| {
@@ -729,7 +729,7 @@ pub mod transformer {
 
                 let correct_count = correct_first_word_predictions.iter().sum::<usize>();
                 let predictions_pct =
-                    correct_count as NodeValue * 100.0 / validation_errors.len() as NodeValue;
+                    correct_count as f64 * 100.0 / validation_errors.len() as f64;
 
                 (validation_errors, predictions_pct)
             }

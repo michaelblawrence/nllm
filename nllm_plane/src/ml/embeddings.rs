@@ -151,7 +151,7 @@ impl Embedding {
     where
         P: Iterator<Item = &'a Vec<String>>,
     {
-        let vectored_phrases: Vec<Vec<f64>> = phrases
+        let vectored_phrases: Vec<Vec<NodeValue>> = phrases
             .flat_map(|phrase| self.get_padded_network_input_iter(&phrase[..]))
             .flatten() // flatten here ignores any error variants (missing vocab etc.)
             .map(|one_hot| one_hot.collect::<Vec<_>>())
@@ -315,7 +315,7 @@ impl Embedding {
     fn get_padded_network_input_iter<'a, T: AsRef<str>>(
         &'a self,
         input_tokens: &'a [T],
-    ) -> impl Iterator<Item = Result<impl Iterator<Item = f64>>> + 'a {
+    ) -> impl Iterator<Item = Result<impl Iterator<Item = NodeValue>>> + 'a {
         iter::repeat(CONTROL_VOCAB)
             .take(self.input_stride_width())
             .chain(input_tokens.iter().map(|x| x.as_ref()))
@@ -1262,8 +1262,8 @@ mod tests {
 
         fn report_training_round(
             round: usize,
-            training_error: f64,
-            validation_errors: Vec<(f64, f64)>,
+            training_error: NodeValue,
+            validation_errors: Vec<(NodeValue, NodeValue)>,
             predictions_pct: f64,
             last_report_time: Option<(Duration, usize)>,
         ) {
@@ -1295,7 +1295,7 @@ mod tests {
             testing_phrases: &Vec<Vec<String>>,
             seen_pairs: &mut HashSet<(String, String)>,
             round: usize,
-        ) -> (Vec<(f64, f64)>, f64) {
+        ) -> (Vec<(NodeValue, NodeValue)>, f64) {
             let mut validation_errors = vec![];
             let mut correct_first_word_predictions = 0;
             let mut total_first_word_predictions = 0;
@@ -1347,8 +1347,8 @@ mod tests {
                 }
             }
 
-            let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
-                / total_first_word_predictions as NodeValue;
+            let predictions_pct = correct_first_word_predictions as f64 * 100.0
+                / total_first_word_predictions as f64;
             (validation_errors, predictions_pct)
         }
 

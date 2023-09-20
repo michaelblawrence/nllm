@@ -241,7 +241,7 @@ impl Network {
         &self,
         layers_activations: &Vec<LayerValues>,
         target_outputs: &LayerValues,
-    ) -> Result<f64> {
+    ) -> Result<NodeValue> {
         let last = layers_activations.last();
         let layer_output = last.expect("should have a final layer");
 
@@ -314,7 +314,7 @@ impl Network {
     fn process_gradient_descent_batch(
         &mut self,
         batch: Vec<(LayerValues, LayerValues)>,
-    ) -> Result<(Vec<f64>, Vec<Vec<(usize, LayerLearnAction)>>)> {
+    ) -> Result<(Vec<NodeValue>, Vec<Vec<(usize, LayerLearnAction)>>)> {
         use rayon::prelude::*;
 
         let (batch_errors, layer_learn_actions) = batch
@@ -336,7 +336,7 @@ impl Network {
     fn process_gradient_descent_batch(
         &mut self,
         batch: Vec<(LayerValues, LayerValues)>,
-    ) -> Result<(Vec<f64>, Vec<Vec<(usize, LayerLearnAction)>>)> {
+    ) -> Result<(Vec<NodeValue>, Vec<Vec<(usize, LayerLearnAction)>>)> {
         let all_layers_activations = batch
             .into_iter()
             .map(|(inputs, target_outputs)| {
@@ -475,7 +475,7 @@ impl Network {
         Ok(layer_learn_actions)
     }
 
-    pub fn node_weights(&self, layer_idx: usize, node_index: usize) -> Result<&[f64]> {
+    pub fn node_weights(&self, layer_idx: usize, node_index: usize) -> Result<&[NodeValue]> {
         Ok(self
             .layers
             .get(layer_idx)
@@ -483,7 +483,7 @@ impl Network {
             .node_weights(node_index)?)
     }
 
-    pub fn layer_weights(&self, layer_idx: usize) -> Result<&[f64]> {
+    pub fn layer_weights(&self, layer_idx: usize) -> Result<&[NodeValue]> {
         Ok(self
             .layers
             .get(layer_idx)
@@ -529,7 +529,7 @@ impl Network {
     fn apply_pending_layer_actions<'a, I: Iterator<Item = &'a (usize, LayerLearnAction)>>(
         &mut self,
         learn_actions: I,
-        learn_rate: f64,
+        learn_rate: NodeValue,
     ) -> Result<()> {
         use itertools::Itertools;
         use rayon::prelude::*;
@@ -566,7 +566,7 @@ impl Network {
     fn apply_pending_layer_actions<'a, I: Iterator<Item = &'a (usize, LayerLearnAction)>>(
         &mut self,
         learn_actions: I,
-        learn_rate: f64,
+        learn_rate: NodeValue,
     ) -> Result<()> {
         for (layer_idx, learn_strategy) in learn_actions.into_iter() {
             let layer = self
@@ -705,15 +705,15 @@ impl NetworkActivationMode {
     }
 
     pub fn softmax_d<'a>(
-        softmax_d: &'a [f64],
-        softmax: &'a [f64],
-    ) -> impl Iterator<Item = f64> + 'a {
+        softmax_d: &'a [NodeValue],
+        softmax: &'a [NodeValue],
+    ) -> impl Iterator<Item = NodeValue> + 'a {
         // dL/dx_i = sum(dL/dy_j * softmax(x_j) * (delta_ij - softmax(x_i)))   for i = 1, ..., n and j = 1, ..., n
         let dot_product = softmax
             .iter()
             .zip(softmax_d)
             .map(|(prob_j, grad_j)| prob_j * grad_j)
-            .sum::<f64>();
+            .sum::<NodeValue>();
 
         softmax
             .iter()
@@ -1072,7 +1072,7 @@ mod tests {
         let batch_size = Some(5);
 
         // TODO: impl on Network?
-        fn layer_weights<'a>(network: &'a Network) -> impl Iterator<Item = Vec<f64>> + 'a {
+        fn layer_weights<'a>(network: &'a Network) -> impl Iterator<Item = Vec<NodeValue>> + 'a {
             (0..network.layer_count()).map(|layer_idx| {
                 network
                     .node_weights(layer_idx, 0)
@@ -1122,11 +1122,11 @@ mod tests {
 
         pub(crate) fn run_training_iteration<const N: usize, const O: usize>(
             network: &mut Network,
-            training_pairs: &[([f64; N], [f64; O])],
-            learn_rate: f64,
+            training_pairs: &[([NodeValue; N], [NodeValue; O])],
+            learn_rate: NodeValue,
             round: i32,
             batch_size: Option<usize>,
-        ) -> f64 {
+        ) -> NodeValue {
             let error = if let Some(batch_size) = batch_size {
                 gradient_decent::compute_training_iteration(
                     network,
@@ -1155,7 +1155,7 @@ mod tests {
         }
 
         pub(crate) fn assert_training_outputs<const N: usize, const O: usize>(
-            training_pairs: &[([f64; N], [f64; O])],
+            training_pairs: &[([NodeValue; N], [NodeValue; O])],
             network: Network,
         ) {
             let mut outputs = vec![];
@@ -1180,10 +1180,10 @@ mod tests {
 
             pub fn compute_training_iteration<const N: usize, const O: usize>(
                 network: &mut Network,
-                training_pairs: &[([f64; N], [f64; O])],
-                learn_rate: f64,
+                training_pairs: &[([NodeValue; N], [NodeValue; O])],
+                learn_rate: NodeValue,
                 batch_sampling: BatchSamplingStrategy,
-            ) -> f64 {
+            ) -> NodeValue {
                 network
                     .learn(NetworkLearnStrategy::BatchGradientDecent {
                         training_pairs: training_pairs
@@ -1200,9 +1200,11 @@ mod tests {
     }
 
     mod comparer {
+        use crate::ml::NodeValue;
+
         #[derive(Debug)]
         pub struct ApproxFloatingPointComparer<'a> {
-            inner: &'a Vec<f64>,
+            inner: &'a Vec<NodeValue>,
         }
 
         impl<'a> PartialEq for ApproxFloatingPointComparer<'a> {
@@ -1226,7 +1228,7 @@ mod tests {
             fn approx(&'a self) -> ApproxFloatingPointComparer<'a>;
         }
 
-        impl<'a> ApproxFloatingPointComparable<'a> for Vec<f64> {
+        impl<'a> ApproxFloatingPointComparable<'a> for Vec<NodeValue> {
             fn approx(&'a self) -> ApproxFloatingPointComparer<'a> {
                 ApproxFloatingPointComparer { inner: &self }
             }

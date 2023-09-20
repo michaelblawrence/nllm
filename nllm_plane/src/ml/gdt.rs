@@ -949,7 +949,7 @@ impl GenerativeDecoderTransformer {
                         });
 
                 let (output_gradients, train_error): (Vec<_>, Vec<_>) = output_gradients
-                    .collect::<Result<Vec<(LayerValues, f64)>>>()?
+                    .collect::<Result<Vec<(LayerValues, NodeValue)>>>()?
                     .into_iter()
                     .unzip();
                 let decoder_gradients = Linear::from_values(&output_gradients)?;

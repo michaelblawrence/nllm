@@ -41,8 +41,8 @@ pub struct TrainerState<M> {
     paused: bool,
     batches_trained: usize,
     pub round: usize,
-    learn_rate: f64,
-    training_loss_logger: BoundedValueLogger<(usize, f64)>,
+    learn_rate: NodeValue,
+    training_loss_logger: BoundedValueLogger<(usize, NodeValue)>,
     rounds_until_pause_enabled: usize,
     halt: bool,
     force_report_test_set: bool,
@@ -88,7 +88,7 @@ impl<M: MLModel> TrainerState<M> {
         }
     }
 
-    fn train(&mut self, phrases: &Vec<Vec<String>>, batch_size: TrainBatchConfig) -> Option<f64> {
+    fn train(&mut self, phrases: &Vec<Vec<String>>, batch_size: TrainBatchConfig) -> Option<NodeValue> {
         if self.training_paused() {
             return None;
         }
@@ -103,7 +103,7 @@ impl<M: MLModel> TrainerState<M> {
         self.try_record_train_iteration(train_error)
     }
 
-    fn try_record_train_iteration(&mut self, train_error: Result<f64>) -> Option<f64> {
+    fn try_record_train_iteration(&mut self, train_error: Result<NodeValue>) -> Option<NodeValue> {
         match train_error {
             Ok(error) if error.is_finite() => {
                 if self.should_perform_autosave() {
@@ -297,7 +297,7 @@ impl<M: MLModel> TrainerState<M> {
 
         self.training_loss_logger = {
             let logger_capacity = self.training_loss_logger.capacity();
-            let mut logger: BoundedValueLogger<(usize, f64)> = metadata
+            let mut logger: BoundedValueLogger<(usize, NodeValue)> = metadata
                 .training_error_history
                 .into_iter()
                 .map(|(round, loss)| (round, (round, loss)))
@@ -346,11 +346,11 @@ impl<M: MLModel> TrainerState<M> {
         self.batches_trained
     }
 
-    pub fn learn_rate(&self) -> f64 {
+    pub fn learn_rate(&self) -> NodeValue {
         self.learn_rate
     }
 
-    pub fn set_learn_rate(&mut self, learn_rate: f64) {
+    pub fn set_learn_rate(&mut self, learn_rate: NodeValue) {
         self.model.set_learn_rate(learn_rate);
         self.learn_rate = learn_rate;
     }
@@ -647,7 +647,7 @@ where
 fn report_round<M: MLModel>(
     state: &mut TrainerState<M>,
     testing_phrases: &Vec<Vec<String>>,
-    training_error: Option<f64>,
+    training_error: Option<NodeValue>,
     label: Option<&str>,
 ) {
     let validation_results = if let Some(embedding) = state.model.as_embedding() {
@@ -887,13 +887,13 @@ mod validate {
     use crate::messages::TrainerReport;
 
     pub struct TestSetValidation {
-        validation_errors: Vec<(f64, f64)>,
-        predictions_pct: f64,
+        validation_errors: Vec<(NodeValue, NodeValue)>,
+        predictions_pct: NodeValue,
     }
 
     pub fn generate_training_report(
         round: usize,
-        training_error: f64,
+        training_error: NodeValue,
         validation_results: TestSetValidation,
         last_report_time: Option<(Duration, usize)>,
         label: Option<&str>,
@@ -1105,6 +1105,10 @@ pub mod writer {
 
     use crate::{config::TrainEmbeddingConfig, messages::TrainerStateMetadata, model::MLModel};
 
+    #[cfg(not(feature = "plot"))]
+    pub fn plot_training_loss(config: &&TrainEmbeddingConfig, metadata: &TrainerStateMetadata) {}
+
+    #[cfg(feature = "plot")]
     pub fn plot_training_loss(config: &&TrainEmbeddingConfig, metadata: &TrainerStateMetadata) {
         use plotly::{Plot, Scatter};
 

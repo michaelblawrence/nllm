@@ -290,7 +290,7 @@ impl RNG for SeedableTestRng {
             let rand = self.0.with_inner(|inner| inner.rand() - 1);
             rand as NodeValue
         };
-        rand * algo::mersenne_twister::F64_MULTIPLIER
+        rand * algo::mersenne_twister::F64_MULTIPLIER as NodeValue
     }
 }
 
@@ -308,7 +308,7 @@ impl RNG for FastSeedableTestRng {
             let rand = self.0.with_inner(|inner| inner.rand() - 1);
             rand as NodeValue
         };
-        rand * algo::park_miller::F64_MULTIPLIER
+        rand * algo::park_miller::F64_MULTIPLIER as NodeValue
     }
 }
 
@@ -409,7 +409,7 @@ mod tests {
 
     fn assert_rng(rng: &dyn RNG) {
         let mut buckets = vec![0; 13];
-        let span = 1.0 / buckets.len() as f64;
+        let span = 1.0 / buckets.len() as NodeValue;
 
         let iters = 10_000;
         for _ in 0..iters {

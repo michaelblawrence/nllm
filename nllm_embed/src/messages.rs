@@ -393,7 +393,7 @@ where
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TrainerStateMetadata {
-    pub learn_rate: f64,
+    pub learn_rate: NodeValue,
     pub training_rounds: usize,
     pub current_round: usize,
     #[serde(default)]
@@ -403,7 +403,7 @@ pub struct TrainerStateMetadata {
     #[serde(default)]
     pub training_report: Option<TrainerReport>,
     #[serde(default)]
-    pub training_error_history: Vec<(usize, f64)>,
+    pub training_error_history: Vec<(usize, NodeValue)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

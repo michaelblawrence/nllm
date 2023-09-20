@@ -7,10 +7,10 @@ use crate::ml::{RngStrategy, RNG};
 
 use super::LayerShape;
 
-#[cfg(not(short_floats))]
+#[cfg(not(feature = "short_floats"))]
 pub type NodeValue = f64;
 
-#[cfg(short_floats)]
+#[cfg(feature = "short_floats")]
 pub type NodeValue = f32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,7 +224,7 @@ impl Layer {
         self.size
     }
 
-    pub fn node_weights<'a>(&'a self, node_index: usize) -> Result<&[f64]> {
+    pub fn node_weights<'a>(&'a self, node_index: usize) -> Result<&[NodeValue]> {
         let n = self.size();
         let start = n * node_index;
         let end = start + n;
@@ -241,7 +241,7 @@ impl Layer {
         self.inputs_count * stride_count
     }
 
-    pub fn weights(&self) -> &[f64] {
+    pub fn weights(&self) -> &[NodeValue] {
         self.weights.as_ref()
     }
 
@@ -507,11 +507,11 @@ impl LayerInitStrategy {
         (rng.rand() * 2.0) - 1.0
     }
 
-    fn rand_normal(mu: f64, sigma: f64, rng: &dyn RNG) -> f64 {
+    fn rand_normal(mu: NodeValue, sigma: NodeValue, rng: &dyn RNG) -> NodeValue {
         use std::f64::consts::PI;
         let u1 = rng.rand();
         let u2 = rng.rand();
-        let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
+        let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * PI as NodeValue * u2).cos();
         return mu + sigma * z0;
     }
 

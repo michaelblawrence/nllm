@@ -99,7 +99,7 @@ pub struct TrainEmbeddingConfig {
     pub phrase_word_length_bounds: (Option<usize>, Option<usize>),
 
     #[arg(short = 'X', long, default_value = "20")]
-    pub phrase_test_set_split_pct: Option<NodeValue>,
+    pub phrase_test_set_split_pct: Option<f64>,
 
     #[arg(short = 'W', long, default_value = None)]
     #[serde(default)]
