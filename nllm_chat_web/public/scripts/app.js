@@ -30,7 +30,7 @@ function Conversation() {
     const [connectText, setConnectText] = createSignal(initialConnectText);
     const [connectDisabled, setConnectDisabled] = createSignal(false);
 
-    let chatTextAreaRef;
+    let chatTextAreaRef, lastMsg;
 
     const [wsStart, wsSend] = createWebSocketChat({
         onConnected: () => setConnectText("Joined"),
@@ -72,6 +72,14 @@ function Conversation() {
         if (e.key == "Enter") {
             e.preventDefault();
             onMessageSubmit();
+            return;
+        }
+        if (e.key == "ArrowUp") {
+            e.preventDefault();
+            if (lastMsg) {
+                setMessageInputValue(msg => (msg && msg.length > 0) ? "" : lastMsg);
+            }
+            return;
         }
     };
 
@@ -89,6 +97,7 @@ function Conversation() {
         if (msg) {
             wsSend(msg);
             setMessageInputValue("");
+            lastMsg = msg;
         }
     };
 
