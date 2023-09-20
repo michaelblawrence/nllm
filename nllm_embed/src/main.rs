@@ -177,7 +177,8 @@ fn parse_repl_char(
 fn parse_wait_for_input_repl(config: &TrainEmbeddingConfig) {
     if let Some(c) = config.repl.as_ref().and_then(|x| x.chars().next()) {
         if c == '#' {
-            println!("Waiting for input...");
+            let pid = std::process::id();
+            println!("Waiting for input... (pid = {pid})");
             let stdin = std::io::stdin();
             let mut tmp = String::new();
             stdin.read_line(&mut tmp).unwrap();
