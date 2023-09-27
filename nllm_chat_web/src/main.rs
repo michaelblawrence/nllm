@@ -139,7 +139,7 @@ async fn keepalive_websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse 
 }
 
 async fn configure_logging() {
-    use tracing_subscriber::{prelude::*, Registry};
+    use tracing_subscriber::{filter::LevelFilter, prelude::*, Registry};
 
     let stdout_log = tracing_subscriber::fmt::layer()
         .compact()
