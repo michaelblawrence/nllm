@@ -15,15 +15,16 @@ use futures::{
     stream::{SplitStream, StreamExt},
 };
 use reqwest::header;
+use tokio::sync::broadcast;
+use tower_http::services::ServeDir;
+use tracing::Level;
 
 use std::{
     collections::HashSet,
     net::SocketAddr,
+    process::Command,
     sync::{Arc, Mutex},
 };
-use tokio::sync::broadcast;
-use tower_http::services::ServeDir;
-use tracing::metadata::LevelFilter;
 
 use crate::tower_ext::ApiServiceExt;
 
@@ -46,7 +47,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    configure_logging();
+    configure_logging().await;
 
     let app_state = configure_app_state().await;
     if let Err(e) = configure_current_dir() {
@@ -137,13 +138,50 @@ async fn keepalive_websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse 
     })
 }
 
-fn configure_logging() {
-    let subscriber = tracing_subscriber::fmt()
+async fn configure_logging() {
+    use tracing_subscriber::{prelude::*, Registry};
+
+    let stdout_log = tracing_subscriber::fmt::layer()
         .compact()
         .with_target(false)
         .with_timer(tracing_subscriber::fmt::time::time())
-        .with_max_level(LevelFilter::INFO)
-        .finish();
+        .map_writer(|x| x.with_max_level(Level::INFO));
+    let subscriber = Registry::default().with(stdout_log);
+
+    let subscriber: Box<dyn tracing::Subscriber + Send + Sync + 'static> = {
+        #[cfg(feature = "cloudwatch")]
+        {
+            let sdk_config = aws_config::load_from_env().await;
+            let client = aws_sdk_cloudwatchlogs::Client::new(&sdk_config);
+            let log_group_name = "nllm-chat-web";
+            match ensure_log_stream(&client, log_group_name).await {
+                Ok(log_stream_name) => Box::new(
+                    subscriber.with(
+                        tracing_cloudwatch::layer()
+                            .with_client(
+                                client,
+                                tracing_cloudwatch::ExportConfig::default()
+                                    .with_batch_size(5)
+                                    .with_interval(std::time::Duration::from_secs(1))
+                                    .with_log_group_name(log_group_name)
+                                    .with_log_stream_name(log_stream_name),
+                            )
+                            .with_code_location(true)
+                            .with_target(false)
+                            .with_filter(LevelFilter::from_level(Level::INFO)),
+                    ),
+                ),
+                Err(e) => {
+                    eprintln!("Failed to init cloudwatch log stream: {e}");
+                    Box::new(subscriber)
+                }
+            }
+        }
+        #[cfg(not(feature = "cloudwatch"))]
+        {
+            Box::new(subscriber)
+        }
+    };
 
     tracing::subscriber::set_global_default(subscriber).unwrap();
 }
@@ -193,6 +231,49 @@ fn configure_current_dir() -> anyhow::Result<()> {
         bail!("failed to find index.html content root");
     }
     Ok(())
+}
+
+#[cfg(feature = "cloudwatch")]
+async fn ensure_log_stream(
+    client: &aws_sdk_cloudwatchlogs::Client,
+    log_group_name: &str,
+) -> anyhow::Result<String> {
+    use aws_sdk_cloudwatchlogs::error::SdkError;
+
+    let ec2_instance_id = get_ec2_instance_id();
+    let instance_id = ec2_instance_id.as_deref().unwrap_or("unknown");
+    let log_stream_name = format!("tracing-stream--{instance_id}");
+    println!("Creating log stream '{log_stream_name}'...");
+
+    match client
+        .create_log_stream()
+        .log_group_name(log_group_name)
+        .log_stream_name(&log_stream_name)
+        .send()
+        .await
+    {
+        Ok(_) => {
+            println!("Created log stream '{log_stream_name}'");
+            ()
+        }
+        Err(SdkError::ServiceError(e)) if e.err().is_resource_already_exists_exception() => (),
+        Err(e) => Err(e.into_service_error())
+            .context(format!("Error creating log stream '{log_stream_name}'"))?,
+    }
+    Ok(log_stream_name)
+}
+
+fn get_ec2_instance_id() -> Option<String> {
+    Command::new("ec2-metadata")
+        .args(["-i"])
+        .output()
+        .ok()
+        .and_then(|x| {
+            use std::io::Read;
+            let mut s = String::new();
+            x.stdout.as_slice().read_to_string(&mut s).ok()?;
+            s.split_once("id: ").map(|x| x.1.to_owned())
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -278,13 +359,19 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     state.user_set.lock().unwrap().remove(&name);
 }
 
+fn next_prompt_index() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static mut COUNTER: AtomicUsize = AtomicUsize::new(0);
+    unsafe { COUNTER.fetch_add(1, Ordering::Relaxed) }
+}
+
 async fn forward_ws_to_broadcast(
     mut ws_receiver: SplitStream<WebSocket>,
     client_tx: broadcast::Sender<ClientPayload>,
     state: Arc<AppState>,
     name: String,
 ) {
-    let name = name.to_owned();
+    let name = name.into_boxed_str();
     let mut beta_mode = false;
     while let Some(Ok(Message::Text(text))) = ws_receiver.next().await {
         if text.starts_with('!') {
@@ -314,6 +401,8 @@ async fn forward_ws_to_broadcast(
                 let prompt_request = inference::ModelPromptRequest {
                     prompt: query.to_string(),
                     use_beta_function: beta_mode,
+                    username: name.to_string(),
+                    index: next_prompt_index(),
                 };
                 let _ = state.model_tx.send(prompt_request);
                 break;

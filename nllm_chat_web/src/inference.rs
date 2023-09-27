@@ -2,14 +2,16 @@ use anyhow::{bail, Context};
 use aws_sdk_lambda::types::InvokeMode;
 use serde_json::json;
 use tokio::sync::broadcast;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use std::{sync::Arc, time::Duration};
 
 #[derive(Debug, Clone)]
 pub struct ModelPromptRequest {
     pub prompt: String,
+    pub username: String,
     pub use_beta_function: bool,
+    pub index: usize,
 }
 
 pub async fn spawn_lambda_inference_client(
@@ -45,7 +47,9 @@ pub async fn spawn_lambda_inference_client(
         let http_client = reqwest::Client::new();
         while let Ok(ModelPromptRequest {
             prompt,
+            username,
             use_beta_function,
+            index,
         }) = model_rx.recv().await
         {
             // TODO: consider moving to env var
@@ -69,10 +73,13 @@ pub async fn spawn_lambda_inference_client(
                     use tokio::io::AsyncBufReadExt;
 
                     info!("Started streaming inference response from remote: prompt = `{prompt}`");
+                    info!(target: "generation-started", index=index, prompt=prompt, username=username, remote=true);
+
                     match response.error_for_status_ref() {
                         Ok(_) => (),
                         Err(e) => {
                             error!("Error streaming inference response from remote: {e}");
+                            info!(target: "generation-error", index=index, prompt=prompt, username=username, remote=true);
                             continue;
                         }
                     }
@@ -84,14 +91,15 @@ pub async fn spawn_lambda_inference_client(
                     let read = tokio_util::io::StreamReader::new(stream);
                     let reader = tokio::io::BufReader::new(read);
                     let mut lines = reader.lines();
-                    let mut last_line = String::new();
+                    let mut response_msg = String::new();
 
                     while let Ok(Some(msg)) = lines.next_line().await {
-                        last_line.clear();
-                        last_line.push_str(&msg);
+                        response_msg.clear();
+                        response_msg.push_str(&msg);
                         tx.send(msg).unwrap();
                     }
-                    info!("Completed streaming inference response from remote: response = `{last_line}`");
+                    info!(target: "generation-completed", index=index, response=response_msg, username=username, remote=true);
+                    info!("Completed streaming inference response from remote: response = `{response_msg}`");
                 }
                 Err(e) => error!("Error starting inference streaming from remote: {e}"),
             }
@@ -111,15 +119,14 @@ pub fn spawn_local_inference(
     let ctx = Arc::new((model, state, tx.clone()));
 
     tokio::spawn(async move {
-        while let Ok(ModelPromptRequest { prompt, .. }) = model_rx.recv().await {
+        while let Ok(prompt_request) = model_rx.recv().await {
             let ctx = ctx.clone();
+            let prompt = prompt_request.prompt.clone();
 
-            let prompt: Arc<str> = prompt.into();
             let infer_task = tokio::task::spawn_blocking({
-                let prompt = prompt.clone();
                 move || {
                     let (model, state, tx) = &*ctx;
-                    let messages = infer(&prompt, &model, &state)?;
+                    let messages = infer(&prompt_request, &model, &state)?;
                     for msg in messages {
                         tx.send(msg)?;
                     }
@@ -140,10 +147,16 @@ pub fn spawn_local_inference(
 }
 
 pub fn infer<'a>(
-    prompt: &'a str,
+    prompt_request: &'a ModelPromptRequest,
     model: &'a respond::RespondModel,
     state: &'a respond::ExtractedModelConfig,
 ) -> anyhow::Result<impl Iterator<Item = String> + 'a> {
+    let ModelPromptRequest {
+        prompt,
+        username,
+        index,
+        ..
+    } = prompt_request;
     let config = to_prompt_config(state);
 
     let env_timeout_secs = std::env::var("NLLM_INFER_TIMEOUT_MS").ok();
@@ -158,6 +171,7 @@ pub fn infer<'a>(
     }
     let mut state: Option<State> = None;
     let mut response = respond::process_prompt(&model, &prompt, &config)?;
+    info!(target: "generation-started", index=index, prompt=prompt, username=username, remote=false);
 
     Ok(std::iter::from_fn(move || match state.take() {
         None => {
@@ -169,7 +183,7 @@ pub fn infer<'a>(
                 response_msg += &format!("{token}{separator}");
 
                 if inference_started.elapsed() > timeout_duration {
-                    info!("Timed out on prompt `{prompt}`");
+                    info!(target: "generation-timeout", index=index, prompt=prompt, username=username, remote=false);
 
                     state = Some(State::Complete);
                     Some(format!("Chat: {response_msg}..."))
@@ -181,11 +195,12 @@ pub fn infer<'a>(
                 }
             } else {
                 state = Some(State::Complete);
+                info!(target: "generation-completed", index=index, response=response_msg, username=username, remote=false);
                 Some(format!("Chat: {response_msg}"))
             }
         }
         Some(State::Complete) => {
-            info!("Completed user prompt response");
+            debug!("Completed user prompt response");
             None
         }
     }))
