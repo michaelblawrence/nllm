@@ -2141,6 +2141,9 @@ pub mod layers {
             let mut embedding_vectors = vec![];
 
             for &token in token_sequence.as_ref() {
+                if token >= self.vocab_size {
+                    return Err(anyhow!("token not in embedding range"));
+                }
                 let embedding = self.embeddings.get(token).context("invalid token id")?;
                 let embedding_vector = embedding.value().as_single_stride()?;
                 embedding_vectors.push(embedding_vector);
@@ -2357,7 +2360,7 @@ pub mod layers {
         pub fn backward_jacobian(
             &self,
             x: &Linear,
-            gamma: f64,
+            gamma: NodeValue,
             dl_dnorm: &Linear,
         ) -> Result<(Linear, Linear, Linear)> {
             // Compute mean and standard deviation of input
@@ -3253,6 +3256,7 @@ pub mod dense {
 
         fn compute_weighted_inputs(&self, inputs: &Linear) -> Result<Linear> {
             // -> output = inputs * weights
+            // TODO: (PERF) optimize matmul operation by ensuring matrix dims are aligned to 16 elems
             let output = inputs.matrix_product(self.weights.value());
 
             if let Some(bias) = &self.bias {
@@ -3675,8 +3679,8 @@ pub mod linear {
         pub fn matrix_product(&self, rhs: &Linear) -> Linear {
             assert_eq!(self.stride, rhs.count, "mismatched dimensions");
 
-            if self.count >= 64 && rhs.stride >= 64 && self.stride % 16 == 0 && rhs.stride % 16 == 0
-            {
+            let is_small = self.count < 64 && rhs.stride < 64;
+            if !is_small && self.stride % 16 == 0 && rhs.stride % 16 == 0 {
                 self.iter().matrix_product_fast(rhs.iter())
             } else {
                 self.iter().matrix_transpose_product(rhs.iter_transpose())
@@ -3686,7 +3690,8 @@ pub mod linear {
         pub fn matrix_product_rhs_transposed(&self, rhs: &Linear) -> Linear {
             assert_eq!(self.stride, rhs.stride, "mismatched stride dimension");
 
-            if self.count >= 64 && rhs.count >= 64 && self.count % 16 == 0 && rhs.count % 16 == 0 {
+            let is_small = self.count < 64 && rhs.count < 64;
+            if !is_small && self.stride % 16 == 0 && rhs.count % 16 == 0 {
                 self.iter().matrix_product_fast(rhs.iter_transpose())
             } else {
                 self.iter().matrix_transpose_product(rhs.iter())
@@ -3696,9 +3701,9 @@ pub mod linear {
         pub fn matrix_product_lhs_transposed(&self, rhs: &Linear) -> Linear {
             assert_eq!(self.count, rhs.count, "mismatched count dimension");
 
-            if self.stride % 16 == 0 && rhs.stride % 16 == 0 {
+            if self.count % 16 == 0 && rhs.stride % 16 == 0 {
                 self.iter_transpose().matrix_product_fast(rhs.iter())
-            } else if self.stride % 4 == 0 && rhs.stride % 4 == 0 {
+            } else if self.count % 4 == 0 && rhs.stride % 4 == 0 {
                 self.iter_transpose().matrix_product_fast_4x4(rhs.iter())
             } else {
                 self.iter_transpose()
@@ -3927,7 +3932,13 @@ pub mod linear {
             self,
             rhs: LinearIter<'a, impl Iterator<Item = NodeValue>>,
         ) -> Linear {
-            self.matrix_product_fast_n::<16>(rhs)
+            if self.stride % 16 == 0 && rhs.stride % 16 == 0 {
+                self.matrix_product_fast_n::<16>(rhs)
+            } else if self.stride % 4 == 0 && rhs.stride % 4 == 0 {
+                self.matrix_product_fast_n::<4>(rhs)
+            } else {
+                unimplemented!("no remained implementation")
+            }
         }
         /// returns owned result of performing matrix multiplication of (Self * Rhs)
         pub fn matrix_product_fast_4x4(
@@ -3963,12 +3974,13 @@ pub mod linear {
             let mut c = vec![0.0; stride * count];
 
             for (c_row, a_row) in c.chunks_exact_mut(n).zip(a.chunks_exact(k)) {
-                for (block_idx, c_row_block) in c_row.chunks_exact_mut(N).enumerate() {
-                    for (a_chunk, b_chunk_rows) in a_row.chunks_exact(N).zip(b.chunks_exact(n * N))
-                    {
-                        for (a, b_chunk_row) in a_chunk.iter().zip(b_chunk_rows.chunks_exact(n)) {
-                            let b_chunk = &b_chunk_row[(block_idx * N)..(block_idx * N + N)];
-                            for (c, b) in c_row_block.iter_mut().zip(b_chunk.iter()) {
+                for (a_chunk, b_chunk_rows) in a_row.chunks_exact(N).zip(b.chunks_exact(n * N)) {
+                    for (a, b_chunk_row) in a_chunk.iter().zip(b_chunk_rows.chunks_exact(n)) {
+                        for (c_block, b_chunk) in
+                            c_row.chunks_exact_mut(N).zip(b_chunk_row.chunks(N))
+                        {
+                            // assert!(c_block)
+                            for (c, b) in c_block.iter_mut().zip(b_chunk.iter()) {
                                 *c += a * b;
                             }
                         }
@@ -3982,6 +3994,7 @@ pub mod linear {
                 count,
             }
         }
+
         /// returns owned result of performing matrix multiplication of (Self * Rhs.T)
         pub fn matrix_transpose_product(
             self,
@@ -4136,7 +4149,7 @@ pub mod linear {
         }
         /// point-wise round to fixed point decimal
         pub fn round(self, decimals: u32) -> LinearIter<'a, impl Iterator<Item = NodeValue>> {
-            let mul = 10u32.pow(decimals) as f64;
+            let mul = 10u32.pow(decimals) as NodeValue;
             LinearIter {
                 inner: self.inner.map(move |x| (x * mul).round() / mul),
                 stride: self.stride,
@@ -4162,7 +4175,7 @@ pub mod linear {
                 parent: None,
             }
         }
-        pub fn dropout_mask(&self, dropout_rate: f64, rng: RngStrategy) -> Linear {
+        pub fn dropout_mask(&self, dropout_rate: NodeValue, rng: RngStrategy) -> Linear {
             assert!(
                 dropout_rate <= 1.0 && dropout_rate >= 0.0,
                 "invalid dropout rate"
@@ -4259,7 +4272,7 @@ pub mod linear {
         pub fn apply_gradients(
             self,
             grads: LinearIter<'a, impl Iterator<Item = NodeValue>>,
-            learn_rate: f64,
+            learn_rate: NodeValue,
         ) -> Linear {
             self.sub(grads.multiply_scalar(learn_rate)).collect()
         }
@@ -4356,7 +4369,7 @@ pub mod linear {
                 count: self.count,
             }
         }
-        fn get_or_init_inner<'b>(self, cell: &'b OnceCell<Vec<f64>>) -> &'b Vec<f64>
+        fn get_or_init_inner<'b>(self, cell: &'b OnceCell<Vec<NodeValue>>) -> &'b Vec<NodeValue>
         where
             'a: 'b,
         {
@@ -4374,7 +4387,9 @@ pub mod linear {
     }
 
     mod iter_ext {
-        pub trait KnownSizeIterator: Iterator<Item = f64> {
+        use crate::ml::NodeValue;
+
+        pub trait KnownSizeIterator: Iterator<Item = NodeValue> {
             fn with_size(self, size: usize) -> KnownSizedIter<Self>
             where
                 Self: Sized,
@@ -4388,8 +4403,8 @@ pub mod linear {
             inner: I,
         }
 
-        impl<I: Iterator<Item = f64>> Iterator for KnownSizedIter<I> {
-            type Item = f64;
+        impl<I: Iterator<Item = NodeValue>> Iterator for KnownSizedIter<I> {
+            type Item = NodeValue;
 
             fn next(&mut self) -> Option<Self::Item> {
                 self.inner.next()
@@ -4400,13 +4415,13 @@ pub mod linear {
             }
         }
 
-        impl<I: Iterator<Item = f64>> ExactSizeIterator for KnownSizedIter<I> {
+        impl<I: Iterator<Item = NodeValue>> ExactSizeIterator for KnownSizedIter<I> {
             fn len(&self) -> usize {
                 self.size
             }
         }
 
-        impl<I: Iterator<Item = f64>> KnownSizeIterator for I {}
+        impl<I: Iterator<Item = NodeValue>> KnownSizeIterator for I {}
     }
 
     #[cfg(test)]
@@ -4503,8 +4518,8 @@ pub mod linear {
                 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
             "#;
 
-            let matrix_a : Linear = a.parse().unwrap();
-            let matrix_b : Linear = b.parse().unwrap();
+            let matrix_a: Linear = a.parse().unwrap();
+            let matrix_b: Linear = b.parse().unwrap();
 
             let expected = r#"
                 0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0
@@ -5007,7 +5022,7 @@ pub mod solver {
             builder::AdamOptimizerBuilder::new(param_count, param_dimension)
         }
 
-        pub fn set_eta(&mut self, eta: f64) {
+        pub fn set_eta(&mut self, eta: NodeValue) {
             self.eta = eta;
         }
 
@@ -5566,7 +5581,9 @@ pub mod solver {
 #[cfg(test)]
 mod tests {
     pub mod helpers {
-        use crate::ml::{layer::LayerInitStrategy, transformer::linear::Linear, RngStrategy};
+        use crate::ml::{
+            layer::LayerInitStrategy, transformer::linear::Linear, NodeValue, RngStrategy,
+        };
 
         pub fn assert_optimisation_converges<T, I>(
             create: &dyn Fn(RngStrategy) -> (T, I, Linear),
@@ -5675,9 +5692,9 @@ mod tests {
 
         pub fn compute_expected_dloss_dinput(
             forward_fn: impl Fn(&Linear) -> Linear,
-            loss_fn: impl Fn(&Linear) -> f64,
+            loss_fn: impl Fn(&Linear) -> NodeValue,
             inputs: Linear,
-            epsilon: f64,
+            epsilon: NodeValue,
         ) -> Linear {
             let output = forward_fn(&inputs);
             let original_loss = loss_fn(&output);
