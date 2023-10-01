@@ -21,7 +21,7 @@ use tracing::Level;
 
 use std::{
     collections::HashSet,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     process::Command,
     sync::{Arc, Mutex},
 };
@@ -71,7 +71,7 @@ async fn main() {
     tracing::info!("listening on {}", addr);
 
     axum::Server::bind(&addr)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .unwrap();
 }
@@ -117,9 +117,10 @@ async fn diagnostics_ws_js() -> Response {
 
 async fn websocket_handler(
     ws: WebSocketUpgrade,
+    connection: axum::extract::ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| websocket(socket, state))
+    ws.on_upgrade(move |socket| websocket(socket, connection.ip(), state))
 }
 
 async fn keepalive_websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -304,7 +305,7 @@ async fn get_username(
 // This function deals with a single websocket connection, i.e., a single
 // connected client / user, for which we will spawn two independent tasks (for
 // receiving / sending chat messages).
-async fn websocket(stream: WebSocket, state: Arc<AppState>) {
+async fn websocket(stream: WebSocket, ip: IpAddr, state: Arc<AppState>) {
     // By splitting, we can send and receive at the same time.
     let (mut sender, mut receiver) = stream.split();
     let (client_tx, client_rx) = broadcast::channel(10);
@@ -325,7 +326,7 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     // Now send the "joined" message to all subscribers.
     let joined_msg = format!("{} joined.", name);
     let welcome_msg = format!("Chat: Hi {name}, if you ever need my help, just call me by starting your message with 'Hey Chat'");
-    tracing::info!("{}", joined_msg);
+    tracing::info!("{} IP = {}", joined_msg, ip);
     let _ = state.tx.send(joined_msg);
     let _ = sender.send(Message::Text(welcome_msg)).await;
 
