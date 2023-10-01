@@ -182,7 +182,7 @@ pub mod token {
         use std::{collections::HashMap, sync::Arc};
 
         use anyhow::{anyhow, Context, Result};
-        use itertools::Itertools;
+        use itertools::{Either, Itertools};
         use serde::{Deserialize, Serialize};
 
         use crate::ml::RngStrategy;
@@ -294,10 +294,19 @@ pub mod token {
                             let token = GDTToken::Word(x.to_string()).into();
                             encoder
                                 .get_key_value(&token)
-                                .ok_or_else(|| x.to_string())
                                 .map(|(x, _)| vec![x.clone()])
+                                .or_else(|| {
+                                    Self::encode_word_token_iter(x)
+                                        .map(|token| {
+                                            encoder
+                                                .get_key_value(&token.into())
+                                                .map(|(x, _)| x.clone())
+                                        })
+                                        .collect::<Option<_>>()
+                                })
+                                .ok_or_else(|| token.to_string())
                                 .or_else(|token| match &self.fallback {
-                                    Some(fallback) => fallback.encode(x).map_err(|_| token),
+                                    Some(fallback) => fallback.encode(&token).map_err(|_| token),
                                     None => Err(token),
                                 })
                         })
@@ -463,7 +472,8 @@ pub mod token {
                                 self.encode_truncated(&chars, Some(token_len + 1))?;
                             let sequence = if sequence.len() > token_len + 1 {
                                 if sample_from_pattern.is_none() {
-                                    let max_start_idx = sequence.len().saturating_sub(token_len + 1);
+                                    let max_start_idx =
+                                        sequence.len().saturating_sub(token_len + 1);
                                     let start_idx = rng.rand_range(0, max_start_idx);
                                     let end_idx = start_idx + token_len + 1;
 
@@ -624,6 +634,80 @@ pub mod token {
                 counts.sort_by_key(|x| x.0);
                 counts
             }
+
+            fn strip_not_alphabetic(x: &str) -> (&str, Option<&str>, Option<&str>) {
+                fn strip_prefix(x: &str) -> (Option<&str>, &str) {
+                    if x.is_empty() {
+                        return (None, x);
+                    }
+
+                    x.char_indices()
+                        .find(|&(_, c)| char::is_alphabetic(c))
+                        .map_or_else(
+                            || (Some(x), &x[..0]),
+                            |(pos, _)| (Some(&x[..pos]).filter(|x| !x.is_empty()), &x[pos..]),
+                        )
+                }
+                fn strip_suffix(x: &str) -> (&str, Option<&str>) {
+                    if x.is_empty() {
+                        return (x, None);
+                    }
+                    x.char_indices()
+                        .rev()
+                        .find(|&(_, c)| char::is_alphabetic(c))
+                        .map_or_else(
+                            || (&x[..0], Some(x)),
+                            |(pos, c)| {
+                                let pos = pos + c.len_utf8();
+                                (&x[..pos], Some(&x[pos..]).filter(|x| !x.is_empty()))
+                            },
+                        )
+                }
+
+                if let (x, Some(suffix)) = strip_suffix(x) {
+                    if let (Some(prefix), x) = strip_prefix(x) {
+                        (x, Some(prefix), Some(suffix))
+                    } else {
+                        (x, None, Some(suffix))
+                    }
+                } else if let (Some(prefix), x) = strip_prefix(x) {
+                    (x, Some(prefix), None)
+                } else {
+                    (x, None, None)
+                }
+            }
+
+            fn encode_word_token_iter(corpus: &str) -> impl Iterator<Item = GDTToken> + '_ {
+                let (word, tokens): (Vec<_>, Vec<_>) =
+                    corpus.split_whitespace().partition_map(|x| {
+                        match Self::strip_not_alphabetic(x) {
+                            (x, None, None) if !x.is_empty() => {
+                                Either::Left(GDTToken::Word(x.to_string()))
+                            }
+                            (x, prefix, suffix) => Either::Right(
+                                prefix
+                                    .into_iter()
+                                    .flat_map(|x| x.chars())
+                                    .map(|x| GDTToken::Char(x))
+                                    .chain(
+                                        Some(x)
+                                            .filter(|x| !x.is_empty())
+                                            .map(|x| [GDTToken::Word(x.to_string())])
+                                            .into_iter()
+                                            .flatten(),
+                                    )
+                                    .chain(
+                                        suffix
+                                            .into_iter()
+                                            .flat_map(|x| x.chars())
+                                            .map(|x| GDTToken::Char(x)),
+                                    ),
+                            ),
+                        }
+                    });
+
+                word.into_iter().chain(tokens.into_iter().flatten())
+            }
         }
 
         fn sample_next_word_boundary_idx(
@@ -646,6 +730,8 @@ pub mod token {
         }
 
         mod builder {
+            use std::borrow::Cow;
+
             use anyhow::{anyhow, Result};
             use itertools::Itertools;
 
@@ -673,6 +759,7 @@ pub mod token {
                 token_type: VocabTokenType,
                 control_token: GDTToken,
                 tokens: hash::DeterministicHashMap<GDTToken, usize>,
+                manual_tokens: hash::DeterministicHashMap<GDTToken, usize>,
                 max_vocab_size: Option<usize>,
                 bpe_config: Option<VocabBpeConfig>,
                 fallback: Option<Box<Vocab>>,
@@ -688,6 +775,7 @@ pub mod token {
                             VocabTokenType::Char => GDTToken::Char('\x00'),
                         },
                         tokens: Default::default(),
+                        manual_tokens: Default::default(),
                         bpe_config: Default::default(),
                         max_vocab_size: None,
                         fallback: None,
@@ -695,15 +783,8 @@ pub mod token {
                 }
                 pub fn from_corpus(mut self, corpus: &str) -> Self {
                     match self.token_type {
-                        VocabTokenType::Word => corpus
-                            .split_whitespace()
-                            .map(|x| GDTToken::Word(x.to_string()))
-                            .for_each(|token| {
-                                self.tokens
-                                    .entry(token)
-                                    .and_modify(|x| *x += 1)
-                                    .or_insert(0);
-                            }),
+                        VocabTokenType::Word => Vocab::encode_word_token_iter(corpus)
+                            .for_each(|token| self.push_token(token)),
                         VocabTokenType::BPE => {
                             let VocabBpeConfig { num_merges, iters } =
                                 self.bpe_config.clone().unwrap_or_default();
@@ -719,30 +800,18 @@ pub mod token {
                             vocab
                                 .into_iter()
                                 .map(|x| GDTToken::Subword(x))
-                                .for_each(|token| {
-                                    self.tokens
-                                        .entry(token)
-                                        .and_modify(|x| *x += 1)
-                                        .or_insert(0);
-                                });
+                                .for_each(|token| self.push_token(token));
                         }
-                        VocabTokenType::Char => {
-                            corpus.chars().map(|x| GDTToken::Char(x)).for_each(|token| {
-                                self.tokens
-                                    .entry(token)
-                                    .and_modify(|x| *x += 1)
-                                    .or_insert(0);
-                            })
-                        }
+                        VocabTokenType::Char => corpus
+                            .chars()
+                            .map(|x| GDTToken::Char(x))
+                            .for_each(|token| self.push_token(token)),
                     }
                     self
                 }
                 pub fn from_gdt(mut self, tokens: &[GDTToken]) -> Self {
                     for token in tokens {
-                        self.tokens
-                            .entry(token.clone())
-                            .and_modify(|x| *x += 1)
-                            .or_insert(0);
+                        self.push_token(token.clone())
                     }
                     self
                 }
@@ -762,12 +831,23 @@ pub mod token {
                                 .tokens
                                 .keys()
                                 .filter_map(|x| match x {
-                                    GDTToken::Word(x) => Some(x),
-                                    GDTToken::Subword(x) => Some(x),
-                                    GDTToken::Char(_) => None,
+                                    GDTToken::Word(x) => Some(Cow::from(x)),
+                                    GDTToken::Subword(x) => Some(Cow::from(x)),
+                                    GDTToken::Char(x) => Some(Cow::from(x.to_string())),
                                 })
+                                .collect_vec()
+                                .iter()
                                 .flat_map(|x| x.chars())
                                 .collect();
+
+                            let char_tokens = self
+                                .tokens
+                                .keys()
+                                .filter(|x| matches!(x, GDTToken::Char(_)))
+                                .cloned()
+                                .collect_vec();
+
+                            char_tokens.iter().for_each(|x| _ = self.tokens.remove(x));
 
                             tokens.iter().for_each(|x| match x {
                                 GDTToken::Char(x) => {
@@ -796,11 +876,32 @@ pub mod token {
                     self.max_vocab_size = Some(max_vocab_size);
                     self
                 }
+                pub fn add_word_token_literal(mut self, token_literal: &str) -> Self {
+                    let token = GDTToken::Word(token_literal.to_string());
+                    self.manual_tokens.insert(token, 0);
+                    self
+                }
+                fn push_token(&mut self, token: GDTToken) {
+                    self.tokens
+                        .entry(token)
+                        .and_modify(|x| *x += 1)
+                        .or_insert(1);
+                }
                 pub fn build(self) -> Result<Vocab> {
                     let control_token: Token = self.control_token.into();
-                    let mut vocab = vec![control_token.with_id(0)];
+                    let capacity = self.max_vocab_size.unwrap_or(self.tokens.len());
+                    let mut vocab = {
+                        let mut init_vocab = Vec::with_capacity(capacity);
+                        init_vocab.push(control_token.with_id(init_vocab.len()));
+                        for (token, _) in self.manual_tokens {
+                            let value: Token = token.into();
+                            init_vocab.push(value.with_id(init_vocab.len()));
+                        }
+                        init_vocab
+                    };
+
                     let vocab_size = self.max_vocab_size.map_or(self.tokens.len(), |x| {
-                        x - self.fallback.as_ref().map_or(0, |x| x.len())
+                        x - self.fallback.as_ref().map_or(0, |x| x.len()) - vocab.len()
                     });
                     let offset = vocab.len();
                     for (i, (token, _)) in self
@@ -1100,6 +1201,36 @@ impl GenerativeDecoderTransformer {
         Ok(-log_logits)
     }
 
+    pub fn nll_each(&self, context_tokens: &[token::Token]) -> Result<Vec<NodeValue>> {
+        let expected_encoded_tokens = context_tokens
+            .iter()
+            .skip(1)
+            .map(|token| self.vocab.token_encode(&token))
+            .collect::<Result<Vec<_>>>()?;
+
+        let network_input = self.encode_input_sequence(context_tokens)?;
+        let output = self.network.forward_inference(&network_input, None, None)?;
+
+        let probabilities = output
+            .rows_iter()
+            .take(network_input.len() - 1)
+            .map(|row| self.compute_probabilities_row(&row.into()))
+            .collect::<Result<Vec<_>>>()?;
+
+        let log_logits = probabilities
+            .iter()
+            .zip_eq(expected_encoded_tokens.iter())
+            .map(|(probabilities, expected_encoded_token)| {
+                -probabilities
+                    .get(*expected_encoded_token)
+                    .expect("output should have same count as vocab")
+                    .ln()
+            })
+            .collect::<Vec<_>>();
+
+        Ok(log_logits)
+    }
+
     pub fn encode_input_sequence(&self, input_sequence: &[token::Token]) -> Result<Vec<usize>> {
         let offset = input_sequence.len().saturating_sub(self.context_length);
         input_sequence
@@ -1271,6 +1402,55 @@ mod tests {
     use crate::ml::{gdt::token::Token, layer::LayerInitStrategy, transformer::solver};
 
     use super::{token::Vocab, *};
+
+    #[test]
+    fn transformer_work_build_word_vocab_strips_nonalphabetic() {
+        let corpus = "this is an example, we only want word tokens! that means no 'numbers' like: 1, 1234 or emoji 😢, but maybe ###chat";
+        let vocab = Vocab::new_builder(token::VocabTokenType::Word)
+            .from_corpus(&corpus)
+            .add_word_token_literal("###chat")
+            .with_char_fallback()
+            .build()
+            .unwrap();
+
+        assert!(vocab.dictionary().contains_key(&Token::word("example")));
+        assert!(vocab.dictionary().contains_key(&Token::word("tokens")));
+        assert!(!vocab.dictionary().contains_key(&Token::word("tokens!")));
+        assert!(!vocab.dictionary().contains_key(&Token::word("'numbers''")));
+        assert!(!vocab.dictionary().contains_key(&Token::word("1234")));
+
+        assert_eq!(vec![Token::word("this")], vocab.encode("this").unwrap());
+        assert_eq!(vec![Token::word("is")], vocab.encode("is").unwrap());
+        assert_eq!(vec![Token::word("an")], vocab.encode("an").unwrap());
+        assert_eq!(
+            vec![Token::word("example"), Token::char(',')],
+            vocab.encode("example,").unwrap()
+        );
+
+        assert_eq!(
+            vec![Token::word("tokens"), Token::char('!')],
+            vocab.encode("tokens!").unwrap()
+        );
+
+        assert_eq!(
+            vec![Token::char('\''), Token::word("numbers"), Token::char('\'')],
+            vocab.encode("'numbers'").unwrap()
+        );
+        assert_eq!(
+            vec![Token::word("like"), Token::char(':')],
+            vocab.encode("like:").unwrap()
+        );
+
+        assert_eq!(
+            vec![Token::char('2'), Token::char('3')],
+            vocab.encode("23").unwrap()
+        );
+        assert_eq!(vec![Token::char('😢')], vocab.encode("😢").unwrap());
+        assert_eq!(
+            vec![Token::word("###chat")],
+            vocab.encode("###chat").unwrap()
+        );
+    }
 
     #[ignore = "fix test"]
     #[test]
