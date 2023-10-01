@@ -22,7 +22,6 @@ use tracing::Level;
 use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
-    process::Command,
     sync::{Arc, Mutex},
 };
 
@@ -140,7 +139,7 @@ async fn keepalive_websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse 
 }
 
 async fn configure_logging() {
-    use tracing_subscriber::{filter::LevelFilter, prelude::*, Registry};
+    use tracing_subscriber::{prelude::*, Registry};
 
     let stdout_log = tracing_subscriber::fmt::layer()
         .compact()
@@ -152,6 +151,7 @@ async fn configure_logging() {
     let subscriber: Box<dyn tracing::Subscriber + Send + Sync + 'static> = {
         #[cfg(feature = "cloudwatch")]
         {
+            use tracing_subscriber::filter::LevelFilter;
             let sdk_config = aws_config::load_from_env().await;
             let client = aws_sdk_cloudwatchlogs::Client::new(&sdk_config);
             let log_group_name = "nllm-chat-web";
@@ -264,8 +264,9 @@ async fn ensure_log_stream(
     Ok(log_stream_name)
 }
 
+#[cfg(feature = "cloudwatch")]
 fn get_ec2_instance_id() -> Option<String> {
-    Command::new("ec2-metadata")
+    std::process::Command::new("ec2-metadata")
         .args(["-i"])
         .output()
         .ok()

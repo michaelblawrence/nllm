@@ -71,12 +71,6 @@ impl EmbedModel {
             None
         }
     }
-
-    pub fn invalidate_corpus_cache(&mut self) {
-        if let Self::S2S(_, S2STrainContext(_, _, train_corpus)) = self {
-            train_corpus.take();
-        }
-    }
 }
 
 impl MLModel for EmbedModel {

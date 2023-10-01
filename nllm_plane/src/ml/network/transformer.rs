@@ -141,26 +141,14 @@ pub mod decoder {
             // panic!();
 
             let mut encoder_output_grads = vec![];
-            for (i, (block, inputs)) in self
-                .blocks
-                .iter()
-                .zip(block_inputs.iter())
-                .enumerate()
-                .rev()
-            {
-                let (block_input_gradients, encoder_output_gradients) =
-                    super::linear::state_counter::GlobalCounter::with_context(
-                        (i + 1) * 10,
-                        || {
-                            block.backward_with_mask(
-                                inputs,
-                                encoder_output,
-                                mask,
-                                encoder_mask,
-                                &block_output_gradients,
-                            )
-                        },
-                    )?;
+            for (block, inputs) in self.blocks.iter().zip(block_inputs.iter()).rev() {
+                let (block_input_gradients, encoder_output_gradients) = block.backward_with_mask(
+                    inputs,
+                    encoder_output,
+                    mask,
+                    encoder_mask,
+                    &block_output_gradients,
+                )?;
                 block_output_gradients = block_input_gradients;
                 encoder_output_grads.push(encoder_output_gradients);
             }
@@ -1268,9 +1256,6 @@ pub mod blocks {
                 .backward(&ff_network_inputs, &d_ff_network_output)?;
 
             let d_ff_network_inputs = d_skip_ff_output.iter().add(ff_gradients.iter()).collect();
-            d_ff_network_inputs.show_heatmap_plot(
-                    "[d_ff_network_inputs]: network.backward(.., d_skip_ff_output) + d_skip_ff_output(=layer_norm.2.backward(.., output_gradients))",
-                );
 
             let (d_decoder_attention_inputs, d_encoder_output) = match encoder_output {
                 Some(encoder_output) => {
@@ -1314,10 +1299,6 @@ pub mod blocks {
                 .0
                 .backward(&skip_self_attention_output, &d_decoder_attention_inputs)?;
 
-            d_skip_self_attention_output.show_heatmap_plot(
-                    "[d_skip_self_attention_output]: layer_norm.0.backward(.., d_decoder_attention_inputs)",
-                );
-
             let d_self_attention_output = &d_skip_self_attention_output;
 
             let attention_gradients = self.masked_self_attention.backward_with_mask(
@@ -1325,10 +1306,6 @@ pub mod blocks {
                 mask,
                 &d_self_attention_output,
             )?;
-
-            attention_gradients.show_heatmap_plot(
-                "[attention_gradients]: masked_self_attention.backward_with_mask(.., d_self_attention_output)",
-            );
 
             let d_inputs = d_skip_self_attention_output
                 .iter()
@@ -2867,18 +2844,11 @@ pub mod attention {
                     .softmax(),
                 None => masked_attention_scores.softmax(),
             };
-            attention_weights
-                .show_heatmap_plot("[attention_weights]: softmax(masked_attention_scores)");
 
             // backward pass
             let dvalues = attention_weights.matrix_product_lhs_transposed(&output_gradients);
-            dvalues.show_heatmap_plot("[dvalues]: attention_weights.T * output_gradients");
             let dattention_weights = output_gradients.matrix_product_rhs_transposed(&values);
-            dattention_weights
-                .show_heatmap_plot("[dattention_weights]: output_gradients * values.T");
             let softmax_grads = softmax_d_iter(dattention_weights, attention_weights)?;
-            // softmax_grads
-            //     .show_heatmap_plot("[softmax_grads]: softmax_d_iter(dattention_weights, ..)");
             // let dmasked_attention_scores = dattention_weights.softmax_d(&attention_weights);
 
             let dmasked_attention_scores = match &input_mask {
@@ -2894,9 +2864,6 @@ pub mod attention {
             let dattention_scores = dscaled_attention_scores
                 .multiply_scalar(scale_factor)
                 .collect();
-            dattention_scores.show_heatmap_plot(
-                "[dattention_scores]: dscaled_attention_scores.set_mask(softmax_grads, ..) * scale_factor",
-            );
 
             // attention_scores = queries * keys.T
             // dattention_scores = dqueries * keys.T
@@ -2906,7 +2873,6 @@ pub mod attention {
             // dattention_scores = queries * dkeys.T
             // dkeys = dattention_scores.T * queries
             let dkeys = dattention_scores.matrix_product_lhs_transposed(&queries);
-            dkeys.show_heatmap_plot("[dkeys]: dattention_scores.T * queries");
 
             Ok((dkeys, dqueries, dvalues))
         }
@@ -3465,63 +3431,6 @@ pub mod linear {
         count: usize,
     }
 
-    pub(crate) mod state_counter {
-        use std::collections::HashMap;
-
-        pub struct GlobalCounter;
-
-        static mut STATE: Option<HashMap<String, (usize, usize)>> = None;
-        static mut RESET_PENDING: bool = false;
-        static mut CONTEXT_ID: usize = 0;
-
-        impl GlobalCounter {
-            pub fn decrement(key: &str, seed: usize) -> bool {
-                let (next_value, _) = unsafe {
-                    let s = STATE.get_or_insert_with(|| HashMap::new());
-                    if RESET_PENDING {
-                        Self::perform_reset(s);
-                    }
-
-                    let key = format!("{key}_{}", CONTEXT_ID);
-                    *s.entry(key)
-                        .and_modify(|(e, _)| *e = e.saturating_sub(1))
-                        .or_insert((seed, seed))
-                };
-                next_value != 0
-            }
-
-            pub fn with_context<F: FnMut() -> T, T>(ctx_id: usize, mut func: F) -> T {
-                unsafe {
-                    CONTEXT_ID += ctx_id;
-                }
-                let x = func();
-                unsafe {
-                    CONTEXT_ID = CONTEXT_ID.saturating_sub(ctx_id);
-                }
-
-                x
-            }
-
-            pub fn context_id() -> usize {
-                unsafe { CONTEXT_ID }
-            }
-
-            pub fn reset() {
-                unsafe {
-                    RESET_PENDING = true;
-                }
-            }
-
-            fn perform_reset(s: &mut HashMap<String, (usize, usize)>) {
-                s.values_mut()
-                    .for_each(|(x, initial)| *x = (*initial).max(1) + 1);
-                unsafe {
-                    RESET_PENDING = false;
-                }
-            }
-        }
-    }
-
     impl Linear {
         pub fn new(count: usize, stride: usize) -> Self {
             Self::with_value(count, stride, 0.0)
@@ -3721,62 +3630,6 @@ pub mod linear {
 
         pub fn is_finite(&self) -> bool {
             self.inner.iter().all(|x| x.is_finite())
-        }
-
-        pub fn show_all_heatmap_plots() {
-            state_counter::GlobalCounter::reset();
-        }
-
-        #[cfg(not(feature = "plot"))]
-        pub fn show_heatmap_plot(&self, title: &'static str) {}
-
-        #[cfg(feature = "plot")]
-        pub fn show_heatmap_plot(&self, title: &'static str) {
-            use plotly::{common::ColorScalePalette, layout::Axis, HeatMap, Plot};
-
-            if !state_counter::GlobalCounter::decrement(title, 0) {
-                return;
-            }
-
-            let rows = self
-                .rows_iter()
-                .map(|row| row.into_iter().copied().collect_vec())
-                .collect_vec();
-            let x_ticks = (0..self.stride).map(|x| x as f64).collect_vec();
-            let y_ticks = (0..self.count).map(|x| x as f64).collect_vec();
-
-            let mut plot = Plot::new();
-            let layout = plot.layout().clone();
-            let mut layout = layout
-                .x_axis(
-                    Axis::new()
-                        .tick_values(x_ticks)
-                        .title("col / stride".into()),
-                )
-                .y_axis(Axis::new().tick_values(y_ticks).title("row / count".into()))
-                .title(title.into())
-                .width(1000)
-                .height(800);
-
-            let context_id = state_counter::GlobalCounter::context_id();
-            if context_id > 0 {
-                layout.add_annotation(
-                    plotly::layout::Annotation::new().text(format!("CTX_{}", context_id)),
-                );
-            }
-
-            plot.set_layout(layout);
-            plot.add_trace(
-                HeatMap::new_z(rows)
-                    .name("block output")
-                    .x_axis("col / stride")
-                    .y_axis("row / count")
-                    .color_scale(ColorScalePalette::Blackbody.into())
-                    .auto_color_scale(false),
-            );
-
-            #[cfg(not(any(feature = "wasi", not(feature = "cli"))))]
-            plot.show();
         }
 
         pub fn to_values(self) -> Vec<LayerValues> {

@@ -111,7 +111,7 @@ impl BytePairEncoder {
     ) {
         let mut frequencies: HashMap<(&MaybeStr<'_>, &MaybeStr<'_>), usize> = HashMap::new();
 
-        for (i, chunk) in tokens.windows(2).enumerate() {
+        for chunk in tokens.windows(2) {
             let pair = (&chunk[0], &chunk[1]);
             *frequencies.entry(pair).or_insert(0) += 1;
         }
