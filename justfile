@@ -34,7 +34,7 @@ cargo-respond input_file:
     {{input_file}}
 
 cargo-flamegraph input_file:
-  sudo cargo flamegraph --no-default-features --features="single_threaded thread" --package embed -- \
+  sudo cargo flamegraph --no-default-features --features="single_threaded thread" --package embed --target embed -- \
     load {{input_file}} \
     --repl="pr"
 
@@ -54,19 +54,19 @@ serve-chat-model input_file:
   NLLM_MODEL_PATH={{input_file}} NLLM_TRIPLE_HASH_PROMPT=1 NLLM_INFER_TIMEOUT_MS=30000 \
    cargo watch -x "run --release --package nllm_chat_web"
 
-deploy-chat-model input_file alias="beta": (build-lambda) (deploy-s3 input_file) (deploy-lambda file_name(input_file) alias)
+deploy-chat-model input_file alias="beta" arch="arm64": (build-lambda arch) (deploy-s3 input_file) (deploy-lambda file_name(input_file) alias)
 
 deploy-s3 input_file:
   aws s3 cp {{input_file}} s3://$NLLM_MODEL_S3_BUCKET
 
-deploy-lambda model_s3_key alias="beta" version_tag="v4":
+deploy-lambda model_s3_key alias="beta" version_tag="v5":
   cargo lambda deploy --tags project=nllm_chat_infer,cversion={{version_tag}} \
     --env-var NLLM_MODEL_S3_BUCKET=$NLLM_MODEL_S3_BUCKET --env-var NLLM_MODEL_S3_KEY={{model_s3_key}} --env-var NLLM_TRIPLE_HASH_PROMPT=1 --env-var NLLM_TEMP=$NLLM_TEMP \
     --role $NLLM_LAMBDA_ARN --timeout $NLLM_LAMBDA_TIMEOUT --memory $NLLM_LAMBDA_MEMORY --enable-function-url --alias {{alias}} \
     nllm_chat_functions
 
-build-lambda:
-  cargo lambda build --release --arm64 --package nllm_chat_functions
+build-lambda arch="arm64":
+  RUSTFLAGS='-C target-feature=+neon' cargo lambda build --release --{{arch}} --package nllm_chat_functions
 
 docker-run run_script="run" script_args="": docker-build
   mkdir -p out/script-{{run_script}}
