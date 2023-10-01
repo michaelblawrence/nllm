@@ -44,7 +44,7 @@ export function Footer() {
                         <a href="https://github.com/michaelblawrence/nllm/blob/master/README.md" class="mr-4 hover:underline md:mr-6">About</a>
                     </li>
                     <li>
-                        <a href="https://github.com/michaelblawrence/nllm/blob/master/README.md" class="mr-4 hover:underline md:mr-6">Licensing</a>
+                        <a href="https://github.com/michaelblawrence/nllm/blob/master/LICENSE.txt" class="mr-4 hover:underline md:mr-6">Licensing</a>
                     </li>
                     <li>
                         <a href="https://michaelblawrence.github.io/CitySynthDemo/" class="mr-4 hover:underline md:mr-6">See More</a>
