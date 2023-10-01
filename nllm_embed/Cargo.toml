@@ -10,6 +10,7 @@ anyhow = { version = "1.0.69", features = ["backtrace"] }
 clap = { version = "4.1.13", features = ["derive"] }
 crossterm = { version = "0.26.1", optional = true }
 itertools = "0.10.5"
+rayon = { version = "1.7.0", optional = true }
 plotly = { version = "0.8.3", optional = true }
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = "1.0.93"
@@ -23,5 +24,5 @@ thread = ["plane/thread"]
 plot = ["plane/plot", "plotly"]
 wasi = ["plane/wasi"]
 single_threaded = ["plane/single_threaded"]
-multi_threaded = ["plane/multi_threaded", "thread", "cli"]
+multi_threaded = ["plane/multi_threaded", "thread", "cli", "rayon"]
 short_floats = ["plane/short_floats"]
