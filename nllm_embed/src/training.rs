@@ -23,6 +23,7 @@ use crate::{
     config::TrainEmbeddingConfig,
     messages::{
         TrainerHandle, TrainerHandleSender, TrainerMessage, TrainerReport, TrainerStateMetadata,
+        YieldState,
     },
     model::MLModel,
 };
@@ -88,7 +89,11 @@ impl<M: MLModel> TrainerState<M> {
         }
     }
 
-    fn train(&mut self, phrases: &Vec<Vec<String>>, batch_size: TrainBatchConfig) -> Option<NodeValue> {
+    fn train(
+        &mut self,
+        phrases: &Vec<Vec<String>>,
+        batch_size: TrainBatchConfig,
+    ) -> Option<NodeValue> {
         if self.training_paused() {
             return None;
         }
@@ -182,7 +187,9 @@ impl<M: MLModel> TrainerState<M> {
         if !self.training_paused() {
             self.round += 1;
         }
-        _ = self.handle_tx.send(TrainerMessage::Yield);
+        _ = self.handle_tx.send(TrainerMessage::Yield(YieldState {
+            round: self.round + 1,
+        }));
     }
 
     pub fn pause(&mut self) -> bool {
@@ -507,15 +514,19 @@ where
         let vocab_builder = gdt::token::Vocab::new_builder(token_type)
             .with_max_vocab_size(config.gdt_bpe_vocab_size);
 
-        let vocab_builder =
-            phrases
-                .iter()
-                .chain(testing_phrases.iter())
-                .fold(vocab_builder, |builder, x| {
-                    let mut phrase = x.join(" ");
-                    phrase.push('\n');
-                    builder.from_corpus(&phrase)
+        let corpus = phrases.iter().chain(testing_phrases.iter()).fold(
+            String::with_capacity(1 >> 24),
+            |mut str, x| {
+                x.iter().for_each(|x| {
+                    str.push_str(&x);
+                    str.push(' ')
                 });
+                str.push('\n');
+                str
+            },
+        );
+
+        let vocab_builder = vocab_builder.from_corpus(&corpus);
 
         let gdt_vocab = vocab_builder.with_char_fallback().build().unwrap();
 

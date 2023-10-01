@@ -1,3 +1,5 @@
+use std::{io::BufReader, path::PathBuf, fs::File};
+
 use clap::{command, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
@@ -120,13 +122,22 @@ pub struct TrainEmbeddingConfig {
 #[derive(Args, Debug, Clone)]
 pub struct SerializedTrainEmbeddingConfig {
     #[arg(long, value_parser = parse_train_config_json)]
-    pub trainer_config: TrainEmbeddingConfig
+    pub trainer_config: TrainEmbeddingConfig,
+
+    #[command(flatten)]
+    pub resume_command: ResumeEmbeddingConfig,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct LoadEmbeddingConfig {
     pub file_path: String,
 
+    #[command(flatten)]
+    pub config: ResumeEmbeddingConfig,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ResumeEmbeddingConfig {
     #[arg(short = 'h', long, default_value = None)]
     pub hidden_layer_nodes: Option<usize>,
 
@@ -207,11 +218,9 @@ impl Into<NetworkActivationMode> for LayerActivationConfig {
     }
 }
 
-
 fn default_autosave_interval_mins() -> u64 {
     15
 }
-
 
 fn parse_range<T>(
     s: &str,
@@ -240,8 +249,17 @@ where
 
 fn parse_train_config_json(
     s: &str,
-) -> Result<TrainEmbeddingConfig, Box<dyn std::error::Error + Send + Sync + 'static>>
-{
-    let config: TrainEmbeddingConfig = serde_json::from_str(s)?;
+) -> Result<TrainEmbeddingConfig, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let config: TrainEmbeddingConfig = if let Some(path) = s
+        .parse::<PathBuf>()
+        .ok()
+        .filter(|x| x.is_file() && x.exists())
+    {
+        let f = File::open(path)?;
+        let reader = BufReader::new(f);
+        serde_json::from_reader(reader)?
+    } else {
+        serde_json::from_str(s)?
+    };
     Ok(config)
 }

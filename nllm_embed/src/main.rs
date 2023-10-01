@@ -1,10 +1,15 @@
-use std::{io::Write, ops::ControlFlow, thread};
+use std::{
+    io::Write,
+    ops::ControlFlow,
+    sync::{Arc, RwLock},
+    thread,
+};
 
 use anyhow::Result;
 use tracing::metadata::LevelFilter;
 
 use config::TrainEmbeddingConfig;
-use messages::{TrainerHandleSender, TrainerMessage};
+use messages::{TrainerHandleSender, TrainerMessage, YieldState};
 use model::EmbedModel;
 
 mod bounded;
@@ -62,14 +67,24 @@ fn main() -> Result<()> {
 
 #[cfg(feature = "thread")]
 fn main() -> Result<()> {
+    use crate::messages::TrainerHandleActions;
+
     configure_logging();
     let (config, resumed_state) = parse_cli_args()?;
+    let latest_state = Arc::new(RwLock::new(None));
     parse_wait_for_input_repl(&config);
 
+    let latest_state_clone = latest_state.clone();
     let config_clone = config.clone();
     let (tx, handle) =
         messages::TrainerHandle::new(move |model: &EmbedModel, msg: TrainerMessage| {
-            let handle_action = msg.apply(model, &config_clone);
+            let handle_action = match msg {
+                TrainerMessage::Yield(state) => {
+                    latest_state_clone.write().unwrap().replace(state);
+                    return TrainerHandleActions::Nothing;
+                }
+                msg => msg.apply(model, &config_clone),
+            };
             handle_action
         });
 
@@ -82,12 +97,14 @@ fn main() -> Result<()> {
         tx.send(TrainerMessage::ReplaceEmbeddingState(snapshot, state))?;
     }
 
+    let latest_state_clone = latest_state.clone();
     let config_clone = config.clone();
     let ui_thread = thread::spawn(move || {
         if let Some(repl) = config.repl {
             for c in repl.chars() {
-                let control_flow = parse_repl_char(c, &tx, &config_clone)
-                    .expect("config repl character caused startup to halt");
+                let control_flow =
+                    parse_repl_char(c, &tx, &config_clone, YieldStateAccessor::default())
+                        .expect("config repl character caused startup to halt");
 
                 if let ControlFlow::Break(()) = control_flow {
                     return;
@@ -96,7 +113,11 @@ fn main() -> Result<()> {
         }
 
         let tx1 = tx.clone();
-        block_on_key_press(move |c| parse_repl_char(c, &tx, &config_clone), &tx1);
+        let latest_state_ref = &latest_state_clone;
+        block_on_key_press(
+            move |c| parse_repl_char(c, &tx, &config_clone, latest_state_ref.into()),
+            &tx1,
+        );
     });
 
     thread.join().unwrap();
@@ -109,6 +130,7 @@ fn parse_repl_char(
     c: char,
     tx: &TrainerHandleSender<TrainerMessage>,
     config: &TrainEmbeddingConfig,
+    latest_state: YieldStateAccessor,
 ) -> Result<ControlFlow<()>> {
     match c {
         'r' => tx.send(TrainerMessage::PrintStatus)?,
@@ -140,6 +162,11 @@ fn parse_repl_char(
         'q' => {
             tx.send(TrainerMessage::Halt)?;
             return Ok(ControlFlow::Break(()));
+        }
+        '?' => {
+            if let Some(latest_state) = latest_state.read() {
+                println!(r"Trainer state: Round {}", latest_state.round);
+            }
         }
         'h' => {
             println!(
@@ -274,6 +301,23 @@ fn prompt<F: Fn(String) -> TrainerMessage>(
     }
 }
 
+#[derive(Default)]
+struct YieldStateAccessor(Option<Arc<RwLock<Option<YieldState>>>>);
+
+impl From<&Arc<RwLock<Option<YieldState>>>> for YieldStateAccessor {
+    fn from(value: &Arc<RwLock<Option<YieldState>>>) -> Self {
+        Self(Some(value.clone()))
+    }
+}
+
+impl YieldStateAccessor {
+    fn read(&self) -> Option<YieldState> {
+        self.0
+            .as_ref()
+            .and_then(|x| x.read().ok().and_then(|x| x.clone()))
+    }
+}
+
 fn configure_logging() {
     let subscriber = tracing_subscriber::fmt()
         .compact()
@@ -304,7 +348,10 @@ fn parse_cli_args() -> Result<(
 
     let (mut config, resumed_state) = match cli.command() {
         config::Command::TrainEmbedding(config) => (config, None),
-        config::Command::JsonTrainEmbedding(config) => (config.trainer_config, None),
+        config::Command::JsonTrainEmbedding(config) => (
+            load_resume_config(config.trainer_config, config.resume_command),
+            None,
+        ),
         config::Command::LoadEmbedding(config) => load_embedding(config)?,
     };
 
@@ -337,34 +384,46 @@ fn load_embedding(
     Option<(String, messages::TrainerStateMetadata)>,
 )> {
     let file_path = &load_config.file_path;
-    let (snapshot, mut config, state) = training::writer::read_model_from_disk(file_path)?;
+    let (snapshot, config, state) = training::writer::read_model_from_disk(file_path)?;
+    let load_config = load_config.config;
 
+    Ok((
+        load_resume_config(config, load_config),
+        Some((snapshot, state)),
+    ))
+}
+
+fn load_resume_config(
+    mut config: TrainEmbeddingConfig,
+    resume_config: config::ResumeEmbeddingConfig,
+) -> TrainEmbeddingConfig {
     config.pause_on_start = true;
-    config.repl = load_config.repl; // always overwrite repl
+    config.repl = resume_config.repl;
+    // always overwrite repl
 
-    if let Some(hidden_layer_nodes) = load_config.hidden_layer_nodes {
+    if let Some(hidden_layer_nodes) = resume_config.hidden_layer_nodes {
         config.hidden_layer_nodes = hidden_layer_nodes;
     }
-    if let Some(hidden_deep_layer_nodes) = load_config.hidden_deep_layer_nodes {
+    if let Some(hidden_deep_layer_nodes) = resume_config.hidden_deep_layer_nodes {
         config.hidden_deep_layer_nodes = Some(hidden_deep_layer_nodes);
     }
-    if let Some(input_stride_width) = load_config.input_stride_width {
+    if let Some(input_stride_width) = resume_config.input_stride_width {
         config.input_stride_width = input_stride_width;
     }
-    if let Some(batch_size) = load_config.batch_size {
+    if let Some(batch_size) = resume_config.batch_size {
         config.batch_size = batch_size;
     }
-    if let Some(input_txt_path) = load_config.input_txt_path {
+    if let Some(input_txt_path) = resume_config.input_txt_path {
         config.input_txt_path = Some(input_txt_path);
     }
-    if let Some(phrase_test_set_max_tokens) = load_config.phrase_test_set_max_tokens {
+    if let Some(phrase_test_set_max_tokens) = resume_config.phrase_test_set_max_tokens {
         config.phrase_test_set_max_tokens = Some(phrase_test_set_max_tokens);
     }
-    if load_config.disable_sample_from_pattern {
+    if resume_config.disable_sample_from_pattern {
         config.sample_from_pattern = None;
     }
-    if load_config.force_continue {
+    if resume_config.force_continue {
         config.quit_on_complete = false;
     }
-    Ok((config, Some((snapshot, state))))
+    config
 }
