@@ -1314,6 +1314,7 @@ dependencies = [
  "parquet",
  "plane",
  "plotly",
+ "rayon",
  "serde",
  "serde_json",
  "tracing",
