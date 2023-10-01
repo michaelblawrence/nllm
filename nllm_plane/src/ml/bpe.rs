@@ -1,7 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use itertools::Itertools;
-use tracing::error;
+use tracing::{error, info};
+
+type MaybeStr<'a> = Cow<'a, str>;
 
 pub struct BytePairEncoder;
 
@@ -23,11 +28,12 @@ impl BytePairEncoder {
         let source_vocab: HashSet<_> = tokens.iter().collect();
 
         let encoded_tokens = {
-            let mut encoded_tokens: Vec<String> = tokens.clone();
+            let mut encoded_tokens: Vec<MaybeStr<'_>> = tokens.clone();
 
-            for _ in 0..iters {
-                let mut frequencies =
-                    Self::build_byte_pair_frequencies(&encoded_tokens, max_token_length);
+            for i in 0..iters {
+                info!("Building BPE: iter {i}/{iters}");
+                let vec = encoded_tokens.clone();
+                let mut frequencies = Self::build_byte_pair_frequencies(&vec, max_token_length);
                 Self::merge_byte_pairs(&mut encoded_tokens, &mut frequencies.1, num_merges);
             }
 
@@ -40,6 +46,7 @@ impl BytePairEncoder {
         let vocab: HashSet<_> = encoded_tokens
             .into_iter()
             .chain(source_vocab.into_iter().cloned())
+            .map(|x| x.into_owned())
             .collect();
 
         vocab
@@ -85,19 +92,30 @@ impl BytePairEncoder {
         encoded_tokens
     }
 
-    fn tokenize(text: &str) -> Vec<String> {
-        text.chars().map(|c| c.to_string()).collect()
+    fn tokenize<'a>(text: &'a str) -> Vec<Cow<'a, str>> {
+        let slices = text
+            .char_indices()
+            .tuple_windows()
+            .map(|((x0, _), (y0, _))| Cow::from(&text[x0..y0]))
+            .collect();
+        info!("Consumed {} corpus bytes", text.len());
+        slices
     }
 
-    fn build_byte_pair_frequencies(
-        tokens: &[String],
+    fn build_byte_pair_frequencies<'a>(
+        tokens: &'a [MaybeStr<'a>],
         max_token_length: usize,
-    ) -> (HashMap<(String, String), usize>, Vec<(String, String)>) {
-        let mut frequencies: HashMap<(String, String), usize> = HashMap::new();
-        for chunk in tokens.windows(2) {
-            let pair = (chunk[0].to_string(), chunk[1].to_string());
+    ) -> (
+        HashMap<(MaybeStr<'a>, MaybeStr<'a>), usize>,
+        Vec<(MaybeStr<'a>, MaybeStr<'a>)>,
+    ) {
+        let mut frequencies: HashMap<(&MaybeStr<'_>, &MaybeStr<'_>), usize> = HashMap::new();
+
+        for (i, chunk) in tokens.windows(2).enumerate() {
+            let pair = (&chunk[0], &chunk[1]);
             *frequencies.entry(pair).or_insert(0) += 1;
         }
+        info!("Counted BPE token frequencies: N = {}", tokens.len());
 
         let sorted_pairing_counts = {
             let mut pairings = frequencies
@@ -118,31 +136,49 @@ impl BytePairEncoder {
 
         let sorted_pairings = sorted_pairing_counts
             .into_iter()
-            .map(|(pair, _)| pair)
-            .cloned()
+            .map(|(&(lhs, rhs), _)| (lhs.clone(), rhs.clone()))
             .collect_vec();
+
+        let frequencies = frequencies
+            .into_iter()
+            .map(|((lhs, rhs), x)| ((lhs.clone(), rhs.clone()), x))
+            .collect();
+
+        info!(
+            "Sorted BPE token pair frequencies: N(pairs) = {}",
+            sorted_pairings.len()
+        );
 
         (frequencies, sorted_pairings)
     }
 
     fn merge_byte_pairs(
-        tokens: &mut Vec<String>,
-        sorted_pairs: &mut Vec<(String, String)>,
+        tokens: &mut [MaybeStr<'_>],
+        sorted_pairs: &mut Vec<(MaybeStr<'_>, MaybeStr<'_>)>,
         num_merges: usize,
     ) {
-        for _ in 0..num_merges {
+        for merge_idx in 0..num_merges {
             if let Some(pair) = &sorted_pairs.pop() {
-                let mut idx = vec![];
+                let mut idx = Vec::with_capacity(tokens.len());
                 for (i, chunk_pair) in tokens.windows(2).enumerate() {
-                    if chunk_pair[0] == pair.0 && chunk_pair[1] == pair.1 {
+                    if &*chunk_pair[0] == &pair.0 && &*chunk_pair[1] == &pair.1 {
                         idx.push(i);
                     }
                 }
+                info!(
+                    "Matched BPE token pairs: N = {} (iter: {merge_idx}/{num_merges})",
+                    tokens.len()
+                );
 
                 let replacement = format!("{}{}", pair.0, pair.1);
-                for &i in idx.iter() {
-                    tokens[i] = replacement.clone();
-                    tokens[i + 1] = String::new();
+                if let [i] = idx[..] {
+                    tokens[i] = Cow::from(replacement);
+                    tokens[i + 1] = Cow::from("");
+                } else {
+                    for &i in idx.iter() {
+                        tokens[i] = Cow::from(replacement.clone());
+                        tokens[i + 1] = Cow::from("");
+                    }
                 }
             } else {
                 break;
