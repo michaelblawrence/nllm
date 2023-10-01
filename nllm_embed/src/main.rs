@@ -154,6 +154,7 @@ fn parse_repl_char(
             Ok(n) => TrainerMessage::UnpauseForIterations(n),
             Err(_) => TrainerMessage::NoOp,
         }))?,
+        'N' => tx.send(TrainerMessage::ToggleDetailedNLL)?,
         'p' => tx.send(TrainerMessage::TogglePause)?,
         'c' => tx.send(TrainerMessage::PrintConfig)?,
         'l' => tx.send(prompt("output_label", |x| {

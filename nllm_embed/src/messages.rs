@@ -30,6 +30,7 @@ pub enum TrainerMessage {
     MultiplyLearnRateBy(NodeValue),
     IncreaseMaxRounds(usize),
     PredictRandomPhrase,
+    ToggleDetailedNLL,
     TogglePause,
     Halt,
     ReplaceEmbeddingState(String, TrainerStateMetadata),
@@ -66,6 +67,7 @@ impl TrainerMessage {
             TrainerMessage::TogglePrintAllStatus => TrainerHandleActions::TogglePrintAllStatus,
             TrainerMessage::ReloadFromSnapshot => TrainerHandleActions::ReloadFromSnapshot,
             TrainerMessage::ForceSnapshot => TrainerHandleActions::ForceSnapshot,
+            TrainerMessage::ToggleDetailedNLL => TrainerHandleActions::ToggleDetailedNLL,
             TrainerMessage::PrintEachRoundNumber => TrainerHandleActions::PrintEachRoundNumber,
             TrainerMessage::SuppressAutoPrintStatus => {
                 TrainerHandleActions::SuppressAutoPrintStatus
@@ -182,6 +184,7 @@ pub enum TrainerHandleActions {
     ReplaceEmbeddingState(String, TrainerStateMetadata),
     SuppressAutoPrintStatus,
     PrintEachRoundNumber,
+    ToggleDetailedNLL,
     UnpauseForIterations(usize),
 }
 
@@ -271,6 +274,15 @@ impl TrainerHandleActions {
             }
             TrainerHandleActions::PrintEachRoundNumber => {
                 state.print_round_number = !state.print_round_number
+            }
+            TrainerHandleActions::ToggleDetailedNLL => {
+                if state.use_detailed_nll() {
+                    state.enable_detailed_nll(false);
+                    info!("Disabled detailed NLL calculations, will take effect next round report...");
+                } else {
+                    state.enable_detailed_nll(true);
+                    info!("Enabled detailed NLL calculations, will take effect next round report...");
+                }
             }
             TrainerHandleActions::Halt => {
                 if state.batches_trained_since_process_started() > 0 {

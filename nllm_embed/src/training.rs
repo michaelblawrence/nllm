@@ -16,7 +16,7 @@ use plane::ml::{
 use anyhow::Result;
 use itertools::Itertools;
 use serde_json::Value;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     bounded::BoundedValueLogger,
@@ -46,6 +46,7 @@ pub struct TrainerState<M> {
     training_loss_logger: BoundedValueLogger<(usize, NodeValue)>,
     rounds_until_pause_enabled: usize,
     halt: bool,
+    use_detailed_nll: bool,
     force_report_test_set: bool,
     force_report_train_set: bool,
     round_reported: bool,
@@ -75,6 +76,7 @@ impl<M: MLModel> TrainerState<M> {
             round_reported: false,
             print_round_number: false,
             supress_auto_report: false,
+            use_detailed_nll: false,
             force_report_test_set: false,
             force_report_train_set: false,
             force_report_all: false,
@@ -280,6 +282,10 @@ impl<M: MLModel> TrainerState<M> {
         self.inital_config.input_stride_width
     }
 
+    pub fn sample_from_pattern(&self) -> Option<&str> {
+        self.sample_from_pattern.as_deref()
+    }
+
     pub fn batch_size(&self) -> TrainBatchConfig {
         if self.inital_config.single_batch_iterations {
             TrainBatchConfig::SingleBatch(self.inital_config.batch_size)
@@ -360,6 +366,14 @@ impl<M: MLModel> TrainerState<M> {
     pub fn set_learn_rate(&mut self, learn_rate: NodeValue) {
         self.model.set_learn_rate(learn_rate);
         self.learn_rate = learn_rate;
+    }
+
+    pub fn use_detailed_nll(&self) -> bool {
+        self.use_detailed_nll
+    }
+
+    pub fn enable_detailed_nll(&mut self, enable: bool) {
+        self.use_detailed_nll = enable;
     }
 }
 
@@ -514,6 +528,14 @@ where
         let vocab_builder = gdt::token::Vocab::new_builder(token_type)
             .with_max_vocab_size(config.gdt_bpe_vocab_size);
 
+        let vocab_builder = match config.sample_from_pattern.as_deref() {
+            Some("###human") | Some("###human:") => vocab_builder
+                .add_word_token_literal("###human:")
+                .add_word_token_literal("###ctx__:")
+                .add_word_token_literal("###chat_:"),
+            _ => vocab_builder,
+        };
+
         let corpus = phrases.iter().chain(testing_phrases.iter()).fold(
             String::with_capacity(1 >> 24),
             |mut str, x| {
@@ -527,8 +549,16 @@ where
         );
 
         let vocab_builder = vocab_builder.from_corpus(&corpus);
+        let vocab_builder = vocab_builder.with_char_fallback();
+        let gdt_vocab = vocab_builder.build().unwrap();
 
-        let gdt_vocab = vocab_builder.with_char_fallback().build().unwrap();
+        if config.gdt_bpe_vocab_size.is_power_of_two() && !gdt_vocab.len().is_power_of_two() {
+            warn!(
+                "Potential vocab size misalignment: [actual]/[requested] vocab size: {}/{}",
+                gdt_vocab.len(),
+                config.gdt_bpe_vocab_size
+            );
+        }
 
         (None, None, Some(gdt_vocab))
     } else {
@@ -540,7 +570,11 @@ where
     let token_count = |x: &Vec<Vec<String>>| x.iter().map(|phrase| phrase.len()).sum::<usize>();
     let char_token_len = char_vocab.as_ref().map(|x| x.len());
     let str_token_len = str_vocab.as_ref().map(|x| x.len());
-    let token_len = char_token_len.or(str_token_len).unwrap_or_default();
+    let gdt_token_len = gdt_vocab.as_ref().map(|x| x.len());
+    let token_len = char_token_len
+        .or(str_token_len)
+        .or(gdt_token_len)
+        .unwrap_or_default();
     info!(
         "Completed token initialisation: (vocab size = {} tokens)",
         token_len
@@ -669,7 +703,12 @@ fn report_round<M: MLModel>(
     } else if let Some(gdt) = state.model.as_gdt() {
         let char_mode = gdt.vocab().token_type().is_char();
         let testing_phrases = TrainerState::<M>::join_phrases(&testing_phrases, Some(char_mode)); // TODO: remove from hot path
-        validate::validate_gdt(gdt, &testing_phrases)
+        validate::validate_gdt(
+            gdt,
+            &testing_phrases,
+            state.sample_from_pattern(),
+            state.use_detailed_nll(),
+        )
     } else {
         panic!("unknown model type: unable to run validation")
     };
@@ -856,7 +895,7 @@ pub fn split_training_and_testing(
     phrases: &mut Vec<Vec<String>>,
     test_phrases_pct: f64,
     test_set_max_tokens: Option<usize>,
-    _sample_from_pattern: Option<&str>, // TODO: use for sampling test phrases
+    sample_from_pattern: Option<&str>,
 ) -> Vec<Vec<String>> {
     let testing_sample_count = {
         let testing_ratio = test_phrases_pct as NodeValue / 100.0;
@@ -879,8 +918,17 @@ pub fn split_training_and_testing(
         }
         None => testing_sample_count,
     };
-    let offset = phrases.len() - testing_sample_count;
-    let testing_phrases = phrases.split_off(offset.clamp(0, phrases.len() - 1));
+    let offset = (phrases.len() - testing_sample_count).clamp(0, phrases.len() - 1);
+    let testing_phrases = match sample_from_pattern.and_then(|prefix| {
+        phrases[..offset]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, x)| x.join(" ").starts_with(prefix))
+    }) {
+        Some((offset, _)) => phrases.split_off(offset),
+        None => phrases.split_off(offset),
+    };
     testing_phrases
 }
 
@@ -891,8 +939,10 @@ mod validate {
     use tracing::{error, info};
 
     use plane::ml::{
-        embeddings::Embedding, gdt::GenerativeDecoderTransformer,
-        seq2seq::transformer::CharacterTransformer, NodeValue,
+        embeddings::Embedding,
+        gdt::{token::Token, GenerativeDecoderTransformer},
+        seq2seq::transformer::CharacterTransformer,
+        LayerValues, NodeValue,
     };
 
     use crate::messages::TrainerReport;
@@ -1049,37 +1099,64 @@ mod validate {
     pub fn validate_gdt(
         transformer: &GenerativeDecoderTransformer,
         testing_phrases: &str,
+        sample_from_pattern: Option<&str>,
+        use_detailed_nll: bool,
     ) -> Result<TestSetValidation> {
-        let mut validation_errors = vec![];
-        let mut correct_first_word_predictions = 0;
-        let mut total_first_word_predictions = 0;
         let testing_tokens = transformer.vocab().encode(testing_phrases)?;
-
         let input_stride_width = transformer.input_stride_width();
-        for testing_phrase_window in testing_tokens.chunks(input_stride_width + 1).into_iter() {
-            let (last_token, context_tokens) = testing_phrase_window.split_last().unwrap();
+        let sample_from_token = sample_from_pattern
+            .filter(|x| x.starts_with("###human"))
+            .map(|_| Token::word("###human:"));
 
-            let predicted = match transformer.predict_arg_max(&context_tokens) {
-                Ok((predicted, _prob)) => predicted,
-                Err(e) => {
-                    error!("failed prediction: {e}");
-                    continue;
-                }
-            };
-            let actual = last_token;
+        let testing_slices: Vec<&[Token]> =
+            chunk_by_inclusive(&testing_tokens, sample_from_token, input_stride_width + 1)
+                .collect();
 
-            if &predicted == actual {
-                correct_first_word_predictions += 1;
+        #[cfg(feature = "multi_threaded")]
+        use rayon::prelude::*;
+
+        let testing_slices = {
+            #[cfg(feature = "multi_threaded")]
+            {
+                testing_slices.par_iter()
             }
+            #[cfg(not(feature = "multi_threaded"))]
+            {
+                testing_slices.iter()
+            }
+        };
+        let validation_results = testing_slices
+            .map(|testing_phrase_window| {
+                let (last_token, context_tokens) = testing_phrase_window.split_last().unwrap();
 
-            let error = transformer.compute_error(&[context_tokens, &[actual.clone()]].concat())?;
-            let nll = transformer.nll(&context_tokens, actual.clone())?;
-            validation_errors.push((error, nll));
-            total_first_word_predictions += 1;
-        }
+                let predicted = match transformer.predict_arg_max(&context_tokens) {
+                    Ok((predicted, _prob)) => predicted,
+                    Err(e) => {
+                        error!("failed prediction: {e}");
+                        return Err(e);
+                    }
+                };
+                let is_correct_prediction = &predicted == last_token;
 
+                let error =
+                    transformer.compute_error(&[context_tokens, &[last_token.clone()]].concat())?;
+
+                let nll = if use_detailed_nll {
+                    let nll_each = transformer.nll_each(&testing_phrase_window)?;
+                    LayerValues::from(nll_each).ave()
+                } else {
+                    transformer.nll(&context_tokens, last_token.clone())?
+                };
+                Ok(((error, nll), is_correct_prediction))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let (validation_errors, predictions): (Vec<_>, Vec<_>) =
+            validation_results.into_iter().unzip();
+
+        let correct_first_word_predictions = predictions.iter().filter(|x| **x).count();
         let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
-            / total_first_word_predictions as NodeValue;
+            / validation_errors.len() as NodeValue;
 
         Ok(TestSetValidation {
             validation_errors,
@@ -1096,6 +1173,31 @@ mod validate {
             || (round_1based <= 100000 && round_1based % 10000 == 0)
             || (round_1based <= 1000000 && round_1based % 100000 == 0)
             || round_1based == training_rounds
+    }
+
+    fn chunk_by_inclusive<T: std::cmp::PartialEq>(
+        mut slice: &[T],
+        chunk_prefix_pattern: Option<T>,
+        max_chunk_size: usize,
+    ) -> impl Iterator<Item = &[T]> {
+        std::iter::from_fn(move || match slice.len() {
+            0 => None,
+            len => {
+                let pos = match chunk_prefix_pattern
+                    .as_ref()
+                    .and_then(|needle| slice.iter().skip(1).position(|x| x == needle))
+                {
+                    Some(pos) => (pos + 1).min(max_chunk_size),
+                    None => max_chunk_size,
+                };
+
+                let mid = pos.min(len);
+                let (first, second) = slice.split_at(mid);
+
+                slice = second;
+                Some(first)
+            }
+        })
     }
 }
 
