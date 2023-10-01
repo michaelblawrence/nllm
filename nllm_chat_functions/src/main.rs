@@ -20,7 +20,7 @@ async fn func(
     ctx: Arc<(
         respond::RespondModel,
         respond::ExtractedModelConfig,
-        respond::PromptChatMode
+        respond::PromptChatMode,
     )>,
 ) -> Result<Response<Body>, Error> {
     let prompt_txt = extract_prompt(event)?;
@@ -166,6 +166,7 @@ pub fn infer<'a>(
         Complete,
     }
     let mut state: Option<State> = None;
+    let mut token_count = 0;
     let mut response = respond::process_prompt(&model, &prompt, &config)?;
 
     Ok(std::iter::from_fn(move || match state.take() {
@@ -176,6 +177,7 @@ pub fn infer<'a>(
         Some(State::Infer(mut response_msg)) => {
             if let Some((token, separator)) = response.next() {
                 response_msg += &format!("{token}{separator}");
+                token_count += 1;
 
                 if inference_started.elapsed() > Duration::from_secs(15) {
                     info!("Timed out on prompt `{prompt}`");
@@ -194,7 +196,8 @@ pub fn infer<'a>(
             }
         }
         Some(State::Complete) => {
-            info!("Completed user prompt response");
+            let tpm = 60.0 * token_count as f64 / inference_started.elapsed().as_secs() as f64;
+            info!("Completed user prompt response: Token Count = {token_count} (tokens/min = {tpm:.1})");
             None
         }
     }))
