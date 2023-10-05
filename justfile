@@ -10,6 +10,9 @@ default:
 build:
   cargo build --features="multi_threaded" --release --package embed
 
+build-avx512:
+  RUSTFLAGS='-C target-feature=+avx512f,+avx512dq,+avx512cd,+avx512bw,+avx512vl' just build
+
 build-wasi:
   cargo +nightly wasi build --no-default-features --features="wasi" --release --package embed 
 
