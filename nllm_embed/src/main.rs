@@ -89,8 +89,9 @@ fn main() -> Result<()> {
         });
 
     let config_clone = config.clone();
+    let defer_init = resumed_state.is_some();
     let thread = thread::spawn(move || {
-        let _embedding = training::setup_and_train_model_v2(config_clone, handle);
+        training::setup_and_train_model_v2(config_clone, handle, defer_init);
     });
 
     if let Some((snapshot, state)) = resumed_state {

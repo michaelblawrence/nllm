@@ -1201,15 +1201,15 @@ impl GenerativeDecoderTransformer {
         Ok(-log_logits)
     }
 
-    pub fn nll_each(&self, context_tokens: &[token::Token]) -> Result<Vec<NodeValue>> {
-        let expected_encoded_tokens = context_tokens
-            .iter()
-            .skip(1)
-            .map(|token| self.vocab.token_encode(&token))
-            .collect::<Result<Vec<_>>>()?;
-
+    pub fn nll_each(&self, context_tokens: &[token::Token]) -> Result<Vec<(NodeValue, bool)>> {
         let network_input = self.encode_input_sequence(context_tokens)?;
         let output = self.network.forward_inference(&network_input, None, None)?;
+
+        let expected_encoded_tokens = context_tokens
+            .iter()
+            .skip(1 + context_tokens.len() - network_input.len())
+            .map(|token| self.vocab.token_encode(&token))
+            .collect::<Result<Vec<_>>>()?;
 
         let probabilities = output
             .rows_iter()
@@ -1220,11 +1220,15 @@ impl GenerativeDecoderTransformer {
         let log_logits = probabilities
             .iter()
             .zip_eq(expected_encoded_tokens.iter())
-            .map(|(probabilities, expected_encoded_token)| {
-                -probabilities
-                    .get(*expected_encoded_token)
-                    .expect("output should have same count as vocab")
-                    .ln()
+            .map(|(probabilities, &expected_encoded_token)| {
+                let target_prob = probabilities
+                    .get(expected_encoded_token)
+                    .expect("output should have same count as vocab");
+                let ranked_first = !probabilities
+                    .iter()
+                    .enumerate()
+                    .any(|(i, p)| p > target_prob && expected_encoded_token != i);
+                (-target_prob.ln(), ranked_first)
             })
             .collect::<Vec<_>>();
 
@@ -1347,11 +1351,11 @@ impl GenerativeDecoderTransformer {
     pub fn compute_error(&self, tokens: &[token::Token]) -> Result<NodeValue> {
         let mut errors: Vec<NodeValue> = vec![];
 
-        for sequence_segment in tokens.windows(self.context_length + 1) {
-            let input_sequence = &sequence_segment[0..self.context_length];
-            let probabilities = self.sample_probabilities(input_sequence)?;
+        for sequence_segment in tokens.windows((self.context_length + 1).min(tokens.len())) {
+            let (target, input_sequence) =
+                sequence_segment.split_last().context("expected tokens")?;
 
-            let target = &sequence_segment[self.context_length];
+            let probabilities = self.sample_probabilities(input_sequence)?;
             let target_token = self.vocab.token_encode(target)?;
             let expected_outputs = self.one_hot(target_token).collect();
 

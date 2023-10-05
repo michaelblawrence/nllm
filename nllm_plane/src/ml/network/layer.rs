@@ -272,7 +272,7 @@ impl LayerGradients {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayerValues(Vec<NodeValue>);
 
 impl<T> From<T> for LayerValues

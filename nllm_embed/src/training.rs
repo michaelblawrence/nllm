@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
+    io::{BufRead, BufReader},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -16,7 +17,7 @@ use plane::ml::{
 use anyhow::Result;
 use itertools::Itertools;
 use serde_json::Value;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     bounded::BoundedValueLogger,
@@ -435,8 +436,9 @@ impl<M> TrainerState<M> {
 pub fn setup_and_train_model_v2<M: MLModel>(
     config: TrainEmbeddingConfig,
     handle: TrainerHandle<TrainerMessage, M>,
+    defer_init: bool,
 ) -> M {
-    let (phrases, testing_phrases, mut state) = init_model_state(config, &handle);
+    let (phrases, testing_phrases, mut state) = init_model_state(config, &handle, defer_init);
     let batch_size = state.batch_size();
 
     loop {
@@ -481,6 +483,7 @@ pub fn setup_and_train_model_v2<M: MLModel>(
 fn init_model_state<M>(
     config: TrainEmbeddingConfig,
     handle: &TrainerHandle<TrainerMessage, M>,
+    defer_init: bool,
 ) -> (Vec<Vec<String>>, Vec<Vec<String>>, TrainerState<M>)
 where
     M: MLModel,
@@ -528,37 +531,41 @@ where
         let vocab_builder = gdt::token::Vocab::new_builder(token_type)
             .with_max_vocab_size(config.gdt_bpe_vocab_size);
 
-        let vocab_builder = match config.sample_from_pattern.as_deref() {
-            Some("###human") | Some("###human:") => vocab_builder
-                .add_word_token_literal("###human:")
-                .add_word_token_literal("###ctx__:")
-                .add_word_token_literal("###chat_:"),
-            _ => vocab_builder,
-        };
+        let gdt_vocab = if defer_init {
+            vocab_builder.build().unwrap()
+        } else {
+            let vocab_builder = match config.sample_from_pattern.as_deref() {
+                Some("###human") | Some("###human:") => vocab_builder
+                    .add_word_token_literal("###human:")
+                    .add_word_token_literal("###ctx__:")
+                    .add_word_token_literal("###chat_:"),
+                _ => vocab_builder,
+            };
 
-        let corpus = phrases.iter().chain(testing_phrases.iter()).fold(
-            String::with_capacity(1 >> 24),
-            |mut str, x| {
-                x.iter().for_each(|x| {
-                    str.push_str(&x);
-                    str.push(' ')
-                });
-                str.push('\n');
-                str
-            },
-        );
-
-        let vocab_builder = vocab_builder.from_corpus(&corpus);
-        let vocab_builder = vocab_builder.with_char_fallback();
-        let gdt_vocab = vocab_builder.build().unwrap();
-
-        if config.gdt_bpe_vocab_size.is_power_of_two() && !gdt_vocab.len().is_power_of_two() {
-            warn!(
-                "Potential vocab size misalignment: [actual]/[requested] vocab size: {}/{}",
-                gdt_vocab.len(),
-                config.gdt_bpe_vocab_size
+            let corpus = phrases.iter().chain(testing_phrases.iter()).fold(
+                String::with_capacity(1 >> 24),
+                |mut str, x| {
+                    x.iter().for_each(|x| {
+                        str.push_str(&x);
+                        str.push(' ')
+                    });
+                    str.push('\n');
+                    str
+                },
             );
-        }
+
+            let vocab_builder = vocab_builder.from_corpus(&corpus);
+            let vocab_builder = vocab_builder.with_char_fallback();
+            let vocab = vocab_builder.build().unwrap();
+            if config.gdt_bpe_vocab_size.is_power_of_two() && !vocab.len().is_power_of_two() {
+                warn!(
+                    "Potential vocab size misalignment: [actual]/[requested] vocab size: {}/{}",
+                    vocab.len(),
+                    config.gdt_bpe_vocab_size
+                );
+            }
+            vocab
+        };
 
         (None, None, Some(gdt_vocab))
     } else {
@@ -584,109 +591,133 @@ where
         token_count(&testing_phrases), testing_phrases.len()
     );
 
-    let model: M = if let (true, Some(vocab)) = (
+    let model_builder = if let (true, Some(_)) = (
         config.use_character_tokens && config.use_transformer && !config.use_gdt,
         &char_vocab,
     ) {
         info!("Using CharacterTransformer (S2S)...");
-        let builder = DecoderBuilder::new(
-            config.input_stride_width,
-            config.embedding_size,
-            vocab.len(),
-        );
-        let builder = builder
-            .with_dropout_rate(0.0)
-            .with_feed_forward_hidden_dimension(config.hidden_layer_nodes);
-
-        let hidden_deep_layer_nodes = config
-            .hidden_deep_layer_nodes
-            .as_ref()
-            .map(|x| x.split(',').collect_vec());
-
-        let builder = if let Some(block_count) = hidden_deep_layer_nodes
-            .as_ref()
-            .and_then(|x| x.get(0))
-            .and_then(|x| x.parse::<usize>().ok())
-        {
-            builder.with_block_count(block_count)
-        } else {
-            builder
-        };
-
-        let builder = if let Some(head_count) = hidden_deep_layer_nodes
-            .as_ref()
-            .and_then(|x| x.get(1))
-            .and_then(|x| x.parse::<usize>().ok())
-        {
-            builder.with_head_count(head_count)
-        } else {
-            builder
-        };
-
-        let s2s = CharacterTransformer::from_builder_ordered(builder, &vocab, rng).unwrap();
-        M::from_s2s(s2s, config.train_rate)
+        ModelBuilder::S2S(char_vocab.unwrap())
     } else if let (true, Some(vocab)) = (config.use_gdt, gdt_vocab) {
         info!("Using GenerativeDecoderTransformer (GDT)...");
-        let builder = DecoderBuilder::new(
-            config.input_stride_width,
-            config.embedding_size,
-            vocab.len(),
-        );
-        let builder = builder
-            // .with_rng(rng.clone()) // TODO: inject rng instance here?
-            .with_dropout_rate(0.0)
-            .with_feed_forward_hidden_dimension(config.hidden_layer_nodes);
-
-        let hidden_deep_layer_nodes = config
-            .hidden_deep_layer_nodes
-            .as_ref()
-            .map(|x| x.split(',').collect_vec());
-
-        let builder = if let Some(block_count) = hidden_deep_layer_nodes
-            .as_ref()
-            .and_then(|x| x.get(0))
-            .and_then(|x| x.parse::<usize>().ok())
-        {
-            builder.with_block_count(block_count)
-        } else {
-            builder
-        };
-
-        let builder = if let Some(head_count) = hidden_deep_layer_nodes
-            .as_ref()
-            .and_then(|x| x.get(1))
-            .and_then(|x| x.parse::<usize>().ok())
-        {
-            builder.with_head_count(head_count)
-        } else {
-            builder
-        };
-
-        let gdt = GenerativeDecoderTransformer::from_builder(builder, vocab, rng).unwrap();
-
-        M::from_gdt(gdt, config.train_rate, config.sample_from_pattern.clone())
+        ModelBuilder::Gdt(vocab)
     } else if let Some(vocab) =
         str_vocab.or(char_vocab.map(|x| x.into_iter().map(|c| c.to_string()).collect()))
     {
         info!("Using Embedding...");
-        let hidden_layer_shape = TrainerState::<()>::build_hidden_layer_shape(&config);
-
-        let embedding = Embedding::new_builder_ordered(&vocab)
-            .with_embedding_dimensions(config.embedding_size)
-            .with_hidden_layer_custom_shape(hidden_layer_shape)
-            .with_input_stride_width(config.input_stride_width)
-            .with_activation_mode(config.activation_mode.into())
-            .with_rng(rng)
-            .build()
-            .unwrap();
-
-        M::from_embedding(embedding, config.train_rate)
+        ModelBuilder::Embedding(vocab)
     } else {
         panic!("invalid config build state");
     };
+
+    let model = build_model(&config, model_builder, rng);
     let state = TrainerState::new(model, &config, &handle.tx);
 
     (phrases, testing_phrases, state)
+}
+
+enum ModelBuilder {
+    S2S(Vec<char>),
+    Gdt(gdt::token::Vocab),
+    Embedding(Vec<String>),
+}
+
+fn build_model<M>(config: &TrainEmbeddingConfig, model_builder: ModelBuilder, rng: RngStrategy) -> M
+where
+    M: MLModel,
+{
+    match model_builder {
+        ModelBuilder::S2S(vocab) => {
+            let builder = DecoderBuilder::new(
+                config.input_stride_width,
+                config.embedding_size,
+                vocab.len(),
+            );
+            let builder = builder
+                .with_dropout_rate(0.0)
+                .with_feed_forward_hidden_dimension(config.hidden_layer_nodes);
+
+            let hidden_deep_layer_nodes = config
+                .hidden_deep_layer_nodes
+                .as_ref()
+                .map(|x| x.split(',').collect_vec());
+
+            let builder = if let Some(block_count) = hidden_deep_layer_nodes
+                .as_ref()
+                .and_then(|x| x.get(0))
+                .and_then(|x| x.parse::<usize>().ok())
+            {
+                builder.with_block_count(block_count)
+            } else {
+                builder
+            };
+
+            let builder = if let Some(head_count) = hidden_deep_layer_nodes
+                .as_ref()
+                .and_then(|x| x.get(1))
+                .and_then(|x| x.parse::<usize>().ok())
+            {
+                builder.with_head_count(head_count)
+            } else {
+                builder
+            };
+
+            let s2s = CharacterTransformer::from_builder_ordered(builder, &vocab, rng).unwrap();
+            M::from_s2s(s2s, config.train_rate)
+        }
+        ModelBuilder::Gdt(vocab) => {
+            let builder = DecoderBuilder::new(
+                config.input_stride_width,
+                config.embedding_size,
+                vocab.len(),
+            );
+            let builder = builder
+                // .with_rng(rng.clone()) // TODO: inject rng instance here?
+                .with_dropout_rate(0.0)
+                .with_feed_forward_hidden_dimension(config.hidden_layer_nodes);
+
+            let hidden_deep_layer_nodes = config
+                .hidden_deep_layer_nodes
+                .as_ref()
+                .map(|x| x.split(',').collect_vec());
+
+            let builder = if let Some(block_count) = hidden_deep_layer_nodes
+                .as_ref()
+                .and_then(|x| x.get(0))
+                .and_then(|x| x.parse::<usize>().ok())
+            {
+                builder.with_block_count(block_count)
+            } else {
+                builder
+            };
+
+            let builder = if let Some(head_count) = hidden_deep_layer_nodes
+                .as_ref()
+                .and_then(|x| x.get(1))
+                .and_then(|x| x.parse::<usize>().ok())
+            {
+                builder.with_head_count(head_count)
+            } else {
+                builder
+            };
+
+            let gdt = GenerativeDecoderTransformer::from_builder(builder, vocab, rng).unwrap();
+            M::from_gdt(gdt, config.train_rate, config.sample_from_pattern.clone())
+        }
+        ModelBuilder::Embedding(vocab) => {
+            let hidden_layer_shape = TrainerState::<()>::build_hidden_layer_shape(config);
+
+            let embedding = Embedding::new_builder_ordered(&vocab)
+                .with_embedding_dimensions(config.embedding_size)
+                .with_hidden_layer_custom_shape(hidden_layer_shape)
+                .with_input_stride_width(config.input_stride_width)
+                .with_activation_mode(config.activation_mode.into())
+                .with_rng(rng)
+                .build()
+                .unwrap();
+
+            M::from_embedding(embedding, config.train_rate)
+        }
+    }
 }
 
 fn report_round<M: MLModel>(
@@ -783,22 +814,11 @@ pub fn init_phrases_and_vocab(
         phrases.truncate(phrase_train_set_size);
     }
 
-    debug!(
-        "First 3 phrases: {:#?}",
-        phrases
-            .iter()
-            .take(3)
-            .map(|phrase| (
-                phrase.join(" "),
-                phrase
-                    .iter()
-                    .map(|word| vocab_counts[word].pow(2))
-                    .join("|")
-            ))
-            .collect::<Vec<_>>()
-    );
-
-    let vocab = compute_vocab(&phrases, None);
+    let vocab = if !config.use_gdt {
+        compute_vocab(&phrases, None)
+    } else {
+        std::iter::empty().collect()
+    };
 
     if !config.phrase_disable_shuffle {
         plane::ml::ShuffleRng::shuffle_vec(&rng, &mut phrases);
@@ -873,16 +893,14 @@ pub fn parse_phrases(config: &TrainEmbeddingConfig) -> Vec<Vec<String>> {
 }
 
 pub fn read_plaintext_phrases(file_path: &str) -> Vec<Vec<String>> {
-    use std::io::Read;
+    let file = File::open(file_path).unwrap(); // TODO: error handling
+    let reader = BufReader::new(file);
 
-    let mut file = File::open(file_path).unwrap(); // TODO: error handling
-    let mut buffer = String::new();
-    file.read_to_string(&mut buffer).unwrap();
-
-    let phrases: Vec<Vec<String>> = buffer
+    let phrases: Vec<Vec<String>> = reader
         .lines()
         .map(|line| {
-            line.split_ascii_whitespace()
+            line.unwrap_or_default()
+                .split_ascii_whitespace()
                 .into_iter()
                 .map(|value| value.to_owned())
                 .collect()
@@ -1129,34 +1147,34 @@ mod validate {
             .map(|testing_phrase_window| {
                 let (last_token, context_tokens) = testing_phrase_window.split_last().unwrap();
 
-                let predicted = match transformer.predict_arg_max(&context_tokens) {
-                    Ok((predicted, _prob)) => predicted,
-                    Err(e) => {
-                        error!("failed prediction: {e}");
-                        return Err(e);
-                    }
-                };
-                let is_correct_prediction = &predicted == last_token;
-
                 let error =
                     transformer.compute_error(&[context_tokens, &[last_token.clone()]].concat())?;
 
-                let nll = if use_detailed_nll {
-                    let nll_each = transformer.nll_each(&testing_phrase_window)?;
-                    LayerValues::from(nll_each).ave()
+                let (nll, correct_predictions) = if use_detailed_nll {
+                    let (nll_each, correct_predictions): (Vec<_>, Vec<_>) = transformer
+                        .nll_each(&testing_phrase_window)?
+                        .into_iter()
+                        .unzip();
+                    (LayerValues::from(nll_each).ave(), correct_predictions)
                 } else {
-                    transformer.nll(&context_tokens, last_token.clone())?
+                    let (predicted, _) = transformer
+                        .predict_arg_max(&context_tokens)
+                        .context("failed prediction")?;
+                    let correct_predictions = vec![&predicted == last_token];
+                    let nll = transformer.nll(&context_tokens, last_token.clone())?;
+                    (nll, correct_predictions)
                 };
-                Ok(((error, nll), is_correct_prediction))
+                Ok(((error, nll), correct_predictions))
             })
             .collect::<Result<Vec<_>>>()?;
 
         let (validation_errors, predictions): (Vec<_>, Vec<_>) =
             validation_results.into_iter().unzip();
 
-        let correct_first_word_predictions = predictions.iter().filter(|x| **x).count();
-        let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
-            / validation_errors.len() as NodeValue;
+        let correct_first_word_predictions = predictions.iter().flatten().filter(|x| **x).count();
+        let total_first_word_predictions = predictions.iter().flatten().count();
+        let predictions_pct = 100.0 * correct_first_word_predictions as NodeValue
+            / total_first_word_predictions as NodeValue;
 
         Ok(TestSetValidation {
             validation_errors,
@@ -1205,7 +1223,7 @@ pub mod writer {
     use std::{
         collections::{HashMap, HashSet},
         fs::File,
-        io::{BufReader, Write},
+        io::{BufReader, BufWriter, Write},
         path::PathBuf,
     };
 
@@ -1296,7 +1314,6 @@ pub mod writer {
         snapshot["_trainer_config"] = serde_json::to_value(&config).unwrap();
         snapshot["_trainer_state"] = serde_json::to_value(&state).unwrap();
 
-        let snapshot_pretty = serde_json::to_string_pretty(&snapshot).unwrap();
         let fpath = path::create_output_fpath(
             ("model", output_ext),
             output_dir,
@@ -1304,11 +1321,9 @@ pub mod writer {
             Some(state),
             label,
         );
-
-        File::create(&fpath)
-            .unwrap()
-            .write_fmt(format_args!("{snapshot_pretty}"))
-            .unwrap();
+        let file = &mut File::create(&fpath).unwrap();
+        let writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(writer, &snapshot).unwrap();
 
         fpath
     }
