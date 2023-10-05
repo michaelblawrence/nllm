@@ -8,10 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use plane::ml::{
-    embeddings::builder::EmbeddingBuilder, gdt::GenerativeDecoderTransformer,
-    seq2seq::transformer::CharacterTransformer, NodeValue,
-};
+use plane::ml::{gdt::GenerativeDecoderTransformer, NodeValue};
 
 use crate::{model::MLModel, training};
 
@@ -22,8 +19,6 @@ pub enum TrainerMessage {
     TogglePrintAllStatus,
     ReloadFromSnapshot,
     ForceSnapshot,
-    WriteStatsToDisk,
-    WriteEmbeddingTsvToDisk,
     RenameOutputLabel(String),
     WriteModelToDisk,
     WriteModelAndMetadataToDisk(TrainerStateMetadata, TrainerModelCheckpointSource),
@@ -109,31 +104,8 @@ impl TrainerMessage {
                 }
                 TrainerHandleActions::Nothing
             }
-            TrainerMessage::WriteStatsToDisk => {
-                match model.as_embedding() {
-                    Some(embedding) => training::writer::write_results_to_disk(&embedding, "embed"),
-                    None => todo!("not yet implement for s2s"),
-                };
-                info!("Results written to disk");
-                TrainerHandleActions::Nothing
-            }
-            // TODO: dispatch back metadata for consistent output label handling
-            TrainerMessage::WriteEmbeddingTsvToDisk => {
-                match model.as_embedding() {
-                    Some(embedding) => training::writer::write_embedding_tsv_to_disk(
-                        &embedding,
-                        "embed",
-                        &config.output_dir,
-                        &config.output_label,
-                    ),
-                    None => todo!("not yet implement for s2s"),
-                };
-                info!("Embedding TSV written to disk");
-                TrainerHandleActions::Nothing
-            }
             TrainerMessage::PredictRandomPhrase => {
-                let sep = if config.use_character_tokens { "" } else { " " };
-                let generated_phrase = model.generate_sequence_string(sep);
+                let generated_phrase = model.generate_sequence_string();
                 match generated_phrase {
                     Ok(output) => info!("Generated a new phrase:  {}", output),
                     Err(e) => error!("Error generating a new phrase:  {}", e),
@@ -235,18 +207,12 @@ impl TrainerHandleActions {
                 }
             }
             TrainerHandleActions::ReloadFromSnapshot => {
-                let state_recovered = if let Some(snapshot) = &state.snapshot.0 {
+                let state_recovered: Result<()> = if let Some(snapshot) = &state.snapshot.0 {
                     info!("Recovering state from snapshot..");
-                    if let Some(_) = state.model.as_embedding() {
-                        match EmbeddingBuilder::from_snapshot(&snapshot).and_then(|x| x.build()) {
-                            Ok(model) => {
-                                state.model = M::from_embedding(model, state.learn_rate());
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        }
+                    if let Some(_) = state.model.as_gdt() {
+                        Err(anyhow!("can not reload gdt yet"))
                     } else {
-                        Err(anyhow!("can not reload s2s yet"))
+                        Err(anyhow!("can not reload all models yet"))
                     }
                 } else {
                     Err(anyhow!(
@@ -278,10 +244,14 @@ impl TrainerHandleActions {
             TrainerHandleActions::ToggleDetailedNLL => {
                 if state.use_detailed_nll() {
                     state.enable_detailed_nll(false);
-                    info!("Disabled detailed NLL calculations, will take effect next round report...");
+                    info!(
+                        "Disabled detailed NLL calculations, will take effect next round report..."
+                    );
                 } else {
                     state.enable_detailed_nll(true);
-                    info!("Enabled detailed NLL calculations, will take effect next round report...");
+                    info!(
+                        "Enabled detailed NLL calculations, will take effect next round report..."
+                    );
                 }
             }
             TrainerHandleActions::Halt => {
@@ -299,26 +269,7 @@ impl TrainerHandleActions {
                 state.set_output_label(output_label);
             }
             TrainerHandleActions::ReplaceEmbeddingState(snapshot, new_state) => {
-                let new_model = if let Some(embedding) = state.model.as_embedding() {
-                    let (new_embedding, build_ctx) = EmbeddingBuilder::from_snapshot(&snapshot)
-                        .unwrap()
-                        .with_hidden_layer_custom_shape(state.hidden_layer_shape())
-                        .with_input_stride_width(state.input_stride_width())
-                        .build_advanced()
-                        .unwrap();
-
-                    if build_ctx.rebuilt_network {
-                        let old_shape = embedding.shape().desc_pretty();
-                        let new_shape = new_embedding.shape().desc_pretty();
-                        info!("Built new hidden model from restored snapshot embedding data with shape = [{}] (previously [{}])",
-                        new_shape, old_shape
-                    );
-                    }
-                    M::from_embedding(new_embedding, new_state.learn_rate)
-                } else if let Some(_) = state.model.as_s2s() {
-                    let new_s2s = serde_json::from_str::<CharacterTransformer>(&snapshot).unwrap();
-                    M::from_s2s(new_s2s, new_state.learn_rate)
-                } else if let Some(_) = state.model.as_gdt() {
+                let new_model = if let Some(_) = state.model.as_gdt() {
                     let new_gdt =
                         serde_json::from_str::<GenerativeDecoderTransformer>(&snapshot).unwrap();
                     M::from_gdt(

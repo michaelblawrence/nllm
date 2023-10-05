@@ -7,9 +7,8 @@ use std::{
 };
 
 use plane::ml::{
-    embeddings::{Embedding, TrainBatchConfig},
+    embeddings::TrainBatchConfig,
     gdt::{self, GenerativeDecoderTransformer},
-    seq2seq::transformer::CharacterTransformer,
     transformer::decoder::builder::DecoderBuilder,
     NodeValue, RngStrategy, RNG,
 };
@@ -279,10 +278,6 @@ impl<M: MLModel> TrainerState<M> {
         }
     }
 
-    pub fn input_stride_width(&self) -> usize {
-        self.inital_config.input_stride_width
-    }
-
     pub fn sample_from_pattern(&self) -> Option<&str> {
         self.sample_from_pattern.as_deref()
     }
@@ -293,10 +288,6 @@ impl<M: MLModel> TrainerState<M> {
         } else {
             TrainBatchConfig::Batches(self.inital_config.batch_size)
         }
-    }
-
-    pub fn hidden_layer_shape(&self) -> Vec<usize> {
-        Self::build_hidden_layer_shape(&self.inital_config)
     }
 
     pub fn set_model(&mut self, model: M, metadata: TrainerStateMetadata) {
@@ -379,19 +370,6 @@ impl<M: MLModel> TrainerState<M> {
 }
 
 impl<M> TrainerState<M> {
-    pub fn build_hidden_layer_shape(config: &TrainEmbeddingConfig) -> Vec<usize> {
-        let layer_node_counts = [config.hidden_layer_nodes];
-        let layer_node_counts = layer_node_counts.into_iter().chain(
-            config
-                .hidden_deep_layer_nodes
-                .iter()
-                .flat_map(|csv| csv.split(','))
-                .filter_map(|x| x.trim().parse::<usize>().ok()),
-        );
-
-        layer_node_counts.collect()
-    }
-
     pub fn join_phrases(phrases: &Vec<Vec<String>>, char_tokens: Option<bool>) -> String {
         let char_tokens =
             char_tokens.unwrap_or_else(|| phrases.first().unwrap().iter().all(|x| x.len() <= 1));
@@ -591,20 +569,9 @@ where
         token_count(&testing_phrases), testing_phrases.len()
     );
 
-    let model_builder = if let (true, Some(_)) = (
-        config.use_character_tokens && config.use_transformer && !config.use_gdt,
-        &char_vocab,
-    ) {
-        info!("Using CharacterTransformer (S2S)...");
-        ModelBuilder::S2S(char_vocab.unwrap())
-    } else if let (true, Some(vocab)) = (config.use_gdt, gdt_vocab) {
+    let model_builder = if let (true, Some(vocab)) = (config.use_gdt, gdt_vocab) {
         info!("Using GenerativeDecoderTransformer (GDT)...");
         ModelBuilder::Gdt(vocab)
-    } else if let Some(vocab) =
-        str_vocab.or(char_vocab.map(|x| x.into_iter().map(|c| c.to_string()).collect()))
-    {
-        info!("Using Embedding...");
-        ModelBuilder::Embedding(vocab)
     } else {
         panic!("invalid config build state");
     };
@@ -616,9 +583,7 @@ where
 }
 
 enum ModelBuilder {
-    S2S(Vec<char>),
     Gdt(gdt::token::Vocab),
-    Embedding(Vec<String>),
 }
 
 fn build_model<M>(config: &TrainEmbeddingConfig, model_builder: ModelBuilder, rng: RngStrategy) -> M
@@ -626,44 +591,6 @@ where
     M: MLModel,
 {
     match model_builder {
-        ModelBuilder::S2S(vocab) => {
-            let builder = DecoderBuilder::new(
-                config.input_stride_width,
-                config.embedding_size,
-                vocab.len(),
-            );
-            let builder = builder
-                .with_dropout_rate(0.0)
-                .with_feed_forward_hidden_dimension(config.hidden_layer_nodes);
-
-            let hidden_deep_layer_nodes = config
-                .hidden_deep_layer_nodes
-                .as_ref()
-                .map(|x| x.split(',').collect_vec());
-
-            let builder = if let Some(block_count) = hidden_deep_layer_nodes
-                .as_ref()
-                .and_then(|x| x.get(0))
-                .and_then(|x| x.parse::<usize>().ok())
-            {
-                builder.with_block_count(block_count)
-            } else {
-                builder
-            };
-
-            let builder = if let Some(head_count) = hidden_deep_layer_nodes
-                .as_ref()
-                .and_then(|x| x.get(1))
-                .and_then(|x| x.parse::<usize>().ok())
-            {
-                builder.with_head_count(head_count)
-            } else {
-                builder
-            };
-
-            let s2s = CharacterTransformer::from_builder_ordered(builder, &vocab, rng).unwrap();
-            M::from_s2s(s2s, config.train_rate)
-        }
         ModelBuilder::Gdt(vocab) => {
             let builder = DecoderBuilder::new(
                 config.input_stride_width,
@@ -703,20 +630,6 @@ where
             let gdt = GenerativeDecoderTransformer::from_builder(builder, vocab, rng).unwrap();
             M::from_gdt(gdt, config.train_rate, config.sample_from_pattern.clone())
         }
-        ModelBuilder::Embedding(vocab) => {
-            let hidden_layer_shape = TrainerState::<()>::build_hidden_layer_shape(config);
-
-            let embedding = Embedding::new_builder_ordered(&vocab)
-                .with_embedding_dimensions(config.embedding_size)
-                .with_hidden_layer_custom_shape(hidden_layer_shape)
-                .with_input_stride_width(config.input_stride_width)
-                .with_activation_mode(config.activation_mode.into())
-                .with_rng(rng)
-                .build()
-                .unwrap();
-
-            M::from_embedding(embedding, config.train_rate)
-        }
     }
 }
 
@@ -726,12 +639,7 @@ fn report_round<M: MLModel>(
     training_error: Option<NodeValue>,
     label: Option<&str>,
 ) {
-    let validation_results = if let Some(embedding) = state.model.as_embedding() {
-        validate::validate_embeddings(embedding, testing_phrases)
-    } else if let Some(s2s) = state.model.as_s2s() {
-        let testing_phrases = TrainerState::<M>::join_phrases(&testing_phrases, Some(true)); // TODO: remove from hot path
-        Ok(validate::validate_s2s(s2s, &testing_phrases))
-    } else if let Some(gdt) = state.model.as_gdt() {
+    let validation_results = if let Some(gdt) = state.model.as_gdt() {
         let char_mode = gdt.vocab().token_type().is_char();
         let testing_phrases = TrainerState::<M>::join_phrases(&testing_phrases, Some(char_mode)); // TODO: remove from hot path
         validate::validate_gdt(
@@ -954,12 +862,10 @@ mod validate {
     use std::time::Duration;
 
     use anyhow::{Context, Result};
-    use tracing::{error, info};
+    use tracing::info;
 
     use plane::ml::{
-        embeddings::Embedding,
         gdt::{token::Token, GenerativeDecoderTransformer},
-        seq2seq::transformer::CharacterTransformer,
         LayerValues, NodeValue,
     };
 
@@ -1026,92 +932,6 @@ mod validate {
                 "{label}round = {:<6} |  train_loss = {:<12.10}, val_pred_acc: {:0>4.1}%, val_loss = {:<2.6e}, val_nll = {:<6.3} {ms_per_round}",
                 report.round + 1, report.training_error, report.predictions_pct, report.validation_error, report.nll
         );
-    }
-
-    pub fn validate_embeddings(
-        embedding: &Embedding,
-        testing_phrases: &Vec<Vec<String>>,
-    ) -> Result<TestSetValidation> {
-        let mut validation_errors = vec![];
-        let mut correct_first_word_predictions = 0;
-        let mut total_first_word_predictions = 0;
-
-        // TODO: take batch_size num of phrases or of training pairs randomly to validate..
-        // once perf hit is ngligable, run on each train iter and save/plot data
-        for testing_phrase in testing_phrases.iter() {
-            for testing_phrase_window in testing_phrase.windows(embedding.input_stride_width() + 1)
-            {
-                let (actual, context_word_vectors) = testing_phrase_window
-                    .split_last()
-                    .context("should have last element")?;
-
-                let context_word_vectors = context_word_vectors
-                    .into_iter()
-                    .map(|x| x.as_str())
-                    .collect::<Vec<_>>();
-
-                let predicted = embedding.predict_next(&context_word_vectors[..])?;
-                if &predicted == actual {
-                    correct_first_word_predictions += 1;
-                }
-
-                total_first_word_predictions += 1;
-            }
-
-            let error = embedding.compute_error(testing_phrase)?;
-            let nll = embedding.nll_batch(&vec![testing_phrase.iter().cloned().collect()])?;
-            validation_errors.push((error, nll));
-        }
-
-        let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
-            / total_first_word_predictions.max(1) as NodeValue;
-
-        Ok(TestSetValidation {
-            validation_errors,
-            predictions_pct,
-        })
-    }
-
-    pub fn validate_s2s(
-        transformer: &CharacterTransformer,
-        testing_phrases: &str,
-    ) -> TestSetValidation {
-        use itertools::Itertools;
-
-        let mut validation_errors = vec![];
-        let mut correct_first_word_predictions = 0;
-        let mut total_first_word_predictions = 0;
-
-        for testing_phrase_window in testing_phrases
-            .chars()
-            .chunks(transformer.input_stride_width() + 1)
-            .into_iter()
-        {
-            let testing_phrase_window = testing_phrase_window.collect_vec();
-            let (&last_token, context_tokens) = testing_phrase_window.split_last().unwrap();
-
-            let predicted = transformer.predict_next(&context_tokens).unwrap();
-            let actual = last_token;
-
-            if predicted == actual {
-                correct_first_word_predictions += 1;
-            }
-
-            let error = transformer
-                .compute_error(&[context_tokens, &[actual]].concat())
-                .unwrap();
-            let nll = transformer.nll(&context_tokens, actual).unwrap();
-            validation_errors.push((error, nll));
-            total_first_word_predictions += 1;
-        }
-
-        let predictions_pct = correct_first_word_predictions as NodeValue * 100.0
-            / total_first_word_predictions as NodeValue;
-
-        TestSetValidation {
-            validation_errors,
-            predictions_pct,
-        }
     }
 
     pub fn validate_gdt(
@@ -1221,17 +1041,14 @@ mod validate {
 
 pub mod writer {
     use std::{
-        collections::{HashMap, HashSet},
         fs::File,
-        io::{BufReader, BufWriter, Write},
+        io::{BufReader, BufWriter},
         path::PathBuf,
     };
 
     use anyhow::{Context, Result};
-    use itertools::Itertools;
     use serde_json::Value;
 
-    use plane::ml::embeddings::Embedding;
     use tracing::info;
 
     use crate::{config::TrainEmbeddingConfig, messages::TrainerStateMetadata, model::MLModel};
@@ -1327,113 +1144,6 @@ pub mod writer {
 
         fpath
     }
-
-    pub fn write_embedding_tsv_to_disk(
-        embedding: &Embedding,
-        label: &str,
-        output_dir: &Option<String>,
-        output_label: &Option<String>,
-    ) {
-        let vocab = embedding.vocab().keys().cloned().collect::<Vec<_>>();
-
-        let fpath_vectors = path::create_output_fpath(
-            ("embedding", "_vectors.tsv"),
-            output_dir.as_deref(),
-            output_label.as_deref(),
-            None,
-            label,
-        );
-        let fpath_labels = path::create_output_fpath(
-            ("embedding", "_labels.tsv"),
-            output_dir.as_deref(),
-            output_label.as_deref(),
-            None,
-            label,
-        );
-
-        File::create(fpath_vectors)
-            .unwrap()
-            .write_fmt(format_args!(
-                "{}",
-                vocab
-                    .iter()
-                    .map(|word| embedding.embeddings(&word).unwrap().iter().join("\t"))
-                    .join("\n")
-            ))
-            .unwrap();
-
-        File::create(fpath_labels)
-            .unwrap()
-            .write_fmt(format_args!("{}", vocab.iter().join("\n")))
-            .unwrap();
-    }
-
-    pub fn write_results_to_disk(embedding: &Embedding, label: &str) {
-        let vocab = embedding.vocab().keys().cloned().collect::<HashSet<_>>();
-
-        let fpath_nearest =
-            path::create_output_fpath(("embedding", "_nearest.json"), None, None, None, label);
-        let fpath_predictions =
-            path::create_output_fpath(("embedding", "_predictions.json"), None, None, None, label);
-        let fpath_embeddings =
-            path::create_output_fpath(("embedding", "_embeddings.csv"), None, None, None, label);
-
-        File::create(fpath_nearest)
-            .unwrap()
-            .write_all(
-                serde_json::to_string_pretty(&{
-                    let mut map = HashMap::new();
-
-                    for v in vocab.iter() {
-                        let nearest = embedding
-                            .nearest(&v)
-                            .map(|(x, _)| x)
-                            .unwrap_or_else(|_| "<none>".to_string());
-                        map.insert(v, nearest);
-                    }
-                    map
-                })
-                .unwrap()
-                .as_bytes(),
-            )
-            .unwrap();
-
-        File::create(fpath_predictions)
-            .unwrap()
-            .write_all(
-                serde_json::to_string_pretty(&{
-                    let mut map = HashMap::new();
-
-                    for v in vocab.iter() {
-                        let predict = embedding
-                            .predict_from(&v)
-                            .unwrap_or_else(|_| "<none>".to_string());
-                        map.insert(v, predict);
-                    }
-                    map
-                })
-                .unwrap()
-                .as_bytes(),
-            )
-            .unwrap();
-
-        File::create(fpath_embeddings)
-            .unwrap()
-            .write_fmt(format_args!(
-                "{}",
-                vocab
-                    .iter()
-                    .map(|word| {
-                        format!(
-                            "{word},{}",
-                            embedding.embeddings(&word).unwrap().iter().join(",")
-                        )
-                    })
-                    .join("\n")
-            ))
-            .unwrap();
-    }
-
     mod path {
         use std::{
             fs::DirBuilder,

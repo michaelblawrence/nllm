@@ -19,7 +19,6 @@ async fn func(
     event: LambdaEvent<Value>,
     ctx: Arc<(
         respond::RespondModel,
-        respond::ExtractedModelConfig,
         respond::PromptChatMode,
     )>,
 ) -> Result<Response<Body>, Error> {
@@ -37,8 +36,8 @@ async fn func(
     let (tx, mut rx) = tokio::sync::broadcast::channel(100);
 
     tokio::task::spawn_blocking(move || {
-        let (model, state, chat_mode) = &*ctx;
-        for message in infer(&prompt_txt, &model, &state, *chat_mode)? {
+        let (model, chat_mode) = &*ctx;
+        for message in infer(&prompt_txt, &model, *chat_mode)? {
             tx.send(message)?;
         }
         <Result<(), Error>>::Ok(())
@@ -87,7 +86,7 @@ async fn main() -> Result<(), Error> {
         .without_time()
         .init();
 
-    let (model, state) = match (
+    let (model, _) = match (
         std::env::var(env::MODEL_S3_BUCKET),
         std::env::var(env::MODEL_S3_KEY),
     ) {
@@ -113,7 +112,7 @@ async fn main() -> Result<(), Error> {
         respond::PromptChatMode::DirectPrompt
     };
 
-    let ctx = Arc::new((model, state, chat_mode));
+    let ctx = Arc::new((model, chat_mode));
     let handler = service_fn(|event| func(event, ctx.clone()));
 
     lambda_runtime::run_with_streaming_response(handler).await?;
@@ -150,16 +149,10 @@ async fn load_model_from_s3(
 pub fn infer<'a>(
     prompt: &'a str,
     model: &'a respond::RespondModel,
-    state: &'a respond::ExtractedModelConfig,
     chat_mode: respond::PromptChatMode,
 ) -> anyhow::Result<impl Iterator<Item = String> + 'a> {
-    let char_mode = state.char_mode.expect("missing char_mode");
     let inference_started = std::time::Instant::now();
-    let config = respond::PromptConfig {
-        use_gdt: state.use_gdt,
-        char_mode,
-        chat_mode,
-    };
+    let config = respond::PromptConfig { chat_mode };
 
     enum State {
         Infer(String),

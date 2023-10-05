@@ -113,10 +113,10 @@ pub fn spawn_local_inference(
     model_fpath: Option<&str>,
     tx: broadcast::Sender<String>,
 ) -> broadcast::Sender<ModelPromptRequest> {
-    let (model, state) = respond::load(model_fpath).unwrap();
+    let (model, _) = respond::load(model_fpath).unwrap();
     let (model_tx, mut model_rx) = broadcast::channel::<ModelPromptRequest>(100);
 
-    let ctx = Arc::new((model, state, tx.clone()));
+    let ctx = Arc::new((model, tx.clone()));
 
     tokio::spawn(async move {
         while let Ok(prompt_request) = model_rx.recv().await {
@@ -125,8 +125,8 @@ pub fn spawn_local_inference(
 
             let infer_task = tokio::task::spawn_blocking({
                 move || {
-                    let (model, state, tx) = &*ctx;
-                    let messages = infer(&prompt_request, &model, &state)?;
+                    let (model, tx) = &*ctx;
+                    let messages = infer(&prompt_request, &model)?;
                     for msg in messages {
                         tx.send(msg)?;
                     }
@@ -149,7 +149,6 @@ pub fn spawn_local_inference(
 pub fn infer<'a>(
     prompt_request: &'a ModelPromptRequest,
     model: &'a respond::RespondModel,
-    state: &'a respond::ExtractedModelConfig,
 ) -> anyhow::Result<impl Iterator<Item = String> + 'a> {
     let ModelPromptRequest {
         prompt,
@@ -157,7 +156,7 @@ pub fn infer<'a>(
         index,
         ..
     } = prompt_request;
-    let config = to_prompt_config(state);
+    let config = to_prompt_config();
 
     let env_timeout_secs = std::env::var("NLLM_INFER_TIMEOUT_MS").ok();
     let env_timeout_secs = env_timeout_secs.and_then(|x| x.parse::<u64>().ok());
@@ -235,9 +234,8 @@ async fn get_lambda_funtion_url(
     Ok(function_url)
 }
 
-pub fn to_prompt_config(state: &respond::ExtractedModelConfig) -> respond::PromptConfig {
+pub fn to_prompt_config() -> respond::PromptConfig {
     use respond::PromptChatMode::*;
-    let char_mode = state.char_mode.expect("missing char_mode");
     let use_human_ctx_chat_format = std::env::var("NLLM_TRIPLE_HASH_PROMPT")
         .map(|x| x != "0")
         .unwrap_or(false);
@@ -247,8 +245,6 @@ pub fn to_prompt_config(state: &respond::ExtractedModelConfig) -> respond::Promp
         DirectPrompt
     };
     respond::PromptConfig {
-        use_gdt: state.use_gdt,
-        char_mode,
         chat_mode,
     }
 }

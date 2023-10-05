@@ -144,8 +144,6 @@ fn parse_repl_char(
         'g' => tx.send(TrainerMessage::PlotTrainingLossGraph)?,
         'G' => tx.send(TrainerMessage::PlotHeatMapGraphs)?, //tmp
         'n' => tx.send(TrainerMessage::PredictRandomPhrase)?,
-        'w' => tx.send(TrainerMessage::WriteStatsToDisk)?,
-        'W' => tx.send(TrainerMessage::WriteEmbeddingTsvToDisk)?,
         's' => tx.send(TrainerMessage::WriteModelToDisk)?,
         ',' => tx.send(TrainerMessage::MultiplyLearnRateBy(0.5))?,
         '.' => tx.send(TrainerMessage::MultiplyLearnRateBy(2.0))?,
@@ -183,8 +181,6 @@ fn parse_repl_char(
                         'z' => force snapshot
                         'G' => open next heatmap plots in browser (tmp)
                         'g' => open training plot in browser
-                        'w' => write stats to disk
-                        'W' => write embedding tsv to disk
                         's' => save model to disk
                         ',' => divide learn rate by 2
                         '.' => multiply learn rate by 2

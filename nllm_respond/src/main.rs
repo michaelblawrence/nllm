@@ -15,14 +15,12 @@ fn main() {
 }
 
 fn run(model_fpath: &mut Option<String>) -> bool {
-    let (model, state) = match respond::load(model_fpath.as_deref()) {
+    let (model, _) = match respond::load(model_fpath.as_deref()) {
         Ok((model, state)) => (model, state),
         Err(_) => return false,
     };
 
-    let char_mode = state.char_mode.expect("missing char_mode");
-
-    println!("Starting... (character input mode = {char_mode})");
+    println!("Starting... ");
     println!("   - Commands available: [ '.load <path>' | '.reload' | '.quit' ]");
 
     // TODO: add inference mode hint to model json?
@@ -61,8 +59,6 @@ fn run(model_fpath: &mut Option<String>) -> bool {
         };
 
         let config = PromptConfig {
-            use_gdt: state.use_gdt,
-            char_mode,
             chat_mode,
         };
         let response = match respond::process_prompt(&model, &input_txt, &config) {
