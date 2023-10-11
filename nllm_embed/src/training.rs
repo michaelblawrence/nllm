@@ -46,6 +46,7 @@ pub struct TrainerState<M> {
     rounds_until_pause_enabled: usize,
     halt: bool,
     use_detailed_nll: bool,
+    pending_autosave: bool,
     force_report_test_set: bool,
     force_report_train_set: bool,
     round_reported: bool,
@@ -75,6 +76,7 @@ impl<M: MLModel> TrainerState<M> {
             print_round_number: false,
             supress_auto_report: false,
             use_detailed_nll: false,
+            pending_autosave: false,
             force_report_test_set: false,
             force_report_train_set: false,
             force_report_all: false,
@@ -163,11 +165,8 @@ impl<M: MLModel> TrainerState<M> {
             return;
         }
 
-        let pending_autosave = self.last_autosave.elapsed() > self.autosave_interval;
-        if !self.paused && pending_autosave {
-            self.trigger_round_report_test_set();
-        }
-        if !self.paused && !self.is_pending_round_report() && pending_autosave {
+        if !self.paused && !self.is_pending_round_report() && self.pending_autosave {
+            self.pending_autosave = false;
             let metadata = self.metadata();
             let msg = TrainerMessage::WriteModelAndMetadataToDisk(
                 metadata,
@@ -177,6 +176,12 @@ impl<M: MLModel> TrainerState<M> {
                 Ok(_) => self.last_autosave = Instant::now(),
                 Err(_) => {}
             };
+        }
+
+        let pending_autosave = self.last_autosave.elapsed() > self.autosave_interval;
+        if !self.paused && pending_autosave && !self.pending_autosave {
+            self.trigger_round_report_test_set();
+            self.pending_autosave = true;
         }
 
         if !self.training_paused() {
