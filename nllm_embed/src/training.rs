@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
     sync::Arc,
@@ -37,7 +37,6 @@ pub struct TrainerState<M> {
     pub supress_auto_report: bool,
     pub force_report_all: bool,
     pub sample_from_pattern: Option<String>,
-    pub snapshot: (Option<String>, Instant),
     pub last_report: Option<(Instant, TrainerReport)>,
     paused: bool,
     batches_trained: usize,
@@ -71,7 +70,6 @@ impl<M: MLModel> TrainerState<M> {
             training_rounds: config.training_rounds,
             paused: config.pause_on_start,
             sample_from_pattern: config.sample_from_pattern.clone(),
-            snapshot: (None, Instant::now()),
             training_loss_logger: BoundedValueLogger::new(1000),
             round_reported: false,
             print_round_number: false,
@@ -113,9 +111,6 @@ impl<M: MLModel> TrainerState<M> {
     fn try_record_train_iteration(&mut self, train_error: Result<NodeValue>) -> Option<NodeValue> {
         match train_error {
             Ok(error) if error.is_finite() => {
-                if self.should_perform_autosave() {
-                    self.perform_snapshot();
-                }
                 self.training_loss_logger.push((self.round, error));
                 Some(error)
             }
@@ -124,17 +119,11 @@ impl<M: MLModel> TrainerState<M> {
                     "Failed perform embedding model training iteration: training loss = {}",
                     non_finite_error
                 );
-                if let (Some(_), when) = self.snapshot {
-                    info!("Snapshot available from {when:?}. See help menu ('h') to restore... pausing")
-                }
                 self.pause();
                 None
             }
             Err(e) => {
                 error!("Failed to train embedding model {e}");
-                if let (Some(_), when) = self.snapshot {
-                    info!("Snapshot available from {when:?}. See help menu ('h') to restore... pausing")
-                }
                 self.pause();
                 None
             }
@@ -174,7 +163,11 @@ impl<M: MLModel> TrainerState<M> {
             return;
         }
 
-        if !self.paused && self.last_autosave.elapsed() > self.autosave_interval {
+        let pending_autosave = self.last_autosave.elapsed() > self.autosave_interval;
+        if !self.paused && pending_autosave {
+            self.trigger_round_report_test_set();
+        }
+        if !self.paused && !self.is_pending_round_report() && pending_autosave {
             let metadata = self.metadata();
             let msg = TrainerMessage::WriteModelAndMetadataToDisk(
                 metadata,
@@ -221,16 +214,6 @@ impl<M: MLModel> TrainerState<M> {
 
     pub fn training_paused(&self) -> bool {
         self.paused && self.rounds_until_pause_enabled == 0
-    }
-
-    fn perform_snapshot(&mut self) {
-        let json = self.model.snapshot().unwrap();
-        self.snapshot = (Some(json), Instant::now());
-    }
-
-    fn should_perform_autosave(&self) -> bool {
-        !self.paused
-            && self.snapshot.1.elapsed().as_secs() > self.inital_config.snapshot_interval_secs
     }
 
     fn should_report_round(&mut self) -> bool {
@@ -345,6 +328,10 @@ impl<M: MLModel> TrainerState<M> {
         }
 
         self.halt = true;
+    }
+
+    pub fn is_pending_round_report(&self) -> bool {
+        self.force_report_test_set || self.force_report_train_set
     }
 
     pub fn batches_trained_since_process_started(&self) -> usize {
@@ -473,8 +460,8 @@ where
     } else {
         RngStrategy::default()
     };
-    let (mut phrases, mut vocab) = init_phrases_and_vocab(&config, phrase_rng.to_arc());
-    let mut testing_phrases = match config.phrase_test_set_split_pct.filter(|x| *x > 0.0) {
+    let mut phrases = init_phrases_and_vocab(&config, phrase_rng.to_arc());
+    let testing_phrases = match config.phrase_test_set_split_pct.filter(|x| *x > 0.0) {
         Some(pct) => split_training_and_testing(
             &mut phrases,
             pct,
@@ -485,19 +472,7 @@ where
     };
     let rng = RngStrategy::default();
 
-    let (char_vocab, str_vocab, gdt_vocab) = if config.use_character_tokens && !config.use_gdt {
-        info!("Transforming vocab and train/test sets to character-level tokens");
-        phrases = characterize_phrases(phrases);
-        testing_phrases = characterize_phrases(testing_phrases);
-        vocab = compute_vocab(&phrases, Some(&testing_phrases));
-        let char_vocab = vocab
-            .into_iter()
-            .map(|c| c.chars().next().unwrap())
-            .chain(['\n'])
-            .collect::<Vec<_>>();
-
-        (Some(char_vocab), None, None)
-    } else if config.use_gdt {
+    let gdt_vocab = {
         let token_type = if config.gdt_bpe_enable {
             gdt::token::VocabTokenType::BPE
         } else if config.gdt_word_mode {
@@ -545,21 +520,11 @@ where
             vocab
         };
 
-        (None, None, Some(gdt_vocab))
-    } else {
-        let str_vocab = vocab.into_iter().collect::<Vec<_>>();
-
-        (None, Some(str_vocab), None)
+        gdt_vocab
     };
 
     let token_count = |x: &Vec<Vec<String>>| x.iter().map(|phrase| phrase.len()).sum::<usize>();
-    let char_token_len = char_vocab.as_ref().map(|x| x.len());
-    let str_token_len = str_vocab.as_ref().map(|x| x.len());
-    let gdt_token_len = gdt_vocab.as_ref().map(|x| x.len());
-    let token_len = char_token_len
-        .or(str_token_len)
-        .or(gdt_token_len)
-        .unwrap_or_default();
+    let token_len = gdt_vocab.len();
     info!(
         "Completed token initialisation: (vocab size = {} tokens)",
         token_len
@@ -569,68 +534,56 @@ where
         token_count(&testing_phrases), testing_phrases.len()
     );
 
-    let model_builder = if let (true, Some(vocab)) = (config.use_gdt, gdt_vocab) {
-        info!("Using GenerativeDecoderTransformer (GDT)...");
-        ModelBuilder::Gdt(vocab)
-    } else {
-        panic!("invalid config build state");
-    };
-
-    let model = build_model(&config, model_builder, rng);
+    info!("Using GenerativeDecoderTransformer (GDT)...");
+    let model = build_model(&config, gdt_vocab, rng);
     let state = TrainerState::new(model, &config, &handle.tx);
+    info!("Initialized GDT model.");
 
     (phrases, testing_phrases, state)
 }
 
-enum ModelBuilder {
-    Gdt(gdt::token::Vocab),
-}
-
-fn build_model<M>(config: &TrainEmbeddingConfig, model_builder: ModelBuilder, rng: RngStrategy) -> M
+fn build_model<M>(config: &TrainEmbeddingConfig, vocab: gdt::token::Vocab, rng: RngStrategy) -> M
 where
     M: MLModel,
 {
-    match model_builder {
-        ModelBuilder::Gdt(vocab) => {
-            let builder = DecoderBuilder::new(
-                config.input_stride_width,
-                config.embedding_size,
-                vocab.len(),
-            );
-            let builder = builder
-                // .with_rng(rng.clone()) // TODO: inject rng instance here?
-                .with_dropout_rate(0.0)
-                .with_feed_forward_hidden_dimension(config.hidden_layer_nodes);
+    let builder = DecoderBuilder::new(
+        config.input_stride_width,
+        config.embedding_size,
+        vocab.len(),
+    );
+    let builder = builder
+        // .with_rng(rng.clone()) // TODO: inject rng instance here?
+        .with_dropout_rate(0.0)
+        .with_feed_forward_hidden_dimension(config.hidden_layer_nodes);
 
-            let hidden_deep_layer_nodes = config
-                .hidden_deep_layer_nodes
-                .as_ref()
-                .map(|x| x.split(',').collect_vec());
+    let hidden_deep_layer_nodes = config
+        .hidden_deep_layer_nodes
+        .as_ref()
+        .map(|x| x.split(',').collect_vec());
 
-            let builder = if let Some(block_count) = hidden_deep_layer_nodes
-                .as_ref()
-                .and_then(|x| x.get(0))
-                .and_then(|x| x.parse::<usize>().ok())
-            {
-                builder.with_block_count(block_count)
-            } else {
-                builder
-            };
+    let csv_block_count = hidden_deep_layer_nodes
+        .as_ref()
+        .and_then(|x| x.get(0))
+        .and_then(|x| x.parse::<usize>().ok());
 
-            let builder = if let Some(head_count) = hidden_deep_layer_nodes
-                .as_ref()
-                .and_then(|x| x.get(1))
-                .and_then(|x| x.parse::<usize>().ok())
-            {
-                builder.with_head_count(head_count)
-            } else {
-                builder
-            };
+    let csv_head_count = hidden_deep_layer_nodes
+        .as_ref()
+        .and_then(|x| x.get(1))
+        .and_then(|x| x.parse::<usize>().ok());
 
-            let gdt = GenerativeDecoderTransformer::from_builder(builder, vocab, rng).unwrap();
-            M::from_gdt(gdt, config.train_rate, config.sample_from_pattern.clone())
-        }
-    }
+    let builder = if let Some(block_count) = config.decoder_blocks.or(csv_block_count) {
+        builder.with_block_count(block_count)
+    } else {
+        builder
+    };
+    let builder = if let Some(head_count) = config.decoder_heads.or(csv_head_count) {
+        builder.with_head_count(head_count)
+    } else {
+        builder
+    };
+
+    let gdt = GenerativeDecoderTransformer::from_builder(builder, vocab, rng).unwrap();
+    M::from_gdt(gdt, config.train_rate, config.sample_from_pattern.clone())
 }
 
 fn report_round<M: MLModel>(
@@ -679,13 +632,10 @@ fn report_round<M: MLModel>(
     }
 }
 
-type DeterministicHashSet<T> =
-    HashSet<T, std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
-
 pub fn init_phrases_and_vocab(
     config: &TrainEmbeddingConfig,
     rng: Arc<dyn RNG>,
-) -> (Vec<Vec<String>>, DeterministicHashSet<String>) {
+) -> Vec<Vec<String>> {
     let phrases = parse_phrases(&config);
 
     let (min_len, max_len) = config.phrase_word_length_bounds;
@@ -721,13 +671,6 @@ pub fn init_phrases_and_vocab(
     if let Some(phrase_train_set_size) = config.phrase_train_set_size {
         phrases.truncate(phrase_train_set_size);
     }
-
-    let vocab = if !config.use_gdt {
-        compute_vocab(&phrases, None)
-    } else {
-        std::iter::empty().collect()
-    };
-
     if !config.phrase_disable_shuffle {
         plane::ml::ShuffleRng::shuffle_vec(&rng, &mut phrases);
     }
@@ -738,36 +681,7 @@ pub fn init_phrases_and_vocab(
         .ok_or(())
         .expect_err("phrases is empty");
 
-    (phrases, vocab)
-}
-
-fn compute_vocab(
-    phrases: &Vec<Vec<String>>,
-    testing_phrases: Option<&Vec<Vec<String>>>,
-) -> DeterministicHashSet<String> {
     phrases
-        .iter()
-        .chain(testing_phrases.into_iter().flatten())
-        .flat_map(|phrase| {
-            phrase
-                .join(" ")
-                .chars()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-fn characterize_phrases(phrases: Vec<Vec<String>>) -> Vec<Vec<String>> {
-    let separator = " ".to_string();
-    phrases
-        .into_iter()
-        .map(|phrase| {
-            Itertools::intersperse(phrase.into_iter(), separator.clone())
-                .flat_map(|word| word.chars().map(|c| c.to_string()).collect_vec())
-                .collect_vec()
-        })
-        .collect_vec()
 }
 
 pub fn parse_phrases(config: &TrainEmbeddingConfig) -> Vec<Vec<String>> {

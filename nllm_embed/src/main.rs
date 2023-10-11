@@ -139,8 +139,6 @@ fn parse_repl_char(
         'R' => tx.send(TrainerMessage::SuppressAutoPrintStatus)?,
         'P' => tx.send(TrainerMessage::PrintEachRoundNumber)?,
         'a' => tx.send(TrainerMessage::TogglePrintAllStatus)?,
-        'x' => tx.send(TrainerMessage::ReloadFromSnapshot)?,
-        'z' => tx.send(TrainerMessage::ForceSnapshot)?,
         'g' => tx.send(TrainerMessage::PlotTrainingLossGraph)?,
         'G' => tx.send(TrainerMessage::PlotHeatMapGraphs)?, //tmp
         'n' => tx.send(TrainerMessage::PredictRandomPhrase)?,
@@ -173,12 +171,10 @@ fn parse_repl_char(
                 r"Trainer help: 
                         'r' => report status (testing set)
                         'o' => report status (training set)
-                        'R' => supress auto-report status
+                        'R' => suppress auto-report status
                         'P' => toggle always report round number
                         'o' => toggle always run testing report 
                         'n' => print new random phrase
-                        'x' => reload from auto-save snapshot
-                        'z' => force snapshot
                         'G' => open next heatmap plots in browser (tmp)
                         'g' => open training plot in browser
                         's' => save model to disk

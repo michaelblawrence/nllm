@@ -53,11 +53,6 @@ impl<T> BoundedValueLogger<T> {
         self.items.iter().map(|(_, item)| item)
     }
 
-    pub fn into_iter(self) -> impl Iterator<Item = T> {
-        let x = self.items.into_iter().map(|(_, item)| item);
-        x
-    }
-
     pub fn set_capacity(&mut self, capacity: usize) {
         self.capacity = capacity.max(Self::MIN_CAPACITY);
         let mut iter_left = 25;

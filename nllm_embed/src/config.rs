@@ -14,7 +14,16 @@ pub struct TrainEmbeddingConfig {
     pub hidden_layer_nodes: usize,
 
     #[arg(short = 'H', long, default_value = None)]
+    #[serde(default)]
     pub hidden_deep_layer_nodes: Option<String>,
+
+    #[arg(short = 'J', long, default_value = None)]
+    #[serde(default)]
+    pub decoder_blocks: Option<usize>,
+    
+    #[arg(short = 'K', long, default_value = None)]
+    #[serde(default)]
+    pub decoder_heads: Option<usize>,
 
     #[arg(short = 'c', long, default_value_t = 10000)]
     pub training_rounds: usize,
@@ -29,21 +38,9 @@ pub struct TrainEmbeddingConfig {
     #[serde(default)]
     pub single_batch_iterations: bool,
 
-    #[arg(short = 'C', long = "char", default_value_t = false)]
-    #[serde(default)]
-    pub use_character_tokens: bool,
-
     #[arg(short = 'N', long, default_value = None)]
     #[serde(default)]
     pub sample_from_pattern: Option<String>,
-
-    #[arg(short = 'L', long, default_value_t = false)]
-    #[serde(default)]
-    pub use_transformer: bool,
-
-    #[arg(long, default_value_t = false)]
-    #[serde(default)]
-    pub use_gdt: bool,
 
     #[arg(long, default_value_t = false)]
     #[serde(default)]
@@ -90,9 +87,6 @@ pub struct TrainEmbeddingConfig {
     #[arg(long, default_value = None)]
     #[serde(default)]
     pub repl: Option<String>,
-
-    #[arg(short = 'S', long, default_value_t = 120)]
-    pub snapshot_interval_secs: u64,
 
     #[arg(short = 'T', long, default_value = None)]
     pub phrase_train_set_size: Option<usize>,

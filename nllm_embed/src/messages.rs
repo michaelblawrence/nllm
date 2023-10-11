@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
 use std::{
     ops::ControlFlow,
     sync::{mpsc, Arc},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use plane::ml::{gdt::GenerativeDecoderTransformer, NodeValue};
@@ -17,8 +17,6 @@ pub enum TrainerMessage {
     PrintTrainingStatus,
     PrintStatus,
     TogglePrintAllStatus,
-    ReloadFromSnapshot,
-    ForceSnapshot,
     RenameOutputLabel(String),
     WriteModelToDisk,
     WriteModelAndMetadataToDisk(TrainerStateMetadata, TrainerModelCheckpointSource),
@@ -60,8 +58,6 @@ impl TrainerMessage {
             }
             TrainerMessage::TogglePause => TrainerHandleActions::TogglePause,
             TrainerMessage::TogglePrintAllStatus => TrainerHandleActions::TogglePrintAllStatus,
-            TrainerMessage::ReloadFromSnapshot => TrainerHandleActions::ReloadFromSnapshot,
-            TrainerMessage::ForceSnapshot => TrainerHandleActions::ForceSnapshot,
             TrainerMessage::ToggleDetailedNLL => TrainerHandleActions::ToggleDetailedNLL,
             TrainerMessage::PrintEachRoundNumber => TrainerHandleActions::PrintEachRoundNumber,
             TrainerMessage::SuppressAutoPrintStatus => {
@@ -148,8 +144,6 @@ pub enum TrainerHandleActions {
     RenameOutputLabel(String),
     TogglePause,
     TogglePrintAllStatus,
-    ReloadFromSnapshot,
-    ForceSnapshot,
     PrintTrainingStatus,
     PrintStatus,
     Halt,
@@ -205,33 +199,6 @@ impl TrainerHandleActions {
                 if state.unpause() {
                     info!("Resuming rounds run, starting...");
                 }
-            }
-            TrainerHandleActions::ReloadFromSnapshot => {
-                let state_recovered: Result<()> = if let Some(snapshot) = &state.snapshot.0 {
-                    info!("Recovering state from snapshot..");
-                    if let Some(_) = state.model.as_gdt() {
-                        Err(anyhow!("can not reload gdt yet"))
-                    } else {
-                        Err(anyhow!("can not reload all models yet"))
-                    }
-                } else {
-                    Err(anyhow!(
-                        "No snapshot found to recover state from, continuing..."
-                    ))
-                };
-
-                match state_recovered {
-                    Ok(_) => {
-                        info!("Recovered state from snapshot, pausing..");
-                        state.pause();
-                    }
-                    Err(e) => info!("Failed to restore snapshot: '{}', continuing...", e),
-                };
-            }
-            TrainerHandleActions::ForceSnapshot => {
-                let json = state.model.snapshot().unwrap();
-                state.snapshot = (Some(json), Instant::now());
-                info!("Forced snapshot save to memory");
             }
             TrainerHandleActions::PrintTrainingStatus => state.trigger_round_report_train_set(),
             TrainerHandleActions::PrintStatus => state.trigger_round_report_test_set(),
