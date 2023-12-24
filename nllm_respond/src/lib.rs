@@ -179,13 +179,8 @@ fn read_model_file(fpath_arg: Option<&str>) -> Option<String> {
         }
     };
 
-    let mut file = File::open(path).expect("failed to open file");
-    let mut buf = String::new();
-
-    file.read_to_string(&mut buf)
-        .expect("failed to read file contents");
-
-    Some(buf)
+    let contents = std::fs::read_to_string(path).expect("failed to open file");
+    Some(contents)
 }
 
 pub struct ExtractedModelConfig {

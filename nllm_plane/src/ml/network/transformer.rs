@@ -3828,13 +3828,13 @@ pub mod linear {
 
             for (c_row, a_row) in c.chunks_exact_mut(n).zip(a.chunks_exact(k)) {
                 for (a_chunk, b_chunk_rows) in a_row.chunks_exact(N).zip(b.chunks_exact(n * N)) {
-                    for (a, b_chunk_row) in a_chunk.iter().zip(b_chunk_rows.chunks_exact(n)) {
+                    for (&a, b_chunk_row) in a_chunk.iter().zip(b_chunk_rows.chunks_exact(n)) {
                         for (c_block, b_chunk) in
                             c_row.chunks_exact_mut(N).zip(b_chunk_row.chunks(N))
                         {
-                            // assert!(c_block)
-                            for (c, b) in c_block.iter_mut().zip(b_chunk.iter()) {
-                                *c += a * b;
+                            for (c, &b) in c_block.iter_mut().zip(b_chunk.iter()) {
+                                *c = unsafe { std::intrinsics::fmaf64(a, b, *c) };
+                                // *c += a * b;
                             }
                         }
                     }
@@ -4275,6 +4275,33 @@ pub mod linear {
         }
 
         impl<I: Iterator<Item = NodeValue>> KnownSizeIterator for I {}
+    }
+
+    pub fn mat_mul(
+        stride: usize,
+        count: usize,
+        inner_dim: usize,
+        a: &[f64],
+        b: &[f64],
+    ) -> Vec<f64> {
+        const N: usize = 32;
+        let (n, k) = (stride, inner_dim);
+        let mut c = vec![0.0; stride * count];
+
+        for (c_row, a_row) in c.chunks_exact_mut(n).zip(a.chunks_exact(k)) {
+            for (a_chunk, b_chunk_rows) in a_row.chunks_exact(N).zip(b.chunks_exact(n * N)) {
+                for (&a, b_chunk_row) in a_chunk.iter().zip(b_chunk_rows.chunks_exact(n)) {
+                    for (c_block, b_chunk) in c_row.chunks_exact_mut(N).zip(b_chunk_row.chunks(N)) {
+                        // assert!(c_block)
+                        for (c, &b) in c_block.iter_mut().zip(b_chunk.iter()) {
+                            *c = a.mul_add(b, *c);
+                            // *c += a * b;
+                        }
+                    }
+                }
+            }
+        }
+        c
     }
 
     #[cfg(test)]

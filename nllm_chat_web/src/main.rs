@@ -1,14 +1,13 @@
 use anyhow::{bail, Context};
 use axum::{
-    body::Bytes,
     extract::{
         ws::{Message, WebSocketUpgrade},
         State,
     },
-    http::{HeaderName, StatusCode},
-    response::{AppendHeaders, Html, IntoResponse, Response},
-    routing::get,
-    Router,
+    http::StatusCode,
+    response::{AppendHeaders, Html, IntoResponse},
+    routing::{get, post},
+    Form, Router,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use reqwest::header;
@@ -16,7 +15,7 @@ use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
@@ -36,10 +35,16 @@ mod env {
     pub const HOTRELOAD: &str = "NLLM_HOTRELOAD";
 }
 
+pub struct ApiAppState {
+    handles: tokio::sync::Barrier,
+    channel: broadcast::Sender<String>,
+}
+
 pub struct AppState {
     user_set: Mutex<HashSet<String>>,
     tx: broadcast::Sender<String>,
     model_tx: broadcast::Sender<inference::ModelPromptRequest>,
+    api: ApiAppState,
 }
 
 #[tokio::main]
@@ -57,20 +62,66 @@ async fn main() {
         .route("/diagnostics/ws.js", get(diagnostics_ws_js))
         .route("/websocket", get(websocket_handler))
         .route("/keepalive", get(keepalive_websocket_handler))
+        .nest(
+            "/api",
+            Router::new()
+                .route("/", get(api_index))
+                .route("/payload", post(api_payload)),
+        )
         .nest_service("/scripts", ServeDir::new("public/scripts").no_cache())
         .nest_service("/icons", ServeDir::new("public/icons"))
         .nest_service("/images", ServeDir::new("public/images"))
         .with_state(app_state);
 
-    let port = std::env::var(env::API_PORT).ok();
-    let port = port.and_then(|x| x.parse().ok()).unwrap_or(3000_u16);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = socket_addr_from_env(env::API_PORT, 3000);
     tracing::info!("listening on {}", addr);
 
     axum::Server::bind(&addr)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .unwrap();
+}
+
+async fn api_index() -> impl IntoResponse {
+    match std::fs::read_to_string("admin.html") {
+        Ok(html) => {
+            let no_cache_header = vec![
+                (header::CACHE_CONTROL, "no-cache, no-store"),
+                (header::EXPIRES, "-1"),
+            ];
+            (StatusCode::OK, AppendHeaders(no_cache_header), Html(html))
+        }
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            AppendHeaders(vec![]),
+            Html(err.to_string()),
+        ),
+    }
+}
+
+async fn api_payload(
+    State(state): State<Arc<AppState>>,
+    Form(map): Form<HashMap<String, String>>,
+) -> Result<impl IntoResponse, String> {
+    let mut rx = state.api.channel.subscribe();
+    let barrier = state.api.handles.wait().await;
+    let map_json = if barrier.is_leader() {
+        // let map_json = serde_json::to_string_pretty(&map).map_err(|x| x.to_string())?;
+        let map_json = map
+            .get(&String::from("type"))
+            .cloned()
+            .unwrap_or_else(|| String::from("Unknown"));
+        state.api.channel.send(map_json.clone()).unwrap();
+        map_json
+    } else {
+        rx.recv().await.unwrap()
+    };
+    let no_cache_header = vec![
+        (header::CACHE_CONTROL, "no-cache, no-store"),
+        (header::EXPIRES, "-1"),
+    ];
+    let html = format!(r#"<p>{para}</p>"#, para = map_json);
+    Ok((StatusCode::OK, AppendHeaders(no_cache_header), Html(html)))
 }
 
 async fn index() -> impl IntoResponse {
@@ -152,6 +203,14 @@ async fn configure_app_state() -> Arc<AppState> {
         user_set: Mutex::new(user_set),
         tx,
         model_tx,
+        api: ApiAppState {
+            handles: tokio::sync::Barrier::new(2),
+            channel: {
+                let channel = broadcast::channel(1);
+                std::mem::forget(channel.1);
+                channel.0
+            },
+        },
     })
 }
 
@@ -173,4 +232,10 @@ fn configure_current_dir() -> anyhow::Result<()> {
         bail!("failed to find index.html content root");
     }
     Ok(())
+}
+
+fn socket_addr_from_env(port_env_key: &str, default: u16) -> SocketAddr {
+    let port = std::env::var(port_env_key).ok();
+    let port = port.and_then(|x| x.parse().ok()).unwrap_or(default);
+    SocketAddr::from(([0, 0, 0, 0], port))
 }
